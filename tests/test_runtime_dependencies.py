@@ -361,4 +361,5 @@ def test_stop_tmux_execution_failure_keeps_port_cleanup_and_returns_nonzero(monk
 
     monkeypatch.setattr(stop_servers.process_env, "run", run)
     assert stop_servers.main(["--scope", "aux"]) == 1
-    assert ports == [8080, 8080, 8080]
+    # aux = embedding、reranker、審核模型、VL:每個 role 的 port 都要檢查。
+    assert ports == [8080, 8080, 8080, 8080]

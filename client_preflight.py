@@ -122,6 +122,8 @@ class Preflight:
     #: :func:`compaction_status` 產生的每一行(逐字、順序不變)。不做二次篩選 ——
     #: 「這個 session 的自動壓縮已被停用」就藏在那幾行裡。
     status: list[str] = field(default_factory=list)
+    #: 審核模型(小模型)的端點與 live n_ctx(:func:`check_auditor` 填);TUI 交給協調器。
+    auditor: Any = None
 
     def note(self, message: str, *, keep: bool = False) -> None:
         """印一則進度訊息。``keep=True`` 表示它通過之後仍要進 TUI 的第一屏。
@@ -174,6 +176,10 @@ def check_deployment_profile(result: Preflight) -> Any:
     if profile.mode == "client":
         import endpoint_policy
         for role, service in profile.services.items():
+            if role == "auditor" and deployment_profile.auditor_unconfigured_reason(profile) is not None:
+                # 舊的四角色 A/B 設定:審核模型端點不存在、也不授權任何流量。
+                # 由 check_auditor 以 A/B 的修法訊息拒絕,不在這裡丟一個看不懂的 policy 錯誤。
+                continue
             endpoint_policy.ensure_allowed(service.base_url, role, split=True)
             result.note(f"{role} endpoint={service.base_url} model={service.model}")
     return profile
@@ -389,6 +395,77 @@ def check_required_servers(result: Preflight) -> None:
         raise PreflightError("附屬模型 server 尚未就緒(見上面的 model-preflight 行)。")
 
 
+def check_auditor(result: Preflight, profile: Any) -> None:
+    """審核模型(小模型)是 TUI 的必要服務:未設定、連不上、沒有 live n_ctx、計數端點
+    不能用,一律在進 TUI 前拒絕(不降級成「這一次不審核」)。
+
+    n_ctx 只取它自己 ``/props`` 的實值:審核請求的精確計數與 gate 都以它為上限。
+    """
+    import client_audit
+    import config
+    import gpu_safety
+    import llama_client
+
+    deployment_profile = _profile_module()
+    reason = deployment_profile.auditor_unconfigured_reason(profile)
+    if reason is not None:
+        raise PreflightError(reason)
+    service = profile.service("auditor")
+    base_url = service.base_url
+    health = llama_client.get_health(base_url, timeout=3)
+    if not isinstance(health, dict) or str(health.get("status", "")).lower() != "ok":
+        raise PreflightError(
+            f"審核模型(auditor)server 沒有就緒({base_url})。\n"
+            "  請執行 ~/start.sh 啟動全部服務;仍失敗就看 ~/.local/state/codetrail/logs/auditor.log。"
+        )
+    try:
+        info = gpu_safety.query_server_info(base_url)
+    except Exception as exc:  # noqa: BLE001 - 觀測失敗一律拒絕
+        raise PreflightError(
+            f"無法觀測審核模型 /props 的 n_ctx: {type(exc).__name__}: {exc}"
+        ) from exc
+    observed = getattr(info, "n_ctx", None)
+    minimum = int(config.AUDITOR_MIN_N_CTX)
+    if type(observed) is not int or observed <= 0:
+        raise PreflightError(
+            "審核模型 /props 沒有有效的正整數 n_ctx;不使用 deployment 的設定值代替。"
+        )
+    if observed < minimum:
+        raise PreflightError(
+            f"審核模型的 n_ctx={observed} 小於下限 {minimum}:放不下問題、回答與知識庫證據。\n"
+            "  請重跑 ./set_config.sh 把審核模型的 n_ctx 調大,再 ~/start.sh stop、~/start.sh。"
+        )
+    if profile.mode == "client":
+        from model_identity import capture_model_identity, ModelIdentityError
+        try:
+            identity = capture_model_identity("auditor", profile=profile)
+        except ModelIdentityError as exc:
+            raise PreflightError(str(exc)) from exc
+        result.note(
+            f"auditor live identity={identity['fingerprint'][:16]} ({identity['identity_kind']})"
+        )
+    try:
+        counted = llama_client.count_chat_tokens(
+            base_url=base_url,
+            messages=[{"role": "user", "content": "CodeTrail auditor preflight"}],
+            model=str(service.model or ""),
+            extra={"max_tokens": 1,
+                   "chat_template_kwargs": llama_client.thinking_template_kwargs(False)},
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001 - 計數不能用就沒有 gate,一律拒絕
+        raise PreflightError(
+            f"審核模型的 token 計數端點不能用({type(exc).__name__}: {exc});"
+            "請更新 llama.cpp build 後重啟服務。"
+        ) from exc
+    if type(counted) is not int or counted <= 0:
+        raise PreflightError("審核模型的 token 計數沒有回正整數;請更新 llama.cpp build 後重啟服務。")
+    result.auditor = client_audit.AuditTarget(
+        base_url=base_url, model=str(service.model or ""), n_ctx=observed,
+    )
+    result.note(f"auditor={service.model} n_ctx={observed}(審核模型,來自它自己的 /props)")
+
+
 def check_tool_health(result: Preflight, profile: Any) -> None:
     """MCP / tool-call 健檢。protocol lane 每次都跑,model lane 依指紋快取。
 
@@ -491,6 +568,7 @@ def run(root: Path, *, skip_tool_health: bool = False) -> Preflight:
             check_ctx_safety(result, profile, requested)
             render_lessons(result)
             check_required_servers(result)
+            check_auditor(result, profile)
             hint = "" if profile.mode == "client" else legacy_web_backend_hint()
             if hint:
                 # keep:那個 backend 占著 port、一個 MCP 子行程與一個模型 slot,

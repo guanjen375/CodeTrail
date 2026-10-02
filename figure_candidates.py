@@ -15,7 +15,7 @@
    `pos`）、`find_tables` 幾何、ruled-line grid、對齊的 word band（無框線 memory map）、
    向量文字 log 直接形成 table / terminal 候選。夠大的純 raster / picture 則形成
    `KIND_RASTER` 候選，後段先以受限 schema 分類成 table / terminal / diagram，再走同一套
-   canonical payload、`▯`、review artifact 與 strict gate；不再以自由文字描述冒充逐字證據。
+   canonical payload、`▯`、review artifact 與驗證狀態標示；不再以自由文字描述冒充逐字證據。
 3. **不無聲截斷。** 超過任何上限都進 `over_budget` 並由 `check_preflight()` fail-loud；
    被丟棄的候選逐筆列進 `stats["dropped_candidates"]`。
 

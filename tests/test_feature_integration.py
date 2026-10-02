@@ -79,13 +79,21 @@ def test_table_scope_and_recovery_reach_model_text_without_widening(tmp_path, mo
     assert result.content[0].text.index("scope:") < result.content[0].text.index("cell:")
 
 
-def test_ocr_exclusion_and_build_unknown_reach_the_model_text_lane():
+def test_ocr_status_and_build_unknown_reach_the_model_text_lane():
+    """未確認 OCR 的狀態與定位(在 REF 文字裡)必須原樣進模型文字;strict 已移除。"""
     budget = ResultBudget(4000, 16000, False, False)
-    excluded = {"source": "spec.pdf", "page": 3, "text_id": "ocr_a", "reason": "unreviewed"}
-    result = adapt_tool_result("query_knowledge_strict",
-                              {"refused": True, "reason": "weak_ref", "excluded_text": [excluded]},
-                              budget=budget)
-    assert "ocr_a" in result.content[0].text and "review_text" in result.content[0].text
+    payload = {
+        "text": ("[REF1]\n  text_lane: mineru（OCR 未經獨立驗證） text_id=ocr_a text_revision=1\n"
+                 "  source: spec.pdf\n  page: 3\n  content: CTRL reset value 0x1"),
+        "display": "",
+        "refs": [{"source": "spec.pdf", "page": 3, "text_id": "ocr_a",
+                  "text_verification_status": "unverified"}],
+        "top_score": 0.1,
+        "has_ref": True,
+    }
+    result = adapt_tool_result("query_knowledge", payload, budget=budget)
+    text = result.content[0].text
+    assert "ocr_a" in text and "OCR 未經獨立驗證" in text and "spec.pdf p.3" in text
     result = adapt_tool_result("code_rag_search", [{"mode": "semantic", "results": [],
                               "build_context": {"target": None, "status": "unknown"}}], budget=budget)
     assert "unknown" in result.content[0].text and "results: 0" in result.content[0].text

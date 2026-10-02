@@ -26,7 +26,15 @@ from urllib.parse import urlsplit
 
 import process_env
 
-ROLES = ("main", "embedding", "reranker", "vl")
+ROLES = ("main", "embedding", "reranker", "vl", "auditor")
+#: 加入審核模型(auditor)之前的角色集合。只用於相容判斷:A/B 分離部署的舊 B 端
+#: deployment.json / client.json 只寫了這四個角色 —— 它們必須能被**載入**(否則連
+#: 重新匯入 manifest 的入口都進不去),但 auditor 視為未設定,使用前 fail-loud。
+LEGACY_ROLES = ("main", "embedding", "reranker", "vl")
+#: model 可以是 null 的角色:main 與 auditor 都沒有內建預設模型(由 set_config 寫入)。
+#: null 不會在載入期被拒(那會讓 config import 直接炸、連修法都印不出來),而是在
+#: 使用端以 `resolve_model_reference` / `auditor_unconfigured_reason` fail-loud。
+_NULLABLE_MODEL_ROLES = frozenset({"main", "auditor"})
 
 #: llama-server 執行檔的最後手段預設(檔案沒寫、argv 沒給時)。
 DEFAULT_LLAMA_BIN = "~/llama.cpp/build/bin/llama-server"
@@ -89,6 +97,10 @@ _ROLE_PARAMETERS = {
     # override 互斥（common_params_fit_impl 見到 tensor_buft_overrides 已被設定就
     # abort），所以 set_config 在 VL 套 CPU-MoE 時會改寫 -ngl 99 --fit off。
     "vl": _COMMON_PARAMETERS | {"fit", "fit_target", "cpu_moe", "n_cpu_moe"},
+    # 審核模型(小聊天模型):只服務客戶端的內部審核請求,請求本身一律帶
+    # temperature 0 與兩個 thinking false,所以不收取樣參數。在 VL 之前啟動。
+    "auditor": _COMMON_PARAMETERS
+    | {"jinja", "cache_type_k", "cache_type_v", "threads", "fit", "fit_target", "cpu_moe", "n_cpu_moe"},
 }
 _BARE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,191}$")
 _GPU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:,\-]{0,255}$")
@@ -178,6 +190,18 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
             "ubatch": None,
             "parameters": {"gpu_layers": 99},
         },
+        # 審核模型沒有內建預設模型:model 為 null 時「已知但未設定」,由 set_config
+        # 寫入。ctx 只是手寫 deployment.json 漏了 ctx 時的墊底值,精靈一定會問。
+        "auditor": {
+            "model": None,
+            "port": 8084,
+            "base_url": "http://localhost:8084",
+            "gpu_role": "aux",
+            "ctx": 32768,
+            "batch": None,
+            "ubatch": None,
+            "parameters": {"gpu_layers": 99, "jinja": True},
+        },
     },
 }
 
@@ -229,7 +253,7 @@ class LauncherOverrides:
 
     以前這一層是三十幾個環境變數疊成的 overlay。改成 argv 之後,「誰覆寫了什麼」
     在 `ps` 上看得見,而且另一份安裝的 `~/start.sh` 再也蓋不到。
-    `gpus` 的鍵是 role 名加上 `"aux"`(套到三個附屬角色裡沒有自己那格的)。
+    `gpus` 的鍵是 role 名加上 `"aux"`(套到附屬角色——含 auditor——裡沒有自己那格的)。
     """
 
     main_model: str | None = None
@@ -511,7 +535,9 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
             if not isinstance(alias, str) or not _BARE_MODEL_RE.fullmatch(alias):
                 raise ProfileError(f"{service_where}.identity_alias must be a versioned bare model ID")
         if "model" in raw:
-            _validate_model_reference(raw["model"], f"{service_where}.model", nullable=role == "main")
+            _validate_model_reference(
+                raw["model"], f"{service_where}.model", nullable=role in _NULLABLE_MODEL_ROLES
+            )
         if "mmproj" in raw:
             if role != "vl":
                 raise ProfileError(f"{service_where}.mmproj is only allowed for vl")
@@ -645,10 +671,14 @@ def _validate_effective(data: dict[str, Any], where: str) -> None:
     if missing_top:
         raise ProfileError(f"{where} is missing top-level field(s): {', '.join(missing_top)}")
     services = data["services"]
-    if set(services) != set(ROLES):
+    legacy_client = data.get("mode") == "client" and set(services) == set(LEGACY_ROLES)
+    if set(services) != set(ROLES) and not legacy_client:
         missing = sorted(set(ROLES) - set(services))
-        raise ProfileError(f"{where} is missing service role(s): {', '.join(missing)}")
-    for role in ROLES:
+        hint = ""
+        if data.get("mode") == "client" and "auditor" in missing:
+            hint = f";{AUDITOR_CLIENT_MISSING}"
+        raise ProfileError(f"{where} is missing service role(s): {', '.join(missing)}{hint}")
+    for role in (LEGACY_ROLES if legacy_client else ROLES):
         raw = services[role]
         if data.get("mode") == "client":
             allowed = {"base_url", "model", "identity_alias"}
@@ -666,7 +696,7 @@ def _validate_effective(data: dict[str, Any], where: str) -> None:
         missing = sorted({"model", "port", "base_url", "gpu_role", "ctx", "batch", "ubatch", "parameters"} - set(raw))
         if missing:
             raise ProfileError(f"{where}.services.{role} is missing field(s): {', '.join(missing)}")
-        if role != "main" and raw["model"] is None:
+        if role not in _NULLABLE_MODEL_ROLES and raw["model"] is None:
             raise ProfileError(f"{where}.services.{role}.model may not be null")
         if role == "vl" and not raw.get("mmproj"):
             raise ProfileError(f"{where}.services.vl.mmproj is required")
@@ -689,7 +719,7 @@ def _validate_effective(data: dict[str, Any], where: str) -> None:
 def _gpu_for(role: str, gpu_role: str, gpus: Mapping[str, str], configured: Any) -> str:
     """這個角色最後要用哪張卡。優先序:`--<role>-gpu` > `--aux-gpu` > 檔案 > 不指定。
 
-    `--aux-gpu` 只套到三個附屬角色(main 有自己的 `--main-gpu`)。回空字串就是
+    `--aux-gpu` 只套到附屬角色(含 auditor;main 有自己的 `--main-gpu`)。回空字串就是
     「不指定」—— `build_server_command` 不會加 `env CUDA_VISIBLE_DEVICES=` 前綴,
     而 pane 最終環境已經把繼承來的那一份剝掉了。
     """
@@ -759,7 +789,15 @@ def load_effective_profile(
 
     services: dict[str, ServiceProfile] = {}
     for role in ROLES:
-        raw = data["services"][role]
+        raw = data["services"].get(role)
+        if raw is None:
+            # 只有 client 模式的舊四角色檔會走到這裡(_validate_effective 已擋掉其他情況):
+            # 合成一個「未設定」的 auditor —— model None、base_url ""。它不授權任何流量
+            # (endpoint_policy 對空字串一律不放行),使用端以 auditor_unconfigured_reason fail-loud。
+            services[role] = ServiceProfile(
+                role=role, model=None, base_url="", port=0, gpu_role="", gpu="",
+                ctx=None, batch=None, ubatch=None, parameters={}, deployment_mode=mode)
+            continue
         if mode == "client":
             services[role] = ServiceProfile(
                 role=role, model=raw["model"], base_url=raw["base_url"].rstrip("/"),
@@ -842,8 +880,16 @@ def resolve_model_reference(
     *,
     must_exist: bool = False,
     registry_file: str | Path | None = None,
+    role: str = "main",
 ) -> str:
     if reference is None:
+        if role == "auditor":
+            # 這裡不知道部署模式;依模式給修法的是 auditor_unconfigured_reason()(launcher、
+            # aicode、doctor 都先走它),這句只在其他路徑兜底,兩種修法都講。
+            raise ProfileError(
+                "審核模型（auditor）尚未設定（deployment.json 的 services.auditor.model 是 null）："
+                "本機請執行 ./set_config.sh；模型主機 A 請用 ./scripts/configure-advanced.sh 選項 3"
+            )
         raise ProfileError(
             "main model is unset; put a registry key or an absolute GGUF path in "
             "deployment.json services.main.model(重跑 ./set_config.sh 也會寫好它)"
@@ -881,6 +927,48 @@ def resolve_model_reference(
     if must_exist and not path.is_file():
         raise ProfileError(f"model artifact does not exist: {path}")
     return str(path)
+
+
+#: 審核模型未設定的修法訊息。launcher、aicode preflight、doctor、check_status 一律經
+#: `auditor_unconfigured_reason()` 取這兩句,不各寫一份(各寫一份就會各自漂移)。
+AUDITOR_LOCAL_MISSING = (
+    "審核模型（auditor）尚未設定：請在 CodeTrail checkout 執行 ./set_config.sh 選擇審核模型，"
+    "再 ~/start.sh stop、~/start.sh"
+)
+#: 模型主機 A:日常 ./set_config.sh 只會建本機設定,A 要從附加入口重設 model-host。
+AUDITOR_HOST_MISSING = (
+    "審核模型（auditor）尚未設定：請在 A 執行 ./scripts/configure-advanced.sh，選項 3（model-host）"
+    "選擇審核模型，重啟後再重新匯出 manifest 給 B"
+)
+AUDITOR_CLIENT_MISSING = (
+    "A/B 分離部署缺少審核模型（auditor）端點：請先在 A 更新 CodeTrail、重跑設定並重新匯出 manifest，"
+    "再於 B 以 ./scripts/configure-advanced.sh 重新匯入"
+)
+
+
+def service_unconfigured(service: ServiceProfile) -> bool:
+    """這個角色是不是「已知但未設定」:目前只有 auditor 會是(model None 或沒有端點)。
+
+    用 getattr:角色迴圈的呼叫端(stop / status / doctor)也會拿到只帶部分欄位的替身。
+    """
+    if getattr(service, "role", None) != "auditor":
+        return False
+    return getattr(service, "model", None) is None or not getattr(service, "base_url", "")
+
+
+def auditor_unconfigured_reason(profile: DeploymentProfile) -> str | None:
+    """審核模型已設定回 None;否則回**依部署模式**的修法訊息(唯一來源)。
+
+    舊安裝升級後 auditor 是 null(本機)或整個不存在(B 的舊四角色檔)。這兩種都必須
+    能載入 —— config 在 import 期就讀 profile,載入失敗等於 aicode、MCP、doctor、
+    甚至 set_config 自己都起不來 —— 所以「未設定」在這裡判、在使用前 fail-loud。
+    """
+    service = profile.services.get("auditor")
+    if service is not None and not service_unconfigured(service):
+        return None
+    if profile.mode == "client":
+        return AUDITOR_CLIENT_MISSING
+    return AUDITOR_HOST_MISSING if profile.mode == "model-host" else AUDITOR_LOCAL_MISSING
 
 
 def bind_host(service: ServiceProfile) -> str:
@@ -962,9 +1050,10 @@ def build_server_command(
 ) -> list[str]:
     """Build argv only from validated structured fields and the parameter allowlist."""
     if service.deployment_mode == "client":
-        raise ProfileError("client mode cannot start a local model; start the four services on A")
+        raise ProfileError("client mode cannot start a local model; start the model services on A")
     model_path = resolve_model_reference(
-        service.model, environ, must_exist=must_exist, registry_file=registry_file
+        service.model, environ, must_exist=must_exist, registry_file=registry_file,
+        role=service.role,
     )
     command = [llama_bin, "-m", model_path]
     if service.identity_alias:
@@ -1086,7 +1175,7 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
             item["mmproj"] = service.mmproj
         try:
             item["model_path"] = resolve_model_reference(
-                service.model, environ, registry_file=profile.registry_file
+                service.model, environ, registry_file=profile.registry_file, role=role
             )
         except ProfileError:
             item["model_path"] = None
@@ -1124,6 +1213,8 @@ def export_client_profile(profile: DeploymentProfile, server_url: str) -> dict[s
         raise ProfileError(str(exc)) from exc
     host = f"[{address.hostname}]" if ":" in address.hostname else address.hostname
     services = {}
+    # B 端的 manifest 必須含審核模型:A 還沒設定審核模型時它沒有 identity_alias,
+    # 會在下面這一圈被同一句「回 model-host A 重設」擋下,不會匯出缺角的 manifest。
     for role, service in profile.services.items():
         if not service.identity_alias:
             raise ProfileError(
@@ -1139,13 +1230,14 @@ def export_client_profile(profile: DeploymentProfile, server_url: str) -> dict[s
     return {"schema_version": 1, "mode": "client", "services": services}
 
 
-#: `--<name>-gpu` → `LauncherOverrides.gpus` 的鍵。`aux` 套到三個附屬角色。
+#: `--<name>-gpu` → `LauncherOverrides.gpus` 的鍵。`aux` 套到附屬角色(含 auditor)。
 _GPU_FLAGS = (
     ("--main-gpu", "main_gpu", "main"),
     ("--aux-gpu", "aux_gpu", "aux"),
     ("--embed-gpu", "embed_gpu", "embedding"),
     ("--rerank-gpu", "rerank_gpu", "reranker"),
     ("--vl-gpu", "vl_gpu", "vl"),
+    ("--auditor-gpu", "auditor_gpu", "auditor"),
 )
 #: `--main-<field>` → `LauncherOverrides` 的欄位。
 _MAIN_FLAGS = (
@@ -1275,7 +1367,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.require_files and profile.mode != "client":
                 for service in profile.services.values():
                     resolve_model_reference(
-                        service.model, must_exist=True, registry_file=profile.registry_file
+                        service.model, must_exist=True, registry_file=profile.registry_file,
+                        role=service.role,
                     )
                     if service.mmproj:
                         resolve_model_reference(
@@ -1292,6 +1385,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("" if value is None else value)
         elif args.command == "exec":
             service = profile.service(args.role)
+            if service_unconfigured(service):
+                raise ProfileError(auditor_unconfigured_reason(profile) or AUDITOR_LOCAL_MISSING)
             # systemd 之類的 supervisor 只會走這裡:少了這行就等於靜默矯正。
             warn_cpu_moe_fit_conflicts([service], prefix="[deployment-profile]")
             from dspark_runtime import validate_dspark_runtime

@@ -106,7 +106,6 @@ from config import (
     RERANKER_ALWAYS_ON, RERANKER_TOP_N, RERANKER_PASSAGE_MAX_CHARS,
     RERANKER_SKIP_THRESHOLD,
     MARGIN_ENABLED, MARGIN_MIN_GAP, MARGIN_LOW_SCORE,
-    STRICT_MODE_THRESHOLD, STRICT_MODE_RERANK_REQUIRED,
     # P1 改進：Multi-Query（條件式啟用）
     MULTI_QUERY_ENABLED, MULTI_QUERY_COUNT, MULTI_QUERY_TYPES,
     MULTI_QUERY_MIN_SCORE_TRIGGER, MULTI_QUERY_SKIP_NUMERIC,
@@ -120,9 +119,9 @@ from config import (
 # ============================================================
 # 這裡刻意**不** import figure_extract：knowledge.py 在 MCP 啟動熱路徑上，而
 # figure_extract 的門面（PEP 562 lazy re-export）會把 pymupdf / VL client / review
-# 路徑整串拉進來；這邊需要的只是六個字串與三個集合。兩邊漂掉是**無聲**的（strict
-# gate 會安靜地不再排除未驗證的圖），所以 tests/test_figure_retrieval.py 有一條
-# smoke 把兩邊的常數逐一比對。改這裡就要同步 figure_extract.py。
+# 路徑整串拉進來；這邊需要的只是六個字串與三個集合。兩邊漂掉是**無聲**的（REF 的
+# 狀態標示與客戶端審核的待覆核判定會安靜地失準），所以 tests/test_figure_retrieval.py
+# 有一條 smoke 把兩邊的常數逐一比對。改這裡就要同步 figure_extract.py。
 VERIF_NATIVE = "native_verified"
 VERIF_CORROBORATED = "corroborated"
 VERIF_NEEDS_REVIEW = "needs_review"
@@ -161,17 +160,12 @@ _VERIFICATION_LABELS = {
     VERIF_LEGACY: "舊 KB 缺驗證欄位，一律視為未驗證",
 }
 
-# model hint 那一行最多列幾張圖；metadata["excluded_figures"] 永遠是完整清單。
-_MAX_EXCLUDED_FIGURES_IN_HINT = 5
-
 # figure 層級降級的穩定 slug（給 code 比對；人看的說明另外寫在 reason_details）。
 # 「為什麼待覆核」必須說得出來，否則使用者只看到一個狀態、不知道要覆核什麼。
 _REASON_PART_FLAGGED = "figure_part_flagged_elsewhere"
 _REASON_REVISION_CONFLICT = "figure_revision_conflict"
-_REASON_TRUNCATED_NO_ROW = "ref_truncated_no_complete_row"
 _DETAIL_PART_FLAGGED = "同一張圖的其他 part 未通過驗證，整張圖一律取最差狀態"
 _DETAIL_REVISION_CONFLICT = "KB 內同一張圖存在多個 revision（人工修正前後混用），無法確定哪一份為真"
-_DETAIL_TRUNCATED_NO_ROW = "REF 預算下連一列/一行完整資料都放不進來，這份 REF 沒有可引用的數值"
 
 # 合併 legacy VL chunk 時要搬過去的欄位。structured chunk 根本不進合併，所以這裡實際
 # 服務的是舊 lane：少了它們，載入時 backfill 上去的 verification_status/reasons 會在
@@ -418,11 +412,26 @@ class Candidate:
 # 給 data flywheel 記錄。只記身分(chunk id / 來源 / 頁 / 章節)與數字,不記
 # content(最終 REF 只帶前 TRACE_SNIPPET_CHARS 字);它是觀測,不參與任何決策。
 # ============================================================
-TRACE_SCHEMA = 1
+#: 2:拿掉 strict 檢索(`query.strict`、`strict_excluded`、`stage="strict"`、`strict_all_excluded*`)。
+#: 讀 trace 的一端(data_flywheel)兩版都要讀得懂:舊紀錄仍帶那些欄位。
+TRACE_SCHEMA = 2
 #: 候選**不設上限**:hybrid 召回的每一個(含 section 展開的成員)都記身分與分數。
 #: 截掉的候選事後補不回「它是沒被召回、沒過門檻、還是被 reranker 淘汰」;檔案大小
 #: 由 data_flywheel 的歸檔(ROTATE_BYTES)處理,不在這裡犧牲資料。
 TRACE_SNIPPET_CHARS = 200
+
+
+def _ref_content_identity(printed: str) -> dict:
+    """REF 區塊 `  content: ` 之後**實際印出**的那段字串的身分(含 KB 自己的截斷標記)。
+
+    客戶端的回答審核拿它把模型看過的 text lane 內容區對回這筆 refs metadata:
+    文件內容裡偽造的 `[REFn]` / `content:` 段落對不上長度與雜湊,就拿不到別筆 REF 的
+    驗證狀態。只放 structured,不進模型可見文字。雜湊吃 UTF-8(surrogatepass)。
+    """
+    return {
+        "content_sha256": hashlib.sha256(printed.encode("utf-8", "surrogatepass")).hexdigest(),
+        "content_chars": len(printed),
+    }
 
 
 def _r4(value) -> float | None:
@@ -735,7 +744,7 @@ class KnowledgeBase:
 
         不回寫檔案：KB 檔的真相由 ingest 與 figure_review 的原子交易負責，查詢端只補
         自己的副本。少了這步，舊 KB 的圖片 chunk 印不出「為什麼不能用」，使用者不知道
-        要去覆核什麼（strict gate 本身靠白名單，缺欄位本來就擋得住）。
+        要去覆核什麼（可信判定本身靠白名單 TRUSTED_VERIFICATION，缺欄位本來就不會被當成可信）。
 
         既有的 `reasons` **不覆寫、只補一個 slug**（去重保序聯集）：舊 chunk 可能已經
         帶著 glyph_conflict 之類的原因卻剛好缺 status，直接指定會靜默丟資料。
@@ -2322,18 +2331,17 @@ English:"""
         )
         return self._merge_expansion_scores(scores, expansion_scores)
 
-    def _should_rerank(self, candidates: list, top_k: int, is_strict_mode: bool = False) -> bool:
+    def _should_rerank(self, candidates: list, top_k: int) -> bool:
         """判斷是否需要 rerank
 
         改進：
         - RERANKER_ALWAYS_ON = True 時，有 reranker 就一律使用
-        - 嚴格模式下強制 rerank（STRICT_MODE_RERANK_REQUIRED）
         - 高信心時跳過 rerank（top_emb_score > RERANKER_SKIP_THRESHOLD）
         - 否則使用條件觸發
         """
         # One item cannot be reordered.  Candidate count relative to requested
-        # output is not a reason to skip: strict/low-confidence queries often
-        # have <= output_k candidates and are exactly where reranking matters.
+        # output is not a reason to skip: low-confidence queries often have
+        # <= output_k candidates and are exactly where reranking matters.
         if len(candidates) <= 1:
             return False
 
@@ -2342,18 +2350,13 @@ English:"""
         candidates = self._decision_order(candidates)
         top_gate_score = candidates[0].gate_score if candidates else 0
 
-        # 改進：高信心時跳過 rerank（減少不必要的延遲）
-        # 但嚴格模式和 ALWAYS_ON 除外
-        if not RERANKER_ALWAYS_ON and not is_strict_mode:
+        # 改進：高信心時跳過 rerank（減少不必要的延遲）；ALWAYS_ON 除外
+        if not RERANKER_ALWAYS_ON:
             if top_gate_score >= RERANKER_SKIP_THRESHOLD:
                 return False
 
         # P0 改進：強制啟用 reranker
         if RERANKER_ALWAYS_ON:
-            return True
-
-        # 嚴格模式強制 rerank
-        if is_strict_mode and STRICT_MODE_RERANK_REQUIRED:
             return True
 
         # Margin-based 判斷（P0 改進）- 全部走 gate 分數
@@ -2383,8 +2386,7 @@ English:"""
 
         # 其他情況：gate 分數較低時，需要 rerank
         return top_gate_score < 0.5
-    def _rerank_with_model(self, question: str, candidates: list, top_k: int,
-                           is_strict_mode: bool = False) -> list:
+    def _rerank_with_model(self, question: str, candidates: list, top_k: int) -> list:
         """重排並保留 cross-encoder 分數，回 [(score, chunk), ...]。
 
         分數會一路傳到 MMR 當 relevance。以前 rerank 完就把分數丟掉，MMR 再拿
@@ -2403,7 +2405,7 @@ English:"""
             return [(None, c.chunk) for c in candidates[:top_k]]
 
         # 條件觸發：判斷是否真的需要 rerank
-        if not self._should_rerank(candidates, top_k, is_strict_mode):
+        if not self._should_rerank(candidates, top_k):
             return [(None, c.chunk) for c in candidates[:top_k]]
 
         # Input pool and output count are separate.  RERANKER_TOP_N is the
@@ -2885,143 +2887,6 @@ English:"""
                 f"text_revision={metadata.get('text_revision', 0)} "
                 f"reason={metadata.get('text_review_reason', '')}")
 
-    def _collect_excluded_text(self, bucket: list, chunk: dict) -> None:
-        """Record every excluded OCR page without copying its private content."""
-        originals = [
-            self.chunks[index] for index in self._member_indices(chunk)
-            if 0 <= index < len(self.chunks) and _is_mineru_text(self.chunks[index])
-        ] or [chunk]
-        for original in originals:
-            verdict = self._text_eligibility(original)
-            if verdict["eligible"]:
-                continue
-            entry = {
-                "source": original.get("source", ""),
-                "page": original.get("page", 0),
-                "origin": "mineru_text",
-                "text_lane": "mineru",
-                "reason": "mineru_text_not_independently_verified",
-            }
-            if original.get("text_id"):
-                entry.update(text_id=original["text_id"], text_revision=original.get("text_revision", 0),
-                             text_content_sha256=original.get("text_content_sha256", ""),
-                             reason=verdict["reason"])
-            if entry not in bucket:
-                bucket.append(entry)
-
-    @staticmethod
-    def _excluded_text_line(excluded: list) -> str:
-        shown = excluded[:_MAX_EXCLUDED_FIGURES_IN_HINT]
-        pages = "；".join(
-            f"{entry.get('source', '?')} p.{entry.get('page', '?')}"
-            + (f" text_id={entry['text_id']} rev={entry.get('text_revision', 0)}" if entry.get("text_id") else "")
-            for entry in shown
-        )
-        more = (f"；另有 {len(excluded) - len(shown)} 頁未列出"
-                if len(excluded) > len(shown) else "")
-        return (
-            f"※ strict 模式已排除 {len(excluded)} 段 MinerU 文字：{pages}{more}。"
-            "這些 OCR 未經獨立驗證，或既有覆核因內容／來源版本失效，不得用作 strict 證據；"
-            "使用 review_text list/show 對來源覆核。"
-        )
-
-    def _collect_excluded_figure(self, bucket: list, chunk: dict, status: str,
-                                 reasons: list | None = None,
-                                 reason_details: list | None = None) -> None:
-        """把被 strict gate 擋掉的圖收進清單：同一張圖只留一筆，狀態取最差、原因聯集。
-
-        `reasons` / `reason_details` 由呼叫端傳 **figure 層級**的聚合結果：只收本 chunk
-        自己的原因時，「因為同一張圖的另一段待覆核而被擋」會變成一筆沒有原因的紀錄，
-        使用者不知道要覆核什麼。
-        """
-        reasons = _ordered_unique(
-            reasons if reasons is not None else _figure_reasons(chunk)
-        )
-        reason_details = _ordered_unique(
-            reason_details if reason_details is not None
-            else _aggregate_reason_details([chunk])
-        )
-        key = _figure_key(chunk)
-        for entry in bucket:
-            if _figure_key(entry) == key:
-                entry["verification_status"] = _worst_verification(
-                    [entry["verification_status"], status]
-                )
-                entry["reasons"] = _ordered_unique(entry["reasons"] + reasons)
-                entry["reason_details"] = _ordered_unique(
-                    entry["reason_details"] + reason_details
-                )
-                return
-        bucket.append({
-            "source": chunk.get("source", ""),
-            "page": chunk.get("page", 0),
-            # 同頁多張圖時，少了頁內序號就說不出「可用的是哪一張」（CONTRACT §13.3）
-            "figure_index": chunk.get("figure_index"),
-            "figure_id": str(chunk.get("figure_id", "") or ""),
-            "figure_kind": str(chunk.get("figure_kind", "") or chunk.get("origin", "") or ""),
-            "verification_status": status,
-            **_figure_quality_metadata(chunk),
-            "reasons": reasons,
-            "reason_details": reason_details,
-        })
-
-    @staticmethod
-    def _excluded_figures_line(excluded: list) -> str:
-        """strict 模式的**一行**說明：哪些 page/figure 有內容但待覆核、原因是什麼。
-
-        metadata["excluded_figures"] 永遠是完整清單；這行只是給模型看的摘要，
-        所以限制筆數，超出的部分明說「另有 N 個未列出」（不是靜默截斷）。
-        """
-        shown = excluded[:_MAX_EXCLUDED_FIGURES_IN_HINT]
-        parts = []
-        for entry in shown:
-            reasons = " | ".join(entry.get("reasons") or []) or "未附原因"
-            index = entry.get("figure_index")
-            parts.append(
-                f"{entry.get('source', '?')} p.{entry.get('page', '?')} "
-                f"figure{index if index else '?'}"
-                f"（{entry.get('figure_id') or '無 figure_id'}, {entry.get('figure_kind') or '?'}）"
-                f"status={entry.get('verification_status', '?')} reasons={reasons}"
-                f" quality={entry.get('quality_grade', 'unknown')}"
-                f" disposition={entry.get('auto_disposition', 'manual_review')}"
-            )
-        more = (f"；另有 {len(excluded) - len(shown)} 個未列出"
-                if len(excluded) > len(shown) else "")
-        return (
-            f"※ strict 模式已排除 {len(excluded)} 個未通過驗證的圖片 REF"
-            f"（只接受 {'/'.join(sorted(TRUSTED_VERIFICATION))}）："
-            + "；".join(parts) + more
-            + "。請依 disposition 處理：repair_required/excluded 需要修復或重新 ingest，"
-            "manual_review（待覆核）才需人工判斷；可用 review_figures 檢視原圖，"
-            "不得用它們回答數值 / register / bit range。"
-        )
-
-    def _untrusted_only_result(self, metadata: dict, excluded: list) -> tuple:
-        """strict gate 把候選清空時的回傳值。
-
-        `has_ref` 維持 False，但 model/display 仍須說明被排除的 figure 或 MinerU
-        文字頁碼與原因。沒有任何內容被排除時仍回 ("", "", metadata)。
-        """
-        excluded_text = metadata.get("excluded_text", [])
-        if not excluded and not excluded_text:
-            return "", "", metadata
-        if not excluded:
-            return (self._excluded_text_line(excluded_text),
-                    "[REF 未驗證 OCR] " + " | ".join(
-                        f"{entry.get('source', '?')} p.{entry.get('page', '?')}"
-                        for entry in excluded_text[:_MAX_EXCLUDED_FIGURES_IN_HINT]
-                    ), metadata)
-        display = "[REF 待覆核] " + " | ".join(
-            f"{entry.get('source', '?')} p.{entry.get('page', '?')}"
-            f"（{entry.get('verification_status', '?')}）"
-            for entry in excluded[:_MAX_EXCLUDED_FIGURES_IN_HINT]
-        )
-        model = self._excluded_figures_line(excluded)
-        if excluded_text:
-            model += "\n" + self._excluded_text_line(excluded_text)
-            display += f" | MinerU 未驗證文字 {len(excluded_text)} 頁"
-        return model, display, metadata
-
     @staticmethod
     def _origin_label(chunk: dict, origin: str, status: str) -> tuple:
         """(REF 要印的 origin 字串, 這份 REF 是不是視覺模型產物)。
@@ -3071,7 +2936,7 @@ English:"""
         `partial_atom` 讓文案說明行尾被切斷。
 
         **分成 plan / render 兩段**是刻意的：呼叫端要先知道「這份 REF 一列完整資料
-        都顯示不出來」，才能在 strict 把它擋在證據之外（模型看不到任何數值，卻拿到
+        都顯示不出來」，才能不讓它撐起 spec／權威旗標（模型看不到任何數值，卻拿到
         has_ref=True 的成功回應，是最糟的一種無聲失敗）。
         """
         total_chars = len(content)
@@ -3226,7 +3091,7 @@ English:"""
             "USE_RERANKER", "RERANKER_ALWAYS_ON", "RERANKER_TOP_N", "RERANKER_SKIP_THRESHOLD",
             "USE_QUERY_EXPANSION", "MULTI_QUERY_ENABLED", "USE_MMR", "MMR_LAMBDA",
             "BM25_ENABLED", "RRF_ENABLED", "RRF_K", "MARGIN_ENABLED", "MARGIN_MIN_GAP",
-            "MARGIN_LOW_SCORE", "STRICT_MODE_THRESHOLD", "STRICT_MODE_RERANK_REQUIRED",
+            "MARGIN_LOW_SCORE",
         )
         module = globals()
         settings = {name.lower(): module.get(name) for name in names}
@@ -3240,7 +3105,6 @@ English:"""
         self,
         question: str,
         top_k: int = KNOWLEDGE_TOP_K,
-        is_strict_mode: bool = False,
         metadata_filter: dict | None = None,
         source: str | None = None,
     ) -> tuple[str, str, dict]:
@@ -3252,8 +3116,7 @@ English:"""
         """
         self.last_trace = None
         empty_metadata = {"has_ref": False, "top_score": 0.0, "ref_count": 0,
-                          "is_high_risk": False, "excluded_figures": [],
-                          "excluded_text": []}
+                          "is_high_risk": False}
         if not self.loaded or not self.chunks:
             return "", "", empty_metadata
 
@@ -3271,8 +3134,7 @@ English:"""
         trace: dict = {
             "schema": TRACE_SCHEMA,
             "stage": "start",
-            "query": {"question": question, "source_filter": source,
-                      "strict": bool(is_strict_mode), "top_k": top_k},
+            "query": {"question": question, "source_filter": source, "top_k": top_k},
             "kb": {"path": Path(str(getattr(self, "path", "") or "")).name,
                    "store_generation": str(loaded_meta.get("store_generation", "")),
                    "file_sha256": str(getattr(self, "loaded_sha256", "") or ""),
@@ -3307,62 +3169,21 @@ English:"""
         trace["candidates"] = [_trace_candidate(c) for c in candidates]
         trace["candidate_count"] = len(candidates)
 
-        # 動態門檻：短問題用較低門檻，嚴格模式用較高門檻
+        # 動態門檻：短問題用較低門檻
         query_tokens = self._estimate_tokens(question)
-        if is_strict_mode:
-            base_threshold = STRICT_MODE_THRESHOLD
-        elif query_tokens < KNOWLEDGE_SHORT_QUERY_TOKENS:
+        if query_tokens < KNOWLEDGE_SHORT_QUERY_TOKENS:
             base_threshold = KNOWLEDGE_THRESHOLD_SHORT
         else:
             base_threshold = KNOWLEDGE_THRESHOLD
 
-        # ---- strict gate（CONTRACT §6.6）：未通過驗證的圖片不得成為證據 ----
-        # 放在門檻計算**之前**是刻意的：留到 REF 組裝才濾，被排除的圖仍會吃掉 top-k
-        # 名額，還會用自己的高分把 min_gate_score / margin 抬上去壓掉真正的文字 chunk。
-        # 判定用 figure 層級的有效狀態（同一張圖的任一 part 待覆核 → 整張都不可信）。
-        excluded_figures: list = []
-        excluded_text: list = empty_metadata["excluded_text"]
-        # 排除清單直接掛進 trace(同一個 list 物件:後面第二道 gate 補進來的也會在);
-        # 每一條提早結束的 return 都經 _stop() 記原因,不然紀錄看起來像「停在 hybrid、
-        # 泛用拒答」,分不出「召回品質差」和「安全驗證刻意排除」。
-        trace["strict_excluded"] = {"figures": excluded_figures, "text": excluded_text}
-
+        # 每一條提早結束的 return 都經 _stop() 記原因,紀錄才分得出停在哪一步。
         def _stop(reason: str):
             trace["stopped"] = reason
-            return self._untrusted_only_result(empty_metadata, excluded_figures)
-
-        if is_strict_mode:
-            kept = []
-            for candidate in candidates:
-                if self._contains_mineru_text(candidate.chunk) and not self._text_eligibility(candidate.chunk)["eligible"]:
-                    self._collect_excluded_text(excluded_text, candidate.chunk)
-                    continue
-                if not self._is_flagged_figure(candidate.chunk, trust_map):
-                    kept.append(candidate)
-                    continue
-                # 只報告「本來就夠格當證據」的：dense 過門檻，**或**有精確 lexical 數值
-                # 證據（register / hex 題主要走後者，漏掉等於這類題完全沒揭露）。
-                if (candidate.gate_score >= base_threshold
-                        or self._has_lexical_numeric_evidence(
-                            question, candidate.gate_bm25, candidate.chunk)):
-                    self._collect_excluded_figure(
-                        excluded_figures, candidate.chunk,
-                        self._figure_status_for(candidate.chunk, trust_map),
-                        reasons=self._figure_reasons_for(candidate.chunk, trust_map),
-                        reason_details=self._figure_reason_details_for(
-                            candidate.chunk, trust_map),
-                    )
-            candidates = kept
-            empty_metadata["excluded_figures"] = excluded_figures
-            trace["stage"] = "strict"
-            if not candidates:
-                # 全部被排除：後面的 _decision_order(candidates)[0] 會直接 IndexError，
-                # 這裡必須立刻返回（並且要把待覆核清單交出去）。
-                return _stop("strict_all_excluded")
+            return "", "", empty_metadata
 
         # 門檻一律吃 gate（content-only）分數。排序可以被生成脈絡影響，
         # 「夠不夠格當證據」不行——那正是規格 §2 說的分數面循環 grounding：
-        # 錯誤脈絡把弱原文推過 strict 門檻。
+        # 錯誤脈絡把弱原文推過門檻。
         decision_ranked = self._decision_order(candidates)
         top_gate_score = decision_ranked[0].gate_score
         min_gate_score = max(base_threshold, top_gate_score * DYNAMIC_THRESHOLD_RATIO)
@@ -3422,7 +3243,6 @@ English:"""
             question,
             filtered,
             rerank_output_k,
-            is_strict_mode=is_strict_mode,
         )
         reranked_chunks = [chunk for _score, chunk in reranked]
         output = [{"id": chunk.get("id"), "score": _r4(score)} for score, chunk in reranked]
@@ -3491,8 +3311,8 @@ English:"""
             "selected": [chunk.get("id") for chunk in top_chunks],
         }
 
-        # marker → figure chunk：在合併/過濾**之前**補進來，後面的 strict gate、
-        # 截斷計畫與去重才會一視同仁地作用在它身上（待覆核的圖照樣會被擋下）。
+        # marker → figure chunk：在合併/過濾**之前**補進來，後面的截斷計畫、狀態標示
+        # 與去重才會一視同仁地作用在它身上（待覆核的圖照樣帶著狀態）。
         top_chunks = self._resolve_replaced_figures(top_chunks)
 
         merged_chunks = self._merge_adjacent_chunks(top_chunks)
@@ -3502,30 +3322,8 @@ English:"""
         merged_chunks = self._filter_noisy_chunks(merged_chunks)
         merged_chunks = self._deduplicate_chunks(merged_chunks)
 
-        # 第二道 strict gate（縱深防禦）：gate 必須在 code 層成立，不能只靠上面那一道
-        # 或 prompt 提醒。合併/過濾之後再確認一次，順便把這裡才浮現的圖收進清單。
-        if is_strict_mode and merged_chunks:
-            kept_chunks = []
-            for chunk in merged_chunks:
-                if self._contains_mineru_text(chunk) and not self._text_eligibility(chunk)["eligible"]:
-                    self._collect_excluded_text(excluded_text, chunk)
-                    continue
-                if self._is_flagged_figure(chunk, trust_map):
-                    self._collect_excluded_figure(
-                        excluded_figures, chunk,
-                        self._figure_status_for(chunk, trust_map),
-                        reasons=self._figure_reasons_for(chunk, trust_map),
-                        reason_details=self._figure_reason_details_for(chunk, trust_map),
-                    )
-                    continue
-                kept_chunks.append(chunk)
-            merged_chunks = kept_chunks
-            if not merged_chunks and (excluded_figures or excluded_text):
-                empty_metadata["excluded_figures"] = excluded_figures
-                return _stop("strict_all_excluded_after_merge")
-
         # REF 預算下每個 structured chunk 實際顯示得到哪裡：先算，因為「連一列完整資料
-        # 都放不進來」的 chunk 在 strict 不能算證據（模型看不到任何數值，卻會拿到一個
+        # 都放不進來」的 chunk 不能撐起 spec／權威旗標（模型看不到任何數值，卻會拿到一個
         # has_ref=True + has_authoritative_chunk=True 的成功回應）。以 id() 當 key，
         # 後面的過濾不會讓索引錯位。
         max_ref_chars = (KNOWLEDGE_MERGE_MAX_CHARS if KNOWLEDGE_MERGE_ADJACENT
@@ -3543,25 +3341,6 @@ English:"""
         def _shows_no_row(chunk: dict) -> bool:
             info = truncation_plan.get(id(chunk))
             return bool(info) and not info.get("shown_atoms")
-
-        if is_strict_mode and truncation_plan:
-            kept_chunks = []
-            for chunk in merged_chunks:
-                if _shows_no_row(chunk):
-                    self._collect_excluded_figure(
-                        excluded_figures, chunk,
-                        self._figure_status_for(chunk, trust_map),
-                        reasons=self._figure_reasons_for(chunk, trust_map)
-                        + [_REASON_TRUNCATED_NO_ROW],
-                        reason_details=self._figure_reason_details_for(chunk, trust_map)
-                        + [_DETAIL_TRUNCATED_NO_ROW],
-                    )
-                    continue
-                kept_chunks.append(chunk)
-            merged_chunks = kept_chunks
-            if not merged_chunks and excluded_figures:
-                empty_metadata["excluded_figures"] = excluded_figures
-                return _stop("strict_all_excluded_after_merge")
 
         # spec 優先提示只算「有效可信」的 chunk：待覆核的圖片 chunk 帶的是文件級
         # doc_type，讓它觸發「spec 類型的 REF 優先級較高」等於把未驗證內容排到前面。
@@ -3612,6 +3391,8 @@ English:"""
         # 逐 REF 的截斷資訊（與 merged_chunks 對齊）與出身統計。VL 標記改成在迴圈裡收集：
         # native lane 的 structured chunk 不是視覺模型產物，不能被算進 VL 提示。
         ref_truncation = []
+        # 逐 REF 的內容身分（與 merged_chunks 對齊，見 _ref_content_identity）
+        ref_content_identity = []
         vl_label_used = False
         structured_ref_used = False
         vl_sources = set()
@@ -3674,7 +3455,9 @@ English:"""
                     )
                 if section:
                     model_lines.append(f"  section: {section}")
-                model_lines.append(f"  content: {content}")
+                printed = f"{content}"
+                model_lines.append(f"  content: {printed}")
+                ref_content_identity.append(_ref_content_identity(printed))
             else:
                 # 關掉內容時 status/reasons/range 照樣要揭露：這個開關管的是 content 本身，
                 # 不是揭露義務（CONTRACT §6.6）。內容一個字都沒印 = 一定沒顯示完。
@@ -3689,6 +3472,7 @@ English:"""
                     model_lines.extend(
                         self._structured_ref_lines(chunk, status, trunc, trust_map)
                     )
+                ref_content_identity.append(_ref_content_identity(""))
 
             ref_truncation.append(trunc)
 
@@ -3722,11 +3506,6 @@ English:"""
                 "不得假設整張表/整份 log 都在這裡；與其他 REF 衝突時同樣要並列兩邊的數值與"
                 "出處，標明「衝突未解，需人工覆核」，不得逕自宣告哪一邊為準"
             )
-        if is_strict_mode and excluded_figures:
-            model_lines.append(self._excluded_figures_line(excluded_figures))
-        if is_strict_mode and excluded_text:
-            model_lines.append(self._excluded_text_line(excluded_text))
-
         model_output = "\n".join(model_lines)
 
         doc_pages = {}
@@ -3770,11 +3549,11 @@ English:"""
         # 將 has_spec_chunk 改為 has_authoritative_chunk
         # 權威類型：spec、manual、api（chat/diagram 不算權威）
         # structured figure chunk 的 type 是**文件級** doc_type（datasheet → spec），
-        # 未通過驗證的圖片內容因此會冒充權威來源，讓 utils.should_refuse_answer 不再拒答。
+        # 未通過驗證的圖片內容因此會冒充權威來源（eval 與 kb_ab_compare 都讀這個旗標）。
         # 判定用 figure 層級狀態：同一張圖只要有一個 part 待覆核，整張都不算權威。
         authoritative_types = {'spec', 'manual', 'api'}
         # 「一列完整資料都沒顯示出來」的 REF 不得撐起權威旗標：模型手上沒有任何數值，
-        # utils.should_refuse_answer 卻會因此不拒答。
+        # 旗標卻宣稱命中了權威來源。
         has_authoritative_chunk = any(
             chunk.get('type') in authoritative_types
             and not self._is_flagged_figure(chunk, trust_map)
@@ -3793,6 +3572,8 @@ English:"""
         refs = []
         for index, c in enumerate(merged_chunks):
             trunc = ref_truncation[index] if index < len(ref_truncation) else {}
+            identity = (ref_content_identity[index] if index < len(ref_content_identity)
+                        else _ref_content_identity(""))
             is_figure = _is_figure_chunk(c)
             refs.append({
                 "source": c.get("source", ""),
@@ -3803,7 +3584,7 @@ English:"""
                 "origin": c.get("origin", ""),
                 **self._text_ref_metadata(c),
                 # PDF 內嵌圖的頁內序號：同頁多張圖若 VL 標題相同，少了它
-                # 下游（MCP / strict / flywheel / eval）就分不出是哪一張。
+                # 下游（MCP / 審核 / flywheel / eval）就分不出是哪一張。
                 # 非圖 chunk 是 None。
                 "figure_index": c.get("figure_index"),
                 "figure_id": str(c.get("figure_id", "") or ""),
@@ -3823,6 +3604,8 @@ English:"""
                 "truncated": bool(trunc.get("truncated")),
                 # 實際完整顯示的原子範圍（截斷時才有值）
                 "shown_range": list(trunc["shown_range"]) if trunc.get("shown_range") else None,
+                # 這筆 REF 在 text 裡 `content:` 之後實際印出的字串身分（給客戶端審核對位）
+                **identity,
             })
 
         # trace 的最終 REF:與上面 refs 用同一份 merged_chunks / ref_truncation,逐筆對齊。
@@ -3885,9 +3668,6 @@ English:"""
             "has_authoritative_chunk": has_authoritative_chunk,  # 是否命中權威類型（spec/manual/api）
             "ref_count": len(merged_chunks),
             "refs": refs,                         # 實際引用的 REF 清單
-            # strict 模式被 gate 擋掉的圖（完整清單，不截斷）：page/figure/status/reasons
-            "excluded_figures": excluded_figures,
-            "excluded_text": excluded_text,
             # P0-Eval: 供 eval 用的 retrieved_chunks 內容
             "retrieved_chunks": retrieved_chunks, # chunk 內容列表，用於 Layer 1 Recall 評估
             # P0 改進：Margin-based 風險判斷

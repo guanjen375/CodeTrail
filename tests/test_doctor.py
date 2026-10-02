@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ── 原 test_doctor.py:doctor 健檢 ──
 
-def _write_profile_model(home: Path, model: str) -> None:
+def _write_profile_model(home: Path, model: str, *, auditor: str | None = None) -> None:
     """把主模型寫進 tmp HOME 的 deployment.json —— 現在**唯一**的來源。
 
     2026-09-04:doctor 的測試從 `monkeypatch.setenv("AICODE_MODEL", ...)` 改成
@@ -37,12 +37,16 @@ def _write_profile_model(home: Path, model: str) -> None:
     """
     cfg_dir = home / ".config" / "codetrail"
     cfg_dir.mkdir(parents=True, exist_ok=True)
+    services = {"main": {"model": model}}
+    if auditor is not None:
+        # 審核模型是必要角色;沒寫就是「未設定」,doctor 會如實 FAIL。
+        services["auditor"] = {"model": auditor}
     (cfg_dir / "deployment.json").write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "profile": "defaults",
-                "services": {"main": {"model": model}},
+                "services": services,
             }
         ),
         encoding="utf-8",
@@ -64,7 +68,9 @@ def test_doctor_no_network_exits_clean(monkeypatch, tmp_path):
     """
     gguf = tmp_path / "fake.gguf"
     gguf.write_text("not a real gguf")
-    _write_profile_model(tmp_path, str(gguf))
+    auditor = tmp_path / "fake-auditor.gguf"
+    auditor.write_text("not a real gguf")
+    _write_profile_model(tmp_path, str(gguf), auditor=str(auditor))
     env = {**os.environ}
     env["HOME"] = str(tmp_path)
     env["USERPROFILE"] = str(tmp_path)
@@ -900,7 +906,7 @@ def test_expected_tool_contract_matches_mcp_server():
     source = (canary.REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8")
     registered = set(check_readme_consistency._mcp_tool_names(source))
     assert registered == canary.EXPECTED_MCP_TOOLS
-    assert len(registered) == 21
+    assert len(registered) == 20
 
 
 

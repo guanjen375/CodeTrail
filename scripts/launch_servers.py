@@ -39,6 +39,7 @@ from deployment_profile import (  # noqa: E402
     ProfileError,
     ServiceProfile,
     add_loader_arguments,
+    auditor_unconfigured_reason,
     build_server_command,
     load_effective_profile,
     loader_argv,
@@ -56,6 +57,7 @@ WINDOWS = {
     "embedding": "embed",
     "reranker": "rerank",
     "vl": "vl",
+    "auditor": "audit",
 }
 
 
@@ -67,11 +69,13 @@ def _positive_int(value: str) -> int:
 
 
 def _scope_roles(scope: str) -> tuple[str, ...]:
+    """啟動順序。審核模型(auditor)**永遠在 VL 之前**:VL 用 --fit 依「已啟動服務的
+    實際占用」決定層數,在它之後才起的服務沒有 VRAM 可用。"""
     if scope == "main":
         return ("main",)
     if scope == "aux":
-        return ("embedding", "reranker", "vl")
-    return ("main", "embedding", "reranker", "vl")
+        return ("embedding", "reranker", "auditor", "vl")
+    return ("main", "embedding", "reranker", "auditor", "vl")
 
 
 def _sessions(args: argparse.Namespace) -> dict[str, str]:
@@ -131,7 +135,9 @@ def _health_timeout(role: str, explicit: int | None = None, artifact_bytes: int 
     `--health-timeout` 給了就是它(以前是兩個環境變數,兩份安裝會互相蓋)。"""
     if explicit is not None:
         return explicit
-    if role != "main":
+    # 審核模型可能是 35B MoE 之類的大檔:跟 main 一樣依大小放寬,固定 60s 會把
+    # 「還在載入」誤判成失敗。
+    if role not in ("main", "auditor"):
         return 60
     size_gib = artifact_bytes / (1024**3)
     return max(300, min(1800, int(size_gib * 5)))
@@ -251,7 +257,7 @@ def _print_dry_run(
     for role in roles:
         service = profile.service(role)
         command = _command_for(service, profile, must_exist=False)
-        prefix = {"embedding": "embed", "reranker": "rerank"}.get(role, role)
+        prefix = {"embedding": "embed", "reranker": "rerank"}.get(role, role)  # auditor → auditor_
         print(f"{prefix}_base_url={service.base_url}")
         print(f"{prefix}_host={urlsplit(service.base_url).hostname or ''}")
         print(f"{prefix}_bind_host={command[command.index('--host') + 1]}")
@@ -440,6 +446,12 @@ def launch(
     在 pane 內決定。"""
     if profile.mode == "client":
         raise ProfileError("client mode does not launch models; run the launcher on A")
+    if "auditor" in roles:
+        # 啟動**任何**服務之前就拒絕:半套啟動(main 已載入幾分鐘才發現審核模型沒設)
+        # 只會留下要 rollback 的現場。
+        reason = auditor_unconfigured_reason(profile)
+        if reason:
+            raise ProfileError(reason)
     services = [profile.service(role) for role in roles]
     _check_port_collisions(services)
     warn_cpu_moe_fit_conflicts(services)
@@ -498,7 +510,7 @@ def launch(
                 _artifact_bytes(
                     Path(resolve_model_reference(service.model, registry_file=registry))
                 )
-                if service.role == "main"
+                if service.role in ("main", "auditor")
                 else 0
             )
             _wait_for_health(
@@ -536,7 +548,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="print resolved commands without launching")
     parser.add_argument(
         "--health-timeout", type=_positive_int, default=None,
-        help="等 /health=ok 的上限秒數(預設:main 依模型大小 300..1800、附屬 60)",
+        help="等 /health=ok 的上限秒數(預設:main 與審核模型依模型大小 300..1800、其他附屬 60)",
     )
     parser.add_argument(
         "--keep-on-failure", action="store_true",

@@ -236,7 +236,7 @@ THEME_CSS = """
 /* markdown_render.rs：標題靠左、區塊之間一個空白行，回答第一行就接在「• 」後面。 */
 .-theme-codex MarkdownHeader { margin: 1 0 1 0; content-align: left middle; }
 .-theme-codex AssistantBlock Markdown > MarkdownBlock:first-child { margin-top: 0; }
-.-theme-codex ToolBlock, .-theme-codex SummaryBlock {
+.-theme-codex ToolBlock, .-theme-codex SummaryBlock, .-theme-codex AuditBlock {
     background: $background; border-top: none; padding: 0; margin: 0 0 1 0;
 }
 .-theme-codex ToolBlock > CollapsibleTitle, .-theme-codex SummaryBlock > CollapsibleTitle {
@@ -246,7 +246,10 @@ THEME_CSS = """
 .-theme-codex ToolBlock.-status-error > CollapsibleTitle,
 .-theme-codex ToolBlock.-status-denied > CollapsibleTitle { color: $error; }
 .-theme-codex SummaryBlock > CollapsibleTitle { text-style: dim; }
-.-theme-codex ToolBlock > Contents, .-theme-codex SummaryBlock > Contents { padding: 0 0 0 2; }
+/* 審核卡：結論的顏色沿用 App 層的 .-audit-* 規則（兩主題相同），這裡只改版面。 */
+.-theme-codex AuditBlock > CollapsibleTitle { padding: 0; text-style: none; }
+.-theme-codex ToolBlock > Contents, .-theme-codex SummaryBlock > Contents,
+.-theme-codex AuditBlock > Contents { padding: 0 0 0 2; }
 
 /* ---- codex：bottom pane ---- */
 .-theme-codex #activity.-active { display: block; }

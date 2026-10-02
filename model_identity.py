@@ -93,6 +93,11 @@ def _capture_model_identity(role: str, *, profile=None, props=None) -> dict:
     """
     profile = profile or deployment_profile.load_effective_profile()
     service = profile.service(role)
+    if deployment_profile.service_unconfigured(service):
+        # 審核模型未設定:沒有端點可核對,給修法而不是一句 URL 格式錯誤。
+        raise ModelIdentityError(
+            f"{role}: {deployment_profile.auditor_unconfigured_reason(profile)}"
+        )
     import endpoint_policy
     endpoint_policy.ensure_allowed(service.base_url + "/props", role, split=profile.mode == "client")
     if props is None:

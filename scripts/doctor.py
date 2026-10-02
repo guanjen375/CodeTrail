@@ -43,6 +43,7 @@ import endpoint_policy  # noqa: E402
 import process_env  # noqa: E402
 from deployment_profile import (  # noqa: E402
     ProfileError,
+    auditor_unconfigured_reason,
     load_effective_profile,
     resolve_model_reference,
 )
@@ -220,14 +221,25 @@ def _read_config():
 
 
 # ============================================================
-# llama-server 健康檢查 (4 個 port 各自)
+# llama-server 健康檢查 (每個 role 的 port 各自)
 # ============================================================
 _LLAMA_SERVERS = [
     ("LLAMA_BASE_URL",       "main",      True),   # 主聊天/程式推導 — 必要
     ("LLAMA_EMBED_BASE_URL", "embedding", True),   # embedding — 必要(RAG / KB 都吃)
     ("LLAMA_RERANK_BASE_URL","reranker",  True),   # reranker — 必要(RAG / Code RAG hard gate)
     ("LLAMA_VL_BASE_URL",    "VL",        True),   # 視覺 — 必要(圖片 / RAG ingestion hard gate)
+    ("LLAMA_AUDITOR_BASE_URL", "auditor", True),   # 審核模型 — 必要(aicode 啟動時檢查)
 ]
+
+
+def _auditor_gap() -> str | None:
+    """審核模型未設定時回修法訊息(與 launcher / aicode 同一個來源);profile 壞掉回 None,
+    那由 check_deployment_profile 報。"""
+    try:
+        profile = load_effective_profile(_profile_env(), profile=_profile_selection())
+    except ProfileError:
+        return None
+    return auditor_unconfigured_reason(profile)
 
 
 def check_parsers(r: Result) -> None:
@@ -271,7 +283,11 @@ def check_endpoint_policy(r: Result) -> None:
     from urllib.parse import urlparse
 
     if getattr(cfg, "DEPLOYMENT_MODE", "local") == "client" or getattr(cfg, "MODEL_ENDPOINTS", {}):
+        gap = _auditor_gap()
         for attr, role, _ in _LLAMA_SERVERS:
+            if role == "auditor" and gap:
+                r.fail(gap)
+                continue
             try:
                 endpoint_policy.ensure_allowed(getattr(cfg, attr), role.lower(), split=True)
                 r.ok(f"{role}: exact client.json endpoint authorization ({getattr(cfg, attr)})")
@@ -349,7 +365,11 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
         return {}
 
     import llama_client
+    gap = _auditor_gap()
     for attr, role, required in _LLAMA_SERVERS:
+        if role == "auditor" and gap:
+            r.fail(gap)
+            continue
         url = getattr(cfg, attr, None)
         if not url:
             r.warn(f"config.{attr} 沒值,跳過 {role} server 檢查")
@@ -507,7 +527,7 @@ def check_models(r: Result, server_status: dict[str, dict]) -> None:
                 r.ok(f"主 server 載入的 {loaded_basename} 與解析出的主模型一致")
 
     # 報附屬 server 載入的 model (informational)
-    for role in ("embedding", "reranker", "VL"):
+    for role in ("embedding", "reranker", "VL", "auditor"):
         srv = server_status.get(role)
         if not srv:
             continue
@@ -535,15 +555,20 @@ def check_deployment_profile(
         f"deployment profile={profile.selected_profile} "
         f"verification={profile.verification} hardware={profile.hardware}"
     )
+    gap = auditor_unconfigured_reason(profile)
     if profile.mode == "client":
-        r.info("topology=client (B); four model services on A")
+        r.info("topology=client (B); model services on A")
         for role, service in profile.services.items():
             r.info(f"[{role}] endpoint={service.base_url} model={service.model}")
+        if gap:
+            r.fail(gap)
         if no_network:
             r.info("remote identity/capabilities not checked (--no-network)")
             return
         from model_identity import capture_model_identity, ModelIdentityError
         for role in profile.services:
+            if role == "auditor" and gap:
+                continue
             record = server_status.get(role) or server_status.get(role.upper()) or {}
             props = record.get("props")
             try:
@@ -558,7 +583,9 @@ def check_deployment_profile(
         return
     if profile.verification != "verified":
         r.warn(f"deployment profile {profile.selected_profile} 尚未標記為 verified")
-    for role in ("main", "embedding", "reranker", "vl"):
+    if gap:
+        r.fail(gap)
+    for role in ("main", "embedding", "reranker", "vl", "auditor"):
         service = profile.service(role)
         r.info(
             f"profile [{role}] port={service.port} gpu_role={service.gpu_role} "
@@ -570,8 +597,10 @@ def check_deployment_profile(
         return
 
     # Compare loaded artifacts even if nvidia-smi is unavailable.
-    for role in ("main", "embedding", "reranker", "vl"):
+    for role in ("main", "embedding", "reranker", "vl", "auditor"):
         service = profile.service(role)
+        if role == "auditor" and gap:
+            continue
         srv = server_status.get(role) or (server_status.get("VL") if role == "vl" else None)
         props = srv.get("props") if isinstance(srv, dict) else None
         loaded = str(props.get("model_path") or "") if isinstance(props, dict) else ""
@@ -579,7 +608,7 @@ def check_deployment_profile(
             continue
         try:
             expected = resolve_model_reference(
-                service.model, _profile_env(), registry_file=profile.registry_file
+                service.model, _profile_env(), registry_file=profile.registry_file, role=role
             )
         except ProfileError as exc:
             r.fail(f"profile [{role}] expected model cannot be resolved: {exc}")
@@ -609,7 +638,7 @@ def check_deployment_profile(
         server_reader=server_reader,
         gpu_inventory=query_gpu_inventory(),
     )
-    for role in ("main", "embedding", "reranker", "vl"):
+    for role in ("main", "embedding", "reranker", "vl", "auditor"):
         observation = inspection.observations[role]
         r.info(
             f"runtime [{role}] PID={observation.pid or '-'} "

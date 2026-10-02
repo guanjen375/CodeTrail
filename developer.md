@@ -40,7 +40,7 @@ scripts/configure-advanced.sh
 
 ### A／B 分離部署
 
-A（host）執行 main、embedding、reranker、VL 四個 llama-server；B（device）執行
+A（host）執行 main、審核模型（auditor）、embedding、reranker、VL 五個 llama-server；B（device）執行
 `aicode`、MCP、原始碼編輯、build 與 KB。B 不需要 GPU、GGUF、mmproj、tmux 或 llama-server。
 未設定 `mode` 的既有部署保持 `local`；另外兩種模式是 `model-host`（A）與 `client`（B）。
 
@@ -53,12 +53,12 @@ scripts/codetrail-host.sh
 ```
 
 首次會引導模型、GPU、context 與網路設定。開放區網需要明確同意；再輸入 A 對 B 的
-literal 私有 IPv4（服務綁定 `0.0.0.0`），供產生四個角色的端點交接資料。腳本使用既有設定與 launcher 啟動服務，
+literal 私有 IPv4（服務綁定 `0.0.0.0`），供產生五個角色的端點交接資料。腳本使用既有設定與 launcher 啟動服務，
 已運作的服務先核對狀態，不為了再次執行腳本而盲目重啟。
 
 依終端顯示的方式保存完整 client manifest，透過組織允許的方式移到 B。
 manifest 含目的地、模型版本 ID 與主模型的 `thinking_kwarg` 能力，不含 GPU、本機模型路徑或任何授權。
-四個 port 來自 A 的 deployment profile。A 的防火牆應只允許 B 的來源位址連線；
+五個 port 來自 A 的 deployment profile。A 的防火牆應只允許 B 的來源位址連線；
 程式端白名單不能代替網路 ACL。原生 HTTP 不提供加密，需使用組織管理的安全直連網路，
 或已正確配置憑證的 HTTPS endpoint；TLS 驗證不會關閉。
 
@@ -69,6 +69,12 @@ model-host 設定會串流計算每個 GGUF（含所有 shard）及 VL projector
 主模型的 thinking 能力也會依新 GGUF chat template 重新偵測；B 匯入 manifest 時保留它。
 沒有能力欄位的舊 manifest 或逐角色手動輸入的設定視為未知，`/think on` 不可用，
 所有請求仍明確送出 off。這不是 B 的永久聊天偏好。
+
+**從四角色舊版升級**：A 的舊設定沒有審核模型，`~/start.sh` 會在啟動任何服務前說明並拒絕。
+在 A 用 `scripts/configure-advanced.sh` 選 3（model-host）選擇審核模型並重啟，再以選單 6 匯出
+含審核模型的新 manifest。B 的舊 `deployment.json`／`client.json`（四角色）仍可載入，不會讓精靈或
+`aicode` 在讀檔時就失敗，但不授權任何審核模型流量；`aicode` 會在進 TUI 前說明缺少審核模型端點並拒絕。
+到 B 以 `scripts/configure-advanced.sh` 重新匯入新 manifest 即可；舊 A 匯出、沒有審核模型的 manifest 會被拒絕。
 
 [DSpark 推測解碼](#dspark) 可在 A 的主模型設定中選擇，或由附加入口選單 7 獨立調整；
 B 不設定本地 draft。A 開啟、關閉或換 draft 後，重啟服務，再以附加入口選單 6 匯出新的 manifest 交給 B
@@ -91,18 +97,18 @@ cd <PROJECT_TO_ANALYZE>
 <CODETRAIL_REPO>/scripts/codetrail-device.sh
 ```
 
-首次依提示提供 manifest 的本地路徑。精靈會完整顯示四角色 URL 與 alias，
+首次依提示提供 manifest 的本地路徑。精靈會完整顯示五個角色的 URL 與 alias，
 明確確認後才把目的地寫入 `deployment.json`，把精確授權寫入 owner-only
 `client.json.model_endpoints`。KB 脈絡生成可能傳送較大範圍文件，需獨立同意
 `kb_context_remote_ok`，一般模型端點授權不包含這項授權。
 
 B 只寫上述兩個設定檔，不建立或覆寫 `models.json`、`~/start.sh`。
 設定完成後會在原專案目錄啟動 `aicode`；已有 client 設定時直接走同一個入口，
-包含正常 preflight、四個 live alias 與主模型 live n_ctx 核對。
+包含正常 preflight、五個 live alias、主模型與審核模型的 live n_ctx 核對。
 之後也可以在專案目錄直接輸入 `aicode`。重新設定或還原最近一次交易，執行
 `scripts/configure-advanced.sh` 依選單操作。
 
-端點限原生 llama-server 根 URL、literal 私有 IP，四角色 origin 必須不同。
+端點限原生 llama-server 根 URL、literal 私有 IP，五個角色的 origin 必須不同。
 拒絕 hostname、credentials、query/fragment、未核准 scheme/IP/port/path、第三方 provider、
 環境 proxy、netrc 與 redirect。修改 `deployment.json` 不會擴大 `client.json` 的授權；
 client 模式的 `model_remote_ok: true` 也不能繞過精確白名單。
@@ -116,13 +122,13 @@ client 模式的 `model_remote_ok: true` 也不能繞過精確白名單。
 
 B 的 strict status 與啟動觀測 live health、alias、capabilities 與 main 的 live n_ctx，
 不以本機檔案、GPU/PID 或設定 ctx 猜測服務狀態。client 模式的 launch 拒絕執行；
-stop 說明須在 A 操作，不終止 B 的其他行程。離線設定檢查不能宣稱四模型已驗證。
+stop 說明須在 A 操作，不終止 B 的其他行程。離線設定檢查不能宣稱五個模型已驗證。
 
 `model_identity.capture_model_identity(role)` 只發 `/props` GET。
 local 身分核對 live model_path 並 hash 本機模型；client 身分核對版本 alias 與 live 資料，
 記為 `declared-runtime-alias`、`artifact_sha256: null`。這表示核對 A 宣告的版本，
 不表示 B 讀過或獨立驗證 A 的權重內容。缺失或不符的 live 身分不會重用舊 cache。
-checkpoint 與私人 session eval 保留這個差別，eval 同時綁定四角色身分；replay
+checkpoint 與私人 session eval 保留這個差別，eval 同時綁定主模型與三個附屬模型的身分（replay 不審核，不含審核模型）；replay
 只繼承 owner-only 端點授權，壓縮與工具權限等評測行為仍固定。
 
 離線 smoke 使用合成模型與 mock HTTP；未在兩台真實主機完成操作時，不能視為雙機驗收。
@@ -210,7 +216,7 @@ python3 scripts/launch_servers.py --scope all --dry-run
 | `permission` | `{}`；逐工具 `allow`／`ask`／`deny`，不能放寬 readonly |
 | `theme` | `default`；可選 `default`／`codex`，TUI `/theme` 預覽後保存，見[使用指南](docs/usage.md#theme) |
 | `model_remote_ok` | `false`；local／model-host 的非 loopback 模型流量需明示同意 |
-| `model_endpoints` | client 模式四角色的精確端點授權，由匯入流程建立；不能由上一鍵繞過 |
+| `model_endpoints` | client 模式五個角色的精確端點授權，由匯入流程建立；不能由上一鍵繞過。舊版的四角色授權仍可載入，但不授權審核模型 |
 | `kb_context_remote_ok` | `false`；Contextual Retrieval 文件窗外送的獨立同意 |
 | `external_import`／`external_import_roots` | `false`／`[]`；開啟時來源目錄必填（TUI `/import on` 會補 `["~/Downloads","/tmp"]`），重開生效；每次匯入仍核准，見[使用指南](docs/usage.md#external-attachments) |
 | `build_commands` | `false`；明示開啟 make／cmake／ninja／meson／bazel，意味可能執行專案程式 |
@@ -235,7 +241,7 @@ python3 scripts/launch_servers.py --scope all --dry-run
 
 ### Deployment profile schema
 
-`deployment_profile.py` 是 main、embedding、reranker、VL 的共同設定入口。它只用
+`deployment_profile.py` 是 main、auditor（審核模型）、embedding、reranker、VL 的共同設定入口。它只用
 Python 3.10 stdlib 讀 JSON，採封閉 schema/參數 allowlist，不執行 JSON 內容。
 
 #### 選擇與優先序
@@ -270,7 +276,7 @@ GPU 選擇都在那一步剝掉,GPU 只由本檔驗證過的值重新指定。
 #### Service schema
 
 最上層 `mode` 接受 `local`（省略時的預設）、`model-host`（A）及 `client`（B）。
-以下 GPU／模型檔／啟動參數屬於本機模型主機設定；client 使用四角色的 `base_url`、
+以下 GPU／模型檔／啟動參數屬於本機模型主機設定；client 使用五個角色的 `base_url`、
 版本化 `model`／`identity_alias` 與 main 的 `thinking_kwarg`，不需本機 GGUF、mmproj、GPU 或 llama-server。
 `identity_alias` 在 model-host 由權重與 projector 的完整 SHA-256 產生並傳給 `--alias`。
 client 的目的地仍須獨立通過 owner-only `client.json.model_endpoints`；profile 不授權連線。
@@ -287,7 +293,9 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
 
 - `model`：`models.json` key 或 GGUF 絕對路徑；main 可在基底中為 `null`，但啟動
   main 時一定 fail-loud，直到 local override 的 `services.main.model`(或一次性的
-  `--main-model`)明確指定。
+  `--main-model`)明確指定。auditor（審核模型，預設 port 8084、`gpu_role: "aux"`）同樣沒有
+  內建預設模型：`null` 代表「已知但未設定」，設定可以載入，但 launcher、`aicode` preflight 與
+  doctor 都在使用前 fail-loud 並給修法（本機重跑 `./set_config.sh`；A／B 見上方升級說明）。
 - `thinking_kwarg`（只有 main）：`null`、`"enable_thinking"` 或 `"thinking"`。
   `set_config.sh` 有界讀取選中 GGUF 的 `tokenizer.chat_template` 與 `tool_use` variant，
   用 Jinja2 只解析 AST，不執行模板，不靠模型名稱、註解或文字猜測。只有可確認的
@@ -302,7 +310,7 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
 - `bind`：`local`(預設,loopback base_url 只綁 `127.0.0.1`)或 `all-interfaces`
   (綁 `0.0.0.0`,對其他機器開放 —— CodeTrail 目前產生的 server 指令未啟用
   認證,慎用)。要開放就寫進 local override(或 `python3 scripts/set_config.py --allow-remote`
-  一次寫好四個 role);非 loopback 的 base_url host 不受影響、照原樣綁定。
+  一次寫好所有 role);非 loopback 的 base_url host 不受影響、照原樣綁定。
 - `gpu_role`：只能是 `main` 或 `aux`。
 - `gpu`(選填)：這個 role 要用的 GPU selector,UUID 或 `nvidia-smi` index;缺席 =
   不指定卡。`build_server_command` 只把驗證過的值輸出成 `env CUDA_VISIBLE_DEVICES=<值>`
@@ -310,7 +318,7 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
 - `ctx`、`batch`、`ubatch`：正整數或明確 `null`；`null` 代表不傳該 llama.cpp flag。
 - `parameters`：role-specific allowlist；未知 key 直接拒絕。完整清單以
   `deployment_profile.py::_ROLE_PARAMETERS` 為單一事實來源，目前是：
-  - 四個 role 共用：`gpu_layers`、`flash_attention`、`no_mmap`、`parallel`。
+  - 所有 role 共用：`gpu_layers`、`flash_attention`、`no_mmap`、`parallel`。
   - main：另有 `jinja`、`temperature`、`top_p`、`top_k`、`min_p`、
     `presence_penalty`、`cache_type_k`、`cache_type_v`、`cpu_moe`、`n_cpu_moe`、
     `threads`、`fit`、`fit_target`。
@@ -318,6 +326,9 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
   - reranker：另有固定角色旗標 `embedding` / `pooling` / `reranking` 與
     `cache_ram`。
   - VL：另有 `fit`、`fit_target`、`cpu_moe`、`n_cpu_moe`。
+  - auditor：另有 `jinja`、`cache_type_k`、`cache_type_v`、`threads`、`fit`、`fit_target`、
+    `cpu_moe`、`n_cpu_moe`（不收取樣參數：審核請求一律自帶 temperature 0 與兩個 thinking false）。
+    `set_config.sh` 寫 `-np 1`、`jinja`、`-fa on`、q8_0 KV、`-ngl 99` 與 `fit: "off"`，MoE 才加 CPU-MoE。
 
   主要映射包括 `gpu_layers` → `-ngl`、`flash_attention` → `-fa`、`no_mmap` →
   `--no-mmap`、`parallel` → `-np`；main 的 sampling / KV cache 欄位也會逐參數轉成
@@ -326,7 +337,7 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
   `cpu_moe: true`(→ `--cpu-moe`)用於 VRAM / CPU-MoE 配置。VL 也支援
   `fit` / `fit_target`，讓最後
   啟動的 VL 依其他 aux 實際占用保留 VRAM。`cpu_moe` 與部分 offload 的
-  `n_cpu_moe`(→ `--n-cpu-moe`)**只允許 main 與 vl**(embedding / reranker
+  `n_cpu_moe`(→ `--n-cpu-moe`)**只允許 main、auditor 與 vl**(embedding / reranker
   拒絕),且同一個 role 不可同時設定這兩鍵。**`--fit` 與 CPU-MoE 互斥**:llama.cpp 的
   `common_params_fit_impl` 一看到 `tensor_buft_overrides` 已被使用者設定就直接 abort
   (只印一行 WARN 就繼續載入,而 `-ngl auto` 的語意是「全部層上 GPU」)。因此
@@ -342,27 +353,27 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
   沒有衝突,不會每次啟動噴警告。
   刻意不在 schema 層拒絕:`config.py` 在 import 期就載入 effective profile,
   硬拒會讓整個 CodeTrail(含 MCP server)無法啟動。
-  `set_config.sh` 只在偵測到 MoE expert tensors 時詢問 CPU-MoE(main 與 VL 各一題,
+  `set_config.sh` 只在偵測到 MoE expert tensors 時詢問 CPU-MoE(main、審核模型與 VL 各一題,
   沒有 y/n 分流,直接問「幾層 experts 留 RAM」;無預設答案,只給一個推薦區間
   (下界 = 權重剛好放得進該 role 所選 GPU 目前 free VRAM 的層數,上界 = 全部移到
   RAM),例如 `推薦數值:38-43`。估算只含 GGUF 權重 storage(未計 KV cache /
   compute buffer / 共卡的附屬服務),是起點而非保證,也不限制輸入);
-  四個角色固定 `-np 1`,VL 使用 `-ngl auto --fit on --fit-target 3072`
+  所有角色固定 `-np 1`,VL 使用 `-ngl auto --fit on --fit-target 3072`
   (VL 的啟動機制)。層數的值完全由使用者輸入(互動題或
-  `--n-cpu-moe N` / `--vl-n-cpu-moe N` 旗標),工具只驗證 0-1024 範圍:
+  `--n-cpu-moe N` / `--auditor-n-cpu-moe N` / `--vl-n-cpu-moe N` 旗標),工具只驗證 0-1024 範圍:
   `0` = 不 offload(不寫任何 CPU-MoE 鍵)、`N` = `n_cpu_moe: N`、
   輸入超過最大 blk 編號(或 build 不支援 `--n-cpu-moe`)→ `cpu_moe: true`。
   放不放得下 VRAM 以啟動後 `nvidia-smi` 實測為準。
 - embedding 與 reranker 另支援 `cache_ram`(整數 `0..262144` MiB，映射為
   `--cache-ram N`)；內建與 `set_config.sh` 預設都固定為 `0`。這兩種非生成服務的
   prompt cache 無法重用，保留預設 8192 MiB 上限只會讓不同輸入逐步累積 host RAM。
-  main 與 VL 不接受這個 profile key，main 的生成 prompt cache 保持原行為。
+  main、auditor 與 VL 不接受這個 profile key，main 的生成 prompt cache 保持原行為。
   `set_config.sh` 會先探測 build 是否支援 `--cache-ram`，舊 build 直接 fail-loud，
   不會靜默省略安全預設；也不另暴露可能互相矛盾的 `cache_idle_slots`。
 - `no_mmap`(→ `--no-mmap`)屬**使用者領域**,`set_config.sh` 從不自動決定:代價是啟動時要把整份
   權重讀進 RAM,換來 MoE 首次推論不必從 SSD 逐頁 page-in(TTFT 1–2 分鐘 → 5–15 秒)。
   套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告(llama.cpp 自己也會印
-  `tensor overrides to CPU are used with mmap enabled`);**手動加在 main 或 vl 的設定,重跑
+  `tensor overrides to CPU are used with mmap enabled`);**手動加在 main、auditor 或 vl 的設定,重跑
   `set_config.sh` 會保留**(`_PRESERVED_KEYS_BY_ROLE`),不會被當成「未涵蓋鍵」丟掉。
   截至 2026-08，上游 [server 參數文件](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
   已將 `--no-mmap` 標為 deprecated，建議未來轉向 `--load-mode`。CodeTrail 仍保留
@@ -403,13 +414,14 @@ Qwen3 是 causal 架構,除 compute buffer 外還有 KV cache,所以增幅遠高
 #### GPU precedence
 
 ```text
-main:      --main-gpu   > services.main.gpu      > 不指定
-embedding: --embed-gpu  > --aux-gpu > services.embedding.gpu > 不指定
-reranker:  --rerank-gpu > --aux-gpu > services.reranker.gpu  > 不指定
-VL:        --vl-gpu     > --aux-gpu > services.vl.gpu        > 不指定
+main:      --main-gpu    > services.main.gpu      > 不指定
+auditor:   --auditor-gpu > --aux-gpu > services.auditor.gpu  > 不指定
+embedding: --embed-gpu   > --aux-gpu > services.embedding.gpu > 不指定
+reranker:  --rerank-gpu  > --aux-gpu > services.reranker.gpu  > 不指定
+VL:        --vl-gpu      > --aux-gpu > services.vl.gpu        > 不指定
 ```
 
-`--aux-gpu` 只套用到三個附屬 role(`gpu_role: "aux"`),不會影響 main。四個角色都沒有
+`--aux-gpu` 只套用到 `gpu_role: "aux"` 的 role(三個附屬模型與審核模型),不會影響 main。所有角色都沒有
 指定時就不輸出 `CUDA_VISIBLE_DEVICES`,由 llama.cpp 自己決定;殼層或 tmux 裡繼承來的
 同名變數不是輸入,`exec` 之前就剝掉了。
 
@@ -454,14 +466,15 @@ checkout 會對未知鍵 fail-loud,那是封閉 schema 的預期行為。
 內部非互動設定入口是 `python3 scripts/set_config.py --yes`。它會跳過提問與確認頁，
 但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**（保留值與 DSpark 的例外見下方）：
 
-- 模型 / GPU：`--main-model` / `--main-gpu`、`--embed-model` / `--embed-gpu`、
-  `--rerank-model` / `--rerank-gpu`、`--vl-model` / `--vl-gpu`。模型與 GPU 的編號
+- 模型 / GPU：`--main-model` / `--main-gpu`、`--auditor-model` / `--auditor-gpu`、
+  `--embed-model` / `--embed-gpu`、`--rerank-model` / `--rerank-gpu`、`--vl-model` / `--vl-gpu`。模型與 GPU 的編號
   **都從 1 起算**(GPU 編號 = `nvidia-smi` index + 1;互動選單與每張卡的描述行都會
   印出對應的 nvidia-smi index)。VL 配對不唯一時再給 `--vl-mmproj`；單一候選、單卡或
   唯一 mmproj 會自動選用。
-- 數值：`--ctx` 與 `--rerank-ctx`。`--threads` 是非必要的進階旗標；不給就是
+- 數值：`--ctx`、`--auditor-ctx`（8192–1048576，建議 32768）與 `--rerank-ctx`。`--threads` 是非必要的進階旗標；不給就是
   auto（看得到 SMT 不寫 `-t`，看不到就寫 CPU 數一半，規則見上方 `threads`）。
-- MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
+- MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；審核模型使用
+  `--auditor-cpu-moe` / `--no-auditor-cpu-moe` / `--auditor-n-cpu-moe N`；VL 使用
   `--vl-cpu-moe` / `--no-vl-cpu-moe` / `--vl-n-cpu-moe N`。`N=0` 等同不 offload。
 - 網路：`--allow-remote` 才會開放區網連線；未指定只綁 `127.0.0.1`。
 - 路徑(選填,不給就用預設):`--llama-bin <路徑>` 指定 llama-server 執行檔(會轉成
@@ -489,6 +502,11 @@ python3 scripts/stop_servers.py --scope aux
 python3 scripts/launch_servers.py --scope aux
 python3 scripts/launch_servers.py --scope all --keep-on-failure
 ```
+
+`--scope aux` 依序是 embedding → reranker → 審核模型 → VL；`--scope all` 先啟動 main。
+審核模型永遠排在 VL 之前：VL 用 `--fit` 依已啟動服務的實際占用決定層數，排在它之後的服務
+就沒有 VRAM 可用。範圍內有未設定的角色（例如舊設定沒有審核模型）時，launcher 在啟動任何
+服務前就以修法訊息拒絕。
 
 `--health-timeout N` 屬於 launcher；`--timeout N` 屬於 stop。所有值仍由
 部署檔、repo 常數或明示 argv 決定，不讀 shell 的模型設定。
@@ -543,7 +561,8 @@ systemctl --user status codetrail-main
 journalctl --user -u codetrail-main -f    # 看 log
 ```
 
-embedding / reranker / VL 各複製一份，只把 `exec main` 改成對應 role；所有 unit 讀的是
+auditor / embedding / reranker / VL 各複製一份，只把 `exec main` 改成對應 role（審核模型是
+`exec auditor`，要在 VL 之前啟動）；所有 unit 讀的是
 同一份 `deployment.json`。要一次性換設定就在 `ExecStart` 後面加 loader 旗標(例如
 `--profile /absolute/path/experiment.json`、`--main-model <CODE_MODEL>`、
 `--llama-bin /absolute/path/to/llama-server`)，與內部 Python launcher 使用同一個 loader。
@@ -606,7 +625,7 @@ aicode
 並且先在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`
 (見下面「不信任 repo 的安全模式」)。
 
-客戶端**只**暴露 CodeTrail 的 21 個 MCP 工具:沒有第二套內建的 shell / 檔案 / web 工具
+客戶端**只**暴露 CodeTrail 的 20 個 MCP 工具:沒有第二套內建的 shell / 檔案 / web 工具
 可以繞過沙箱。要更嚴的話,`~/.config/codetrail/client.json` 的 `permission` 可以把任何
 工具改成 `ask` 或 `deny`(只能收緊,不能放寬 readonly policy)。
 
@@ -754,7 +773,7 @@ CodeTrail,也建議在那個 project 的 `.gitignore` 補上同樣項目。`.git
 
 ### 模型 API(llama-server)曝光面
 
-四個 CodeTrail 產生的 llama-server(8080–8083)**預設只綁
+五個 CodeTrail 產生的 llama-server(8080–8084,含審核模型)**預設只綁
 `127.0.0.1`，且未啟用認證**。上游 llama-server 目前有 `--api-key` /
 `--api-key-file` 與 TLS 選項，但 CodeTrail 的 profile allowlist 與內部 HTTP client 尚未
 接上這些 credential。因此以目前支援的路徑來看，綁
@@ -786,7 +805,7 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
 ### 快速檢查表
 
 - 從具體專案目錄跑 `aicode`,不要從 `$HOME` 或 `/`。
-- 確認啟動前有 `MCP PASS — 21 tools + list_dir round-trip`；implicit 非 optimal 只代表
+- 確認啟動前有 `MCP PASS — 20 tools + list_dir round-trip`；implicit 非 optimal 只代表
   routing 診斷警告，explicit failure 則會拒絕啟動。
 - 不信任 repo 時在 `client.json` 設 `"project_instructions": false`。
 - 要更嚴的權限時,用 `~/.config/codetrail/client.json` 的 `permission`(只能收緊)。
@@ -891,7 +910,7 @@ python3 scripts/run_tests.py
 ### 啟動與客戶端分工
 
 `aicode` 只解析自己的 checkout／symlink、找到 python3、拒絕 argv／非 TTY、確認 Textual 後
-exec `codetrail_chat.py`。`client_preflight` 負責 sandbox、deployment、live n_ctx、四服務能力、
+exec `codetrail_chat.py`。`client_preflight` 負責 sandbox、deployment、live n_ctx、附屬服務能力、審核模型（health、live n_ctx、token 計數；未設定時給修法）、
 lessons 與 MCP／模型 canary，結果以 argv／物件交給 Engine 和 MCP。正常啟動畫面空白，
 所有摘要與警告留 `/status`；沒有 hidden web backend 或第二組模型工具。
 <a id="review-artifacts"></a>
@@ -1357,7 +1376,7 @@ python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --no-context   # 這次不
 等於在沒有明確同意下把整份文件的窗送去遠端(NDA)。
 
 **雙訊號是這個功能的正確性核心**。`ctx` 是 LLM 生成物,只准影響「哪些 chunk 被撈上來、
-排第幾」。所有**決策**——拒答閘、信心標記、rerank/expansion 的 skip、數值證據判定、
+排第幾」。所有**決策**——信心標記、rerank/expansion 的 skip、數值證據判定、
 污染控制的分數門檻——一律讀 content-only 的 gate 訊號:
 
 - NPZ 存兩組矩陣:`embeddings`(retrieval,含 ctx)與 `embeddings_gate`(content-only),
@@ -1455,7 +1474,7 @@ gate 分 / BM25）、門檻與 margin 決策、通過 gate 的清單、reranker 
 MMR 選了誰、污染控制、最終 REF（成員 id、分數、截斷、前 200 字）與信心結論；`stage` 記到
 哪一步就是在哪一步結束。同一筆也記這次生效的檢索設定與 KB 的 `store_generation`，所以改了
 RAG 之後可以拿舊紀錄的查詢重跑、逐階段比對。候選**不設上限**，reranker 評過分的每一個都
-留（`rerank.scores`），提早結束的紀錄帶 `stopped` 原因與 strict 排除的完整清單。
+留（`rerank.scores`），提早結束的紀錄帶 `stopped` 原因。trace schema 為 2；strict 查詢移除前的舊紀錄（schema 1）另有當時的 strict 排除清單，`data_flywheel.py trace` 兩版都讀得懂。
 `code_rag_search` 的紀錄則記整個候選池（`pool`，combined 排序前 200、含落選者）的
 embedding / lexical / 融合 / rerank 分數與過門檻、最終旗標，以及 embedding / reranker 設定，
 不帶程式碼文字。檢索途中炸掉（reranker timeout 之類）也記一筆：`metadata.failed=true`、
@@ -1495,7 +1514,6 @@ symlink 就略過（`skipped: symlink`）；所有開檔都先 lstat 再帶 `O_N
 MCP server 端只記 KB-shaped tools：
 
 - `query_knowledge`
-- `query_knowledge_strict`
 - `code_rag_search`
 
 一般 plumbing tools，例如 `read_file`、`grep_code`、`apply_patch`，不會在 MCP 端逐一記完整對話。
@@ -1755,7 +1773,7 @@ python3 scripts/session_eval.py validate \
 
 #### 4. 對候選模型 replay
 
-runner 不會替操作者停／啟 server。先載入候選 GGUF，確認四個 llama-server ready，再跑：
+runner 不會替操作者停／啟 server。先載入候選 GGUF，確認主模型與三個附屬模型的 llama-server ready（replay 不審核，不需要審核模型），再跑：
 
 ```bash
 python3 scripts/session_eval.py run \
@@ -1914,7 +1932,7 @@ RAM 足夠才考慮在該 role `parameters` 加 `"no_mmap": true`，validate 後
 
 **典型症狀**:
 
-- `/tools` 明明列得出 21 個工具,模型卻回答「沒有 CodeTrail 工具」。
+- `/tools` 明明列得出 20 個工具,模型卻回答「沒有 CodeTrail 工具」。
 - 明確要求 `list_dir(path=".", depth=1)` 後,模型只輸出 `<list_dir path="." depth="1"/>`,接著用自然語言宣稱「已成功取得目錄」,畫面上沒有 `· list_dir → completed`、也沒有真實目錄內容。
 - 模型每輪都回答「我現在呼叫」「讓我直接使用工具」，但訊息隨即結束；使用者催促後只換句話重複，始終沒有工具卡。
 
@@ -1927,10 +1945,10 @@ RAM 足夠才考慮在該 role `parameters` 加 `"no_mmap": true`，validate 後
 | 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 的 `· <工具> → completed`,或 JSON event 的 `type: "tool_use"`、`part.state.status: "completed"` |
 
 `aicode` 把 transport、explicit hard gate 與 implicit diagnostic 分開，不需要
-每次先叫模型背 21 個名字：
+每次先叫模型背 20 個名字：
 
-- `MCP PASS — 21 tools + list_dir round-trip`：每次啟動都另起一個 MCP server 子行程，完成
-  `initialize`、依固定順序精確比對 21 個名稱，擷取完整 typed schemas／instructions digest，
+- `MCP PASS — 20 tools + list_dir round-trip`：每次啟動都另起一個 MCP server 子行程，完成
+  `initialize`、依固定順序精確比對 20 個名稱，擷取完整 typed schemas／instructions digest，
   再執行無副作用的 `list_dir(path=".", depth=1)`。這層完全不問 LLM；schema 的
   bounds/description/budget 由 static contract 驗證，routing catalog 另保存逐工具
   counts/digests 與 token measurement。
@@ -2161,7 +2179,7 @@ evidence text 字元，不是 tokenizer token。
 
 模型可能產生未出現在來源的條號、日期、金額、API 或檔案名；降低溫度與換模型都不能證明
 這些內容是真的。先提供或匯入原始來源，再要求工具查證並逐項附 file:line／REF。
-規格數字用 strict；無來源時明確標未知，推測另列。
+規格數字逐項附 REF，互動 TUI 的[審核卡](docs/usage.md#answer-audit)會核對引用；無來源時明確標未知，推測另列。
 
 客戶端每次請求已明示 `temperature`／`top_p`／`top_k`／`min_p`，來源為 repo 設定與
 EngineOptions；server defaults 只適用沒有明示值的請求。不要因改了 deployment 的
@@ -2261,7 +2279,7 @@ cd <CODETRAIL_REPO>
 設定成功不等於實機能容納 weights、KV cache 與 compute buffer，仍需查看啟動 log 與 VRAM。
 <a id="pdf-errors"></a>
 
-### VL、PDF 預算、抽取失敗與 strict 排除
+### VL、PDF 預算、抽取失敗與待覆核內容
 
 每一次 MCP 呼叫的 read timeout 是**固定的** `config.MCP_CALL_TIMEOUT_SECONDS`(660 秒,
 略高於 `ingest_document` 的 10 分鐘內部上限),呼叫端不得放寬也不得調小 —— 調小就等於
@@ -2360,49 +2378,57 @@ PDF 的話回傳還會多附一條 `--preflight` 版本,先估成本再決定。
 如果回傳寫的是「輸出不完整」而不是逾時,那代表讀取子行程輸出的執行緒出了問題 —— 這種情況
 **不會**回報成功,因為手上的輸出不足以判斷入庫結果;一樣改用 CLI 重跑並看 chunk 數。
 
-### 查得到那張表,但嚴格模式拒絕用它回答數值
+### 查得到那張表,但審核卡標 ⚠ 待覆核
 
-這是設計行為,不是 bug。`query_knowledge_strict` 在 **code 層**排除未通過驗證的圖片內容
-(`needs_review` / `unverified` / `legacy_unverified`),所以它不會用沒被獨立證據佐證的圖片
-數值回答 register、bit range 或規格數字。被擋下的那些會出現在回傳的 `excluded_figures`
-(帶 source、頁碼、`figure_id`、kind、狀態與原因)與 `review_hint` —— **四條回傳路徑都有**,
-所以「全部候選都被擋」時你仍看得到「哪一頁、哪一張圖可用但待覆核」,不會被誤導成「查不到」。
+這是設計行為,不是 bug。圖表的驗證狀態是 `needs_review` / `unverified` / `legacy_unverified`
+時,`query_knowledge` 照樣回傳它,但 REF 文字與 refs metadata 都帶狀態與原因;主模型引用它的
+陳述在[審核卡](docs/usage.md#answer-audit)上最多是 ⚠「只有待覆核的圖表／OCR 支持」,不會是 ✔。
+要讓它成為可信證據,就要對原圖確認。
 
-診斷順序:
-
-```text
-請用工具 review_figures,action 設 "list",列出待覆核的圖與原因。
-```
-
-看 `reasons`:
+診斷順序:在 TUI 輸入 `/kb review`(或請模型用工具 `review_figures`,action 設 "list"),
+看那一項的原因:
 
 - `▯` / glyph 衝突 → 該字元在原圖上就分不出來(例如 `8` 與 `B`、`0` 與 `O`)。這種只能人看原圖。
 - 缺 row/line、tile 縫合不確定、截斷 → 抽取沒能覆蓋完整,同樣要人工確認。
 - `legacy_unverified` → 這張是**舊 KB** 或**純 raster 路徑**的 chunk。舊 KB 的圖片 chunk 在
   載入時一律補成這個狀態(只在記憶體內,不改你的 `knowledge.json`)。
 
-處理方式(先看那一筆有沒有 `figure_id`:有才是 structured、才進得了 `review_figures`):
+處理方式(先看那一筆有沒有 `figure_id`:有才是 structured、才進得了覆核):
 
-- **structured figure(有 `figure_id`)** → 可以用 `review_figures(action="fix", ...,
-  confirm_against_image=True)` 人工覆核(它會改知識庫,permission 是 `ask`,你會在核准框
-  看到完整參數)。
-- **原生表格(PDF 裡可以選取文字)** → `remove_document` 之後重新 `ingest_document`,
+- **structured figure(有 `figure_id`)** → 在 `/kb review` 對照原圖按 `y` 確認,或按 `e` 修改後
+  確認;兩者都送出 `review_figures(action="fix", ..., confirm_against_image=True)`(它會改知識庫,
+  permission 是 `ask`,你會在核准框看到完整參數)。
+- **原生表格(PDF 裡可以選取文字)** → `/kb remove` 之後重新 `/kb add`,
   它會走結構化 lane,**可能**拿到可信狀態。但「有原生文字」不保證 `native_verified`:
   那需要兩個一致的原生 evidence channel;只有一個通道時是 `unverified`,通道矛盾時是
   `needs_review`。native lane 不呼叫 VL,所以也**不會**產生 `corroborated`。實際結果以
-  重 ingest 後 `review_figures(action="list")` 顯示的為準。
+  重新入庫後 `/kb review` 顯示的為準。
 - **新版 ingest 的掃描版／拍照版純 raster** → 先分類成 table／terminal／prose／diagram
-  並產生 structured figure，所以會出現在 `review_figures`；被判定「不是圖面」（封面、logo、
+  並產生 structured figure，所以會出現在 `/kb review`；被判定「不是圖面」（封面、logo、
   照片）的則零抽取、零 chunk，只出現在 ingest 的缺席清單與 review artifact 的
   「判定不是圖面」一節。沒有獨立原生證據時仍是
-  `unverified`／`needs_review`，strict 查詢不會採用；只有人對原圖以
+  `unverified`／`needs_review`，審核不把它當可信證據；只有人對原圖以
   `confirm_against_image=True` 核准指定 revision 後才可能成為 `human_verified`。
 - **舊 KB 的 legacy VL chunk（沒有 `figure_id`）** → 沒有 canonical payload 可 fix；要走
   structured review 必須用新版重新 ingest 原始文件。沒有原圖或人工確認時，不得把純
-  raster 數字宣稱為 strict-trusted。
-- 覆核時如果 `list` 回 `payload: (讀不到)`,代表那份 review artifact 已經被清掉了;
-  `fix` 需要 canonical payload,只能重新 ingest 該文件。清除的影響見
+  raster 數字宣稱為已驗證。
+- 覆核時如果明細顯示讀不到內容(工具的 `list` 回 `payload: (讀不到)`),代表那份 review
+  artifact 已經被清掉了;`fix` 需要 canonical payload,只能重新 ingest 該文件。清除的影響見
   [setup 的清除 PDF review artifacts](#review-artifacts)。
+
+### 審核卡顯示「審核未完成」,或 aicode 說缺審核模型
+
+- 啟動時 `aicode`／`~/start.sh` 說審核模型（auditor）尚未設定：舊安裝升級後還沒選審核模型。
+  本機重跑 `./set_config.sh`,再 `~/start.sh stop`、`~/start.sh`;A／B 依
+  [分離部署的升級說明](#split-deployment)在 A 重設並重新匯出 manifest,到 B 重新匯入。
+- `aicode` 說審核模型連不上、live n_ctx 不足或 token 計數失敗:看
+  `~/.local/state/codetrail/logs/auditor.log` 與 `nvidia-smi`;n_ctx 至少 8192,不夠就重跑
+  設定把審核模型的 ctx 調大後重啟。
+- 卡片顯示「問題與回答本身就超過審核模型 context」:審核模型的 ctx 太小,放不下這一題的問題與回答;
+  調大 ctx,或請模型分段回答。
+- 卡片顯示「審核模型輸出格式錯誤」或「輸出沒有完成」:這一次不當成通過;偶發可以再問一次,
+  經常發生就換一顆較能遵守 JSON 格式的審核模型。
+- 審核模型的請求用自己的鎖與自己的 server,不會擋住主模型;審核失敗也不影響回答本身與排隊。
 
 **升級注意**:`review_figures` 的人工核准閘寫死在 `client_policy.ASK_TOOLS`,不依賴任何
 外部設定檔——舊安裝升級後不需要為了這件事改任何東西。
@@ -2410,7 +2436,7 @@ PDF 的話回傳還會多附一條 `--preflight` 版本,先估成本再決定。
 
 ### Server、embedding buffer 與舊部署
 
-`/health` 不通或 404 時，檢查 deployment 的四角色 URL、port 與各 role log。
+`/health` 不通或 404 時，檢查 deployment 的五個角色 URL、port 與各 role log。
 
 ```bash
 python3 scripts/check_status.py --strict
@@ -2418,6 +2444,7 @@ curl -s http://localhost:8080/health
 curl -s http://localhost:8081/health
 curl -s http://localhost:8082/health
 curl -s http://localhost:8083/health
+curl -s http://localhost:8084/health
 ```
 
 health OK 只是基本可達；VL、工具 calling、DSpark 與模型身分仍各自驗證。
@@ -2431,8 +2458,8 @@ query + passage 能放下，不用單次短 curl 宣稱完整入庫可行。
 
 `主模型未設定`／registry 路徑不存在時，確認 `services.main.model` 與 models.json 實際路徑，
 不能保留 `<CODE_MODEL>` placeholder。local 用 set_config 重設；client 用附加入口重新匯入
-A 的 manifest，不手填 B 本機 GGUF。`chunks=0` 先確認 ingest 成功，strict 排除看
-`excluded_figures`／`excluded_text`，不是一律「查不到」。
+A 的 manifest，不手填 B 本機 GGUF。`chunks=0` 先確認 ingest 成功；待覆核的圖表與未確認的 OCR
+仍會出現在 REF 裡，看它們的狀態與原因，不是一律「查不到」。
 
 已移除的舊介面可能留下 `codetrail-web` tmux／aicode_web symlink。先確認是舊部署後
 個別停止或移除，不能殺掉其他工作 session；現在遠端操作用 SSH 加 `aicode`。

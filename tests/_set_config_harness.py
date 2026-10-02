@@ -74,27 +74,32 @@ LEGACY_SHELL_OVERRIDES = {
 
 # --yes 的數值旗標(使用者題沒有預設值 → 非互動一律得給)。
 # threads 已不是使用者題(未給 --threads 就不寫 -t)。
-NUM_FLAGS = ("--ctx", "65536", "--rerank-ctx", "8192")
+NUM_FLAGS = ("--ctx", "65536", "--auditor-ctx", "32768", "--rerank-ctx", "8192")
 # 標準 fixture(TWO_GPUS + make_models):main 有 2 個候選(big-chat + VL)、
+# 審核模型同樣 2 個(聊天模型候選由小到大:VL 主檔、big-chat)、
 # reranker 有 2 個(bge + qwen3)、兩顆 GPU → 這些都要旗標;
 # embedding / VL 只有一個候選會自動選用。
 YES_TWO_GPU = (
-    "--yes", "--main-model", "1", "--rerank-model", "1",
-    "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
+    "--yes", "--main-model", "1", "--auditor-model", "1", "--rerank-model", "1",
+    "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
     *NUM_FLAGS,
 )
 # 單 GPU fixture:GPU 自動選用,只剩模型與數值。
-YES_ONE_GPU = ("--yes", "--main-model", "1", "--rerank-model", "1", *NUM_FLAGS)
+YES_ONE_GPU = ("--yes", "--main-model", "1", "--auditor-model", "1", "--rerank-model", "1",
+               *NUM_FLAGS)
 
 # 標準 fixture 的互動作答順序(一個角色問完才換下一個):
-#   [1/5] main 編號、main GPU(編號 1 起算:1=5090、2=2000 Ada)、主模型 ctx、DSpark(off)
-#   [2/5] embed GPU(唯一候選自動選用)
-#   [3/5] reranker 編號、reranker GPU、reranker internal buffer
-#   [4/5] VL GPU(唯一候選/唯一 mmproj 自動選用)
-#   [5/5] 壓縮模式編號(1=codetrail / 2=manual / 3=off;沒有預設值)
+#   [1/6] main 編號、main GPU(編號 1 起算:1=5090、2=2000 Ada)、主模型 ctx、DSpark(off)
+#   [2/6] 審核模型編號(1 = VL 主檔,由小到大)、審核模型 GPU、審核模型 ctx
+#   [3/6] embed GPU(唯一候選自動選用)
+#   [4/6] reranker 編號、reranker GPU、reranker internal buffer
+#   [5/6] VL GPU(唯一候選/唯一 mmproj 自動選用)
+#   [6/6] 壓縮模式編號(1=codetrail / 2=manual / 3=off;沒有預設值)
 #   摘要確認
 # (big-chat / vl-model 都是非 GGUF 假檔 → 無法解析 layout → 不會問 CPU-MoE。)
-STDIN_STANDARD = "1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\n\n"
+#: 審核模型那一組作答(插在主模型 DSpark 之後);內嵌 stdin 的測試共用這一段。
+AUDITOR_STDIN = "1\n2\n32768\n"
+STDIN_STANDARD = "1\n1\n65536\noff\n" + AUDITOR_STDIN + "2\n1\n2\n8192\n2\n1\n\n"
 
 
 def sparse(path: Path, size: int) -> None:

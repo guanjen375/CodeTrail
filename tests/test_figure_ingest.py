@@ -234,8 +234,8 @@ def _evidence(payload=None, kind=None, *channels) -> dict:
     """真 producer（`figure_verify._build_evidence`）的 evidence 形狀。
 
     契約 §19.4：`native_verified` / `corroborated` 不得配空 evidence，而且要有**格/行級**
-    佐證——空的卻宣稱可信，等於把「沒查過」寫成「查過了」，strict query 之後會直接拿它
-    回答暫存器數值。fixture 也要誠實，否則等於在測一個現實中產生不出來的 FigureResult。
+    佐證——空的卻宣稱可信，等於把「沒查過」寫成「查過了」，查詢與回答審核之後會把它
+    當成可信的暫存器數值。fixture 也要誠實，否則等於在測一個現實中產生不出來的 FigureResult。
     """
     evidence = {"channels": list(channels or ("markdown_pos",)), "cells": {}, "lines": {},
                 "unlocatable_tokens": [], "anchor_coverage": {}, "row_alignment": {},

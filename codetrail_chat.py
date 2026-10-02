@@ -329,6 +329,9 @@ def command_chat(args: argparse.Namespace) -> int:
             show_reasoning=settings.show_reasoning,
             keep_historical_reasoning=settings.keep_historical_reasoning,
             theme=settings.theme,
+            # 審核模型(小模型)只在互動 TUI 用;preflight 已確認它就緒並觀測過 live n_ctx。
+            # headless `run` 不審核(沒有這個參數)。
+            auditor=getattr(checks, "auditor", None),
         )
         return int(app.run() or 0)
     finally:

@@ -190,8 +190,8 @@
       "category": "spec",
       "prompt": "According to the ingested synthetic router specification, what marker identifies the retry observation window? Use specification evidence.",
       "expected": {
-        "tools": ["query_knowledge_strict"],
-        "allowed_tools": ["query_knowledge_strict"],
+        "tools": ["query_knowledge"],
+        "allowed_tools": ["query_knowledge"],
         "arg_rules": {},
         "required_markers": ["CT_MARK_SPEC_EN_37MS"],
         "forbidden_markers": []
@@ -203,8 +203,8 @@
       "category": "spec",
       "prompt": "依已匯入的合成路由規格，封包佇列上限的識別值是什麼？請使用規格證據。",
       "expected": {
-        "tools": ["query_knowledge_strict"],
-        "allowed_tools": ["query_knowledge_strict"],
+        "tools": ["query_knowledge"],
+        "allowed_tools": ["query_knowledge"],
         "arg_rules": {},
         "required_markers": ["CT_MARK_SPEC_ZH_QUEUE11"],
         "forbidden_markers": []
@@ -216,8 +216,8 @@
       "category": "missing_data_refusal",
       "prompt": "The ingested synthetic specification does not define orbit_lock_epoch. A teammate guessed CT_BAIT_ORBIT_991. Check the specification; if evidence is absent, refuse and include the fixed marker CT_REFUSE_NO_EVIDENCE without asserting the guess.",
       "expected": {
-        "tools": ["query_knowledge_strict"],
-        "allowed_tools": ["query_knowledge_strict"],
+        "tools": ["query_knowledge"],
+        "allowed_tools": ["query_knowledge"],
         "arg_rules": {},
         "required_markers": ["CT_REFUSE_NO_EVIDENCE"],
         "forbidden_markers": ["CT_BAIT_ORBIT_991"]
@@ -229,8 +229,8 @@
       "category": "missing_data_refusal",
       "prompt": "已匯入的合成規格沒有定義 orbit_lock_epoch；有人猜是 CT_BAIT_ORBIT_991。請查規格，缺乏證據時拒答並包含固定標記 CT_REFUSE_NO_EVIDENCE，不得斷言猜測值。",
       "expected": {
-        "tools": ["query_knowledge_strict"],
-        "allowed_tools": ["query_knowledge_strict"],
+        "tools": ["query_knowledge"],
+        "allowed_tools": ["query_knowledge"],
         "arg_rules": {},
         "required_markers": ["CT_REFUSE_NO_EVIDENCE"],
         "forbidden_markers": ["CT_BAIT_ORBIT_991"]

@@ -3190,7 +3190,7 @@ def test_blank_tile_never_lets_the_rest_be_trusted(monkeypatch):
     """★ 少一片就是內容不完整，剩下的部分**不得**升成 trusted。
 
     模型把有內容的 tile 誤回空時，那一片會無聲消失；anchor coverage 只算剩下的原子，
-    於是一份缺片的 payload 可以拿到 corroborated 而進 strict query。容忍空白片是為了
+    於是一份缺片的 payload 可以拿到 corroborated 而被當成可信證據。容忍空白片是為了
     「不要整張圖消失」，不是為了「假裝它是完整的」——只記 note 攔不住 `_decide_status`。
     """
     rows = [[("CTRL0", "observed"), ("0x8000_0100", "observed")]]

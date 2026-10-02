@@ -84,6 +84,11 @@ def _shell_env(tmp_path: Path, **extra: str) -> dict[str, str]:
     }
 
 
+#: 審核模型(auditor)是必要角色:aux / all 範圍的啟動在任何服務之前就會拒絕未設定的
+#: auditor。只想驗別的角色的 fixture 用這一份(dry-run 不要求檔案存在)。
+AUDITOR_SERVICE = {"model": "/synthetic/auditor-small.gguf"}
+
+
 def _write_deployment(tmp_path: Path, services: dict | None = None, **top) -> Path:
     """tmp HOME 的 `~/.config/codetrail/deployment.json` —— 設定的唯一來源。"""
     path = tmp_path / ".config" / "codetrail" / "deployment.json"
@@ -126,7 +131,7 @@ def _write_profile_fixture(tmp_path: Path, name: str) -> Path:
                 "description": "launcher test profile fixture",
                 "verification": "unverified",
                 "hardware": "test",
-                "services": {},
+                "services": {"auditor": dict(AUDITOR_SERVICE)},
             }
         ),
         encoding="utf-8",
@@ -153,7 +158,8 @@ def test_start_all_routes_main_and_all_aux_to_their_shared_gpus(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "profile=gpu-split" in proc.stdout
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-H200") == 1
-    assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-RTX2000ADA") == 3
+    # --aux-gpu 套到所有附屬角色:embedding、reranker、審核模型、VL。
+    assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-RTX2000ADA") == 4
     for dead in ("SHELL-MAIN-GPU", "SHELL-AUX-GPU", "CUDA_VISIBLE_DEVICES=9"):
         assert dead not in proc.stdout
 
@@ -172,29 +178,32 @@ def test_start_main_fails_loud_when_no_main_model_is_set(tmp_path):
 
 
 def test_aux_models_and_gpus_come_from_the_deployment_file(tmp_path):
-    """三顆附屬模型與它們的 GPU 來自 `deployment.json`(以前是四個 `*_MODEL` /
+    """附屬模型(含審核模型)與它們的 GPU 來自 `deployment.json`(以前是四個 `*_MODEL` /
     三個 `*_GPU` 環境變數;那些名字現在只證明自己無效)。"""
     embed = tmp_path / "file-embed.gguf"
     rerank = tmp_path / "file-rerank.gguf"
     vl = tmp_path / "file-vl.gguf"
     mmproj = tmp_path / "file-mmproj.gguf"
+    auditor = tmp_path / "file-auditor.gguf"
     _write_deployment(
         tmp_path,
         {
             "embedding": {"model": str(embed), "gpu": "0"},
             "reranker": {"model": str(rerank), "gpu": "1"},
             "vl": {"model": str(vl), "mmproj": str(mmproj), "gpu": "2"},
+            "auditor": {"model": str(auditor), "gpu": "3"},
         },
     )
 
     proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
-    for path in (embed, rerank, vl, mmproj):
+    for path in (embed, rerank, vl, mmproj, auditor):
         assert str(path) in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=0" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=1" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=2" in proc.stdout
+    assert "CUDA_VISIBLE_DEVICES=3" in proc.stdout
     assert "/shell/" not in proc.stdout
 
 
@@ -233,7 +242,8 @@ def test_launcher_rejects_duplicate_service_ports(tmp_path):
                     "reranker": {
                         "port": 8081,
                         "base_url": "http://localhost:8081",
-                    }
+                    },
+                    "auditor": dict(AUDITOR_SERVICE),
                 },
             }
         ),
@@ -277,7 +287,8 @@ def test_legacy_vl_cpu_moe_config_gets_fit_off_and_a_warning(tmp_path):
                             "fit_target": 3072,
                             "n_cpu_moe": 35,
                         }
-                    }
+                    },
+                    "auditor": dict(AUDITOR_SERVICE),
                 },
             }
         ),
@@ -308,7 +319,7 @@ def _write_vl_cpu_moe_config(tmp_path: Path, parameters: dict) -> None:
             {
                 "schema_version": 1,
                 "profile": "defaults",
-                "services": {"vl": {"parameters": parameters}},
+                "services": {"vl": {"parameters": parameters}, "auditor": dict(AUDITOR_SERVICE)},
             }
         ),
         encoding="utf-8",
@@ -682,6 +693,8 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
             "embedding": {"port": 18081, "base_url": "http://127.0.0.1:18081", "gpu": "0"},
             "reranker": {"port": 18082, "base_url": "http://localhost:18082", "gpu": "1"},
             "vl": {"port": 18083, "base_url": "http://127.0.0.1:18083", "gpu": "2"},
+            "auditor": {**AUDITOR_SERVICE, "port": 18084, "base_url": "http://127.0.0.1:18084",
+                        "gpu": "3"},
         },
     )
 
@@ -697,6 +710,8 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
     assert "vl_base_url=http://127.0.0.1:18083" in proc.stdout
     assert "vl_host=127.0.0.1" in proc.stdout
     assert "vl_port=18083" in proc.stdout
+    assert "auditor_base_url=http://127.0.0.1:18084" in proc.stdout
+    assert "auditor_port=18084" in proc.stdout
     assert "--port 18081" in proc.stdout
     assert "--port 18082" in proc.stdout
     assert "--port 18083" in proc.stdout
@@ -712,6 +727,7 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
 
 
 def test_start_rag_servers_noncausal_models_use_full_physical_batch(tmp_path):
+    _write_deployment(tmp_path, {"auditor": dict(AUDITOR_SERVICE)})
     proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
@@ -770,12 +786,13 @@ def _run_check_status(tmp_path: Path, *args: str) -> subprocess.CompletedProcess
     )
 
 
-FOUR_LLAMA_SERVERS = "\n".join(
+FIVE_LLAMA_SERVERS = "\n".join(
     (
         "101, /opt/llama-server, GPU-aaaa, 17000",
         "102, /opt/llama-server, GPU-aaaa, 1100",
         "103, /opt/llama-server, GPU-aaaa, 900",
         "104, /opt/llama-server, GPU-aaaa, 7900",
+        "105, /opt/llama-server, GPU-aaaa, 7700",
         "999, /usr/bin/python3, GPU-aaaa, 500",
     )
 )
@@ -790,17 +807,17 @@ THREE_UNIQUE_LLAMA_SERVERS = "\n".join(
 )
 
 
-def test_check_status_passes_with_four_unique_llama_server_pids(tmp_path):
-    _write_fake_nvidia_smi(tmp_path, FOUR_LLAMA_SERVERS)
+def test_check_status_passes_with_one_unique_llama_server_pid_per_role(tmp_path):
+    _write_fake_nvidia_smi(tmp_path, FIVE_LLAMA_SERVERS)
 
     proc = _run_check_status(tmp_path)
 
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.count("[GPU]") == 4
+    assert proc.stdout.count("[GPU]") == 5
     assert "PID=101" in proc.stdout
     assert "GPU=GPU-aaaa" in proc.stdout
     assert "VRAM=17000 MiB" in proc.stdout
-    assert "偵測到 4 個不同的 llama-server PID" in proc.stdout
+    assert "偵測到 5 個不同的 llama-server PID" in proc.stdout
 
 
 def test_check_status_report_only_mode_does_not_fail_the_shell(tmp_path):
@@ -1151,15 +1168,15 @@ def test_stop_and_status_use_argv_and_constants_not_the_shell(tmp_path):
         assert dead not in stop.stdout + stop.stderr
         assert dead not in tmux_log.read_text(encoding="utf-8")
 
-    # status 階段:四個 role 都在 GPU 上 —— 「預設 4 / --expected 5」要數的就是這四筆。
-    _fake_nvidia_smi(FOUR_LLAMA_SERVERS)
+    # status 階段:五個 role 都在 GPU 上 —— 「預設 5 / --expected 6」要數的就是這五筆。
+    _fake_nvidia_smi(FIVE_LLAMA_SERVERS)
     proc_root = tmp_path / "proc"
     proc_root.mkdir(exist_ok=True)
     status = _run("check_status.py", "--proc-root", str(proc_root))
     assert status.returncode == 0, status.stderr
-    # 殼層的 EXPECTED_LLAMA_SERVERS=99 沒有作用;預設仍是四個 role。
-    assert "偵測到 4 個不同的 llama-server PID（預期至少 4）" in status.stdout
+    # 殼層的 EXPECTED_LLAMA_SERVERS=99 沒有作用;預設是每個 role 一個(五個)。
+    assert "偵測到 5 個不同的 llama-server PID（預期至少 5）" in status.stdout
     assert "預期至少 99" not in status.stdout + status.stderr
 
-    tightened = _run("check_status.py", "--proc-root", str(proc_root), "--expected", "5")
-    assert "只偵測到 4 個不同的 llama-server PID（預期至少 5）" in tightened.stderr
+    tightened = _run("check_status.py", "--proc-root", str(proc_root), "--expected", "6")
+    assert "只偵測到 5 個不同的 llama-server PID（預期至少 6）" in tightened.stderr

@@ -1,8 +1,8 @@
 # CodeTrail — 本地 Code-RAG / RAG / MCP 工作台
 
-CodeTrail 是公開原始碼專案，包含本地 RAG、Code-RAG、21 個 MCP 工具，以及自己的
+CodeTrail 是公開原始碼專案，包含本地 RAG、Code-RAG、20 個 MCP 工具，以及自己的
 Python／Textual 全螢幕聊天客戶端。模型透過工具搜尋程式、閱讀規格、分析圖片與 firmware，
-再以檔案行號或 REF 回答。使用者入口是終端指令 `aicode`，推理服務使用
+再以檔案行號或 REF 回答；回答用到知識庫時，另一個小模型（審核模型）會逐條核對引用。使用者入口是終端指令 `aicode`，推理服務使用
 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的 `llama-server` 與本地 GGUF。
 部署不需要 Node / npm。
 
@@ -78,7 +78,7 @@ CodeTrail 會檢查必要的 server 能力，包含 chat token 計數、rerankin
 
 <a id="models"></a>
 
-## 準備四類 GGUF 模型
+## 準備模型：兩個聊天模型＋三個附屬模型
 
 模型預設放 `~/models`；其他目錄可在 `./scripts/configure-advanced.sh` 選「local」後指定。
 主聊天模型以 `<CODE_MODEL>` 表示，
@@ -88,11 +88,14 @@ CodeTrail 會檢查必要的 server 能力，包含 chat token 計數、rerankin
 | 角色 | 預設 port | 用途／內建模型 key |
 |---|---:|---|
 | main | 8080 | 聊天與工具呼叫；`<CODE_MODEL>` |
+| auditor | 8084 | 審核模型（小模型）：主模型的回答用到知識庫時，逐條核對引用；建議 4B–14B 指令模型，可直接用 VL 的 `qwen3.5-9b` 同一個 GGUF |
 | embedding | 8081 | 文件與程式向量；`bge-m3` |
 | reranker | 8082 | 檢索排序；`bge-reranker-v2-m3` |
 | VL | 8083 | 圖片理解；`qwen3.5-9b`，需配對 mmproj |
 
-四個服務都是啟動必要條件，reranker 不可用時不會改用較差排序。
+前兩個是聊天模型（主模型＋審核模型），後三個是附屬模型。五個服務都是啟動必要條件，
+reranker 不可用時不會改用較差排序；審核模型沒有內建預設，由設定精靈選擇，它不載入 mmproj，
+所以沿用 VL 的 GGUF 不必另外下載。
 以下是附屬模型的下載範例；下載需連網，部署後可使用本地檔案運作：
 
 ```bash
@@ -121,10 +124,11 @@ source .venv/bin/activate
 ```
 
 精靈直接掃描 `~/models`，並沿用保存的 llama-server 路徑或上述預設，不再詢問這兩個位置。
-接著依序選主聊天、embedding、reranker、VL 的模型與 GPU，再選必要容量
-參數。單一候選可自動選用；多個候選由使用者決定。主模型問 n_ctx；MoE 模型另問
+接著依序選主聊天、審核模型（小模型）、embedding、reranker、VL 的模型與 GPU，再選必要容量
+參數。單一候選可自動選用；多個候選由使用者決定。主模型問 n_ctx；審核模型也問 n_ctx
+（建議 32768，要放得下問題、回答與本回合查到的知識庫證據）；MoE 模型另問
 留在 RAM 的 expert 層數；reranker 的 internal buffer 與主 n_ctx 分開設定。
-四個服務固定單 slot，主聊天與內部工作共用模型鎖。
+五個服務固定單 slot；主聊天與內部工作共用主模型鎖，審核模型用自己的鎖，不會擋住主模型。
 本機精靈保留既有壓縮模式；尚無 client.json 時不因設定模型而建立它。
 需要調整壓縮模式，見[壓縮設定](docs/compaction-rules.md)。
 
@@ -135,6 +139,16 @@ DSpark 在主模型設定中一起選，預設 off。相同主模型的既有 dr
 
 最後只確認一次完整摘要，Enter 寫入、`q` 取消且不寫檔。若目前設定為 A／B 分離模式，
 精靈會先明示轉成本機與移除遠端端點授權；取消保留原設定。
+
+**從四個模型的舊版升級**：舊設定沒有審核模型。`git pull` 之後先重跑 `./set_config.sh`
+選審核模型，再 `~/start.sh stop`、`~/start.sh`。還沒設定之前，`~/start.sh` 與 `aicode`
+都會直接說明缺審核模型並拒絕啟動，不會跳過審核。A／B 分離部署要在 A 更新設定、
+重新匯出 manifest，再到 B 重新匯入，見[進階部署](developer.md#advanced-deployment)。
+
+**調度**：審核模型是獨立的 llama-server（8084），啟動順序是
+main → embedding → reranker → 審核模型 → VL；VL 最後啟動並依剩餘 VRAM 自動 offload，
+所以審核模型與 VL 同卡時不會互搶。審核只在主模型答完之後、同一回合內執行，兩個聊天模型
+不會同時為同一題生成；沒用到知識庫的回合不審核。實際放不放得下以 `~/start.sh` 啟動結果為準。
 
 | 產物 | 用途 |
 |---|---|
@@ -161,7 +175,8 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-四個服務通過 health 與必要能力檢查後才算 ready。服務預設只綁 `127.0.0.1`。
+五個服務通過 health 與必要能力檢查後才算 ready。服務預設只綁 `127.0.0.1`。
+主模型在 tmux session `codetrail-main`；附屬模型與審核模型在 `codetrail-rag`（審核模型是 `audit` window）。
 大模型載入時會顯示等待進度；失敗會回滾本次啟動，原因保存在
 `~/.local/state/codetrail/logs/<role>.log`。查看主模型：
 
@@ -241,17 +256,37 @@ Tab 補全（路徑含空白寫成 `@"路徑"`）；把檔案拖進終端機或�
 請用 analyze_file 分析 build/firmware.elf，view=symbols、target=uart。
 ```
 
-讀取結果進對話，不會自動加入可反覆檢索的知識庫。要讓規格、PDF、圖片或 firmware 之後反覆查詢，使用入庫：
+讀取結果進對話，不會自動加入可反覆檢索的知識庫。要讓規格、PDF、圖片或 firmware 之後反覆查詢，
+用 `/kb` 直接入庫與覆核（不必請模型代勞）：
 
 ```text
-請用 ingest_document 匯入 docs/spec.pdf，完成後 reload_knowledge_base，回報 chunks。
-請用 query_knowledge_strict 查 reset assert 最小時間，附 REF，證據不足就拒答。
+/kb                    看知識庫狀態：文件、段數、待處理項目
+/kb add @docs/spec.pdf 匯入（@ 後可 Tab 補全；圖片會自動經 VL）
+/kb review             覆核待確認的圖表與 OCR
+/kb remove spec.pdf    移除一份文件（會跳核准框）
 ```
 
-圖片直接交給 `ingest_document`，它會自行使用 VL，不必先 `analyze_file`。
-聊天截圖加 `mode="chat"`。圖多的 PDF 先用 `preflight_only=True` 估成本，零寫入；
-入庫後看 `review_figures` 的狀態與原因。單張抽壞只讓那一張缺席，其餘有效內容可以入庫；
-VL 服務、來源身分或文件級契約失敗則整份中止。未驗證圖面不能供 strict 回答數值。
+`/kb add` 完成後顯示結果卡：✓ 完成、⚠ 有待處理項目或 ✗ 失敗，並告訴你還有幾項要到 `/kb review` 處理。
+`/kb review` 列出待覆核的表格與圖、需修復與抽取失敗的項目，以及待確認的 OCR 段落；選一項會顯示
+原圖的完整路徑、PDF 頁碼與抽出的內容。你對照原圖或原 PDF 確認無誤後按 `y`，有錯就按 `e` 修改再送出；
+兩者都會再跳出核准框顯示完整參數。單張抽壞只讓那一張缺席，其餘有效內容可以入庫；
+VL 服務、來源身分或文件級契約失敗則整份中止。也可以請模型呼叫工具（例如
+「請用 ingest_document 匯入 docs/spec.pdf」）；`preflight_only`、`fresh` 等進階參數只能這樣用。
+
+### 回答審核（小模型）
+
+主模型這一輪用過 `query_knowledge` 或 `query_table` 才回答時，審核模型會在回答下方加一張「審核」卡：
+把回答裡依賴知識庫的陳述逐條拿去對照**這一輪查到的證據**，引用必須逐字出現在證據裡才算數。
+
+| 卡片 | 意思 |
+|---|---|
+| ✔ | 每一項陳述都在證據裡找得到 |
+| ⚠ | 有陳述找不到證據，或只有待覆核的圖表／OCR 支持（先 `/kb review` 覆核） |
+| ✘ | 有陳述與證據矛盾 |
+| ？ | 證據太長沒有全部送審或無法核對，不能給整體結論 |
+
+審核卡只給你看，不會送回主模型；它是核對過引用的提示，不是證明回答完整正確
+（一次最多 12 項，也可能漏列）。審核中按 Ctrl+C 只中斷審核，回答保留。
 
 專案外的截圖、下載檔用 `@~/Downloads/…` 夾帶：先在 TUI 輸入 `/import on` 並重開 `aicode`
 （或在 `client.json` 設 `external_import` 與 `external_import_roots`）。之後每個專案外附件都會跳出
@@ -265,7 +300,7 @@ VL 服務、來源身分或文件級契約失敗則整份中止。未驗證圖�
 | 用途 | 工具 |
 |---|---|
 | 程式探索 | `list_dir`、`read_file`、`grep_code`、`code_rag_search`、`file_info` |
-| 知識查詢 | `query_knowledge`、`query_knowledge_strict`、`query_table` |
+| 知識查詢 | `query_knowledge`、`query_table` |
 | 修改與驗證 | `git_status`、`git_diff`、`apply_patch`、`run_lint`、`run_command` |
 | 附件與知識庫 | `analyze_file`、`ingest_document`、`remove_document`、`reload_knowledge_base`、`review_figures`、`review_text`、`import_external_file` |
 | 行為規則 | `record_lesson` |

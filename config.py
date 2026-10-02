@@ -38,6 +38,11 @@ LLAMA_BASE_URL = _DEPLOYMENT_PROFILE.service("main").base_url
 LLAMA_EMBED_BASE_URL = _DEPLOYMENT_PROFILE.service("embedding").base_url
 LLAMA_RERANK_BASE_URL = _DEPLOYMENT_PROFILE.service("reranker").base_url
 LLAMA_VL_BASE_URL = _DEPLOYMENT_PROFILE.service("vl").base_url
+# 審核模型(auditor):主模型用知識庫回答後逐條核對引用的小模型。舊安裝升級後
+# model 是 None(本機)或 base_url 是 ""(A/B 舊 B 端);這裡只取值,使用前由
+# `deployment_profile.auditor_unconfigured_reason()` fail-loud 並給修法。
+LLAMA_AUDITOR_BASE_URL = _DEPLOYMENT_PROFILE.service("auditor").base_url
+AUDITOR_MODEL = _DEPLOYMENT_PROFILE.service("auditor").model
 
 # Native + OpenAI-compat endpoints(集中管理,呼叫端不要硬寫路徑)。
 LLAMA_GENERATE_URL = f"{LLAMA_BASE_URL}/completion"
@@ -433,6 +438,24 @@ if not 0 < CLIENT_MAX_OUTPUT_TOKENS <= CLIENT_MAX_OUTPUT_TOKENS_CAP:  # pragma: 
 # `developer.md#troubleshooting` 的判讀方式)。
 CLIENT_PRIME_PROMPT_CACHE = True
 
+# 審核模型(client_audit)的請求參數。AUDITOR_MAX_OUTPUT_TOKENS 跟 CLIENT_MAX_OUTPUT_TOKENS
+# 一樣是**同一個數字**的兩個用途:實送的 max_tokens 與 context gate 的保留額。兩者不同
+# 的話,閘放行的 prompt 仍可能在生成途中把審核模型的 ctx 撐爆並被從前面靜默截掉。
+# 12 項陳述 × 每項(陳述 ≤400 字＋引用 ≤300 字)用 2048 綽綽有餘;改它是改 repo。
+AUDITOR_MAX_OUTPUT_TOKENS = 2048
+if not 512 <= AUDITOR_MAX_OUTPUT_TOKENS <= 8192:  # pragma: no cover - import guard
+    raise RuntimeError(
+        f"AUDITOR_MAX_OUTPUT_TOKENS 必須介於 512..8192,得到 {AUDITOR_MAX_OUTPUT_TOKENS}。"
+        "它同時是審核請求實送的 max_tokens 與 context gate 的保留額。"
+    )
+AUDITOR_MAX_CLAIMS = 12               # 一次審核最多列幾項陳述(json_schema 的 maxItems)
+AUDITOR_MIN_N_CTX = 8192              # 審核模型 live n_ctx 低於這個值,aicode 拒絕啟動
+AUDITOR_REQUEST_TIMEOUT_SECONDS = 180  # 單次審核 HTTP read timeout
+AUDITOR_EVIDENCE_TOOLS = ("query_knowledge", "query_table")  # 本回合用過才審核、證據只取這些
+AUDITOR_QUOTE_MIN_CHARS = 4           # 引用至少幾個非空白字元才算數
+AUDITOR_QUOTE_MAX_CHARS = 300
+AUDITOR_CLAIM_MAX_CHARS = 400
+
 # 客戶端每輪的搜尋收斂邊界。宣告額度包含無效/被拒呼叫,所以真正送 MCP 的次數
 # 也一定受限;近似 grep 連續沒有新來源才停,精確重複可提早收斂。
 CLIENT_STAGNANT_TOOL_STEPS = 2
@@ -775,16 +798,10 @@ MARGIN_ENABLED = True                # 啟用 margin 判斷
 MARGIN_MIN_GAP = 0.05                # top1-top2 差距低於此值視為「不確定」
 MARGIN_LOW_SCORE = 0.4               # top1 分數低於此值時需要額外檢查
 
-# 嚴格模式門檻（spec/manual 類問題更保守）
-STRICT_MODE_THRESHOLD = 0.40         # 嚴格模式下的基礎門檻（比一般問題高）
-STRICT_MODE_RERANK_REQUIRED = True   # 嚴格模式強制 rerank
-
 # ============================================================
-# P0 改進：Claim-to-Evidence 強制化設定
+# Claim-to-Evidence 映射（eval 的引用覆蓋評估：utils.extract_evidence_mapping）
 # ============================================================
-CLAIM_TO_EVIDENCE_ENABLED = True     # 啟用 Claim-to-Evidence 驗證
-CLAIM_EVIDENCE_STRICT = True         # 嚴格模式：數字/限制/預設值必須有 REF
-# 需要強制驗證的 pattern（數字、限制、預設值等）
+# 被視為「需要 REF 的 claim」的 pattern（數字、限制、預設值等）
 CLAIM_EVIDENCE_PATTERNS = [
     r'\d+',                          # 任何數字
     r'最[大小]',                      # 最大/最小
@@ -794,20 +811,6 @@ CLAIM_EVIDENCE_PATTERNS = [
     r'must|shall|should',            # 規範用語
     r'thread-safe|atomic',           # 執行緒安全
     r'overflow|underflow',           # 溢位
-]
-
-# P0-2: 句子級證據覆蓋率設定
-SENTENCE_EVIDENCE_ENABLED = True     # 啟用句子級證據檢查
-SENTENCE_EVIDENCE_DELETE = True      # True=刪除無證據句子，False=僅降級標記
-SENTENCE_EVIDENCE_MIN_LEN = 15       # 短於此長度的句子不檢查（避免誤殺短句）
-# 可保留無 REF 的句子類型（過渡語、結構語）
-SENTENCE_EVIDENCE_WHITELIST = [
-    r'^(首先|其次|第[一二三四五]|接下來|最後|總結)',  # 過渡語
-    r'^(以下|如下|包括|例如)',  # 結構語
-    r'^(根據|依據|參考)',  # 已標示來源的引言
-    r'(：|:)\s*$',  # 以冒號結尾的引言
-    r'^(推測|可能|或許)',  # 已標記為推測
-    r'^[\u2022\-\*]\s',  # 列表項目開頭
 ]
 
 # ============================================================
@@ -963,17 +966,6 @@ CODE_RAG_RERANK_CANDIDATE_POOL = int(
 EMBED_BATCH_SIZE = 32
 EMBED_BATCH_MAX_CHARS = 20000
 
-# ============================================================
-# 嚴格模式設定
-# ============================================================
-STRICT_MODE = True
-STRICT_MODE_KEYWORDS = [
-    '依文件', '根據文件', '規格', '一定要', '保證正確',
-    '根據 manual', '按照手冊', '依照規範', '依據說明',
-    'spec', 'manual', 'specification', 'according to'
-]
-STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
-
 # ------------------------------------------------------------
 # CodeTrail 內部呼叫的取樣參數(top_p / top_k / min_p)
 # ------------------------------------------------------------
@@ -988,25 +980,13 @@ STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
 CHAT_TOP_P = 0.95
 CHAT_TOP_K = 20
 CHAT_MIN_P = 0.0
-WEAK_REF_THRESHOLD = 0.35            # REF 分數低於此值視為「太弱」（調整: 0.30->0.35）
 SKIP_LOW_CONFIDENCE_KB = True        # 是否跳過低信心度的 KB 上下文注入
 LOW_CONFIDENCE_KB_THRESHOLD = 0.30   # 低於此分數則不注入 KB context（調整: 0.25->0.30）
 
-# Spec/規格類問題關鍵字（向後相容，新邏輯使用 needs_grounding 偵測器）
-SPEC_QUESTION_KEYWORDS = [
-    '規格', 'spec', 'manual', 'datasheet', '資料手冊',
-    '限制', '最大值', '最小值', 'thread-safe', 'overflow',
-    '兼容', '相容', '行為定義', 'behavior', '是否支援', '是否支持',
-    '上限', '下限', '邊界', 'boundary', '合規', 'compliance'
-]
-
 # ============================================================
-# P0-1: needs_grounding 偵測器設定
+# 數值詢問模式
 # ============================================================
-# 取代原本的關鍵字觸發，改用特徵偵測
-NEEDS_GROUNDING_ENABLED = True  # 啟用 needs_grounding 偵測器（取代純關鍵字）
-
-# 數值詢問模式：grounding 與檢索的 numeric fast path 共用，避免語言分歧。
+# 檢索的 numeric fast path（knowledge._is_numeric_query）用它判斷數值題，中英文同一份。
 GROUNDING_NUMERIC_PATTERNS = [
     r'多少', r'幾[個條筆次]?', r'幾分鐘', r'多大', r'多長', r'多久',
     r'最[大小多少高低]', r'上限', r'下限', r'門檻', r'閾值',
@@ -1014,37 +994,6 @@ GROUNDING_NUMERIC_PATTERNS = [
     r'default|預設|預設值', r'限制[是為]?',
     r'\bhow\s+(?:many|much|long)\b',
     r'\b(?:max(?:imum)?|min(?:imum)?|upper\s+limit|lower\s+limit)\b',
-]
-
-# 規格/標準詢問模式
-GROUNDING_SPEC_PATTERNS = [
-    r'RFC\s*\d+', r'ISO\s*\d+', r'IEEE\s*\d+',  # 標準編號
-    r'API\s*(參數|endpoint|回傳|返回|錯誤碼)',
-    r'(錯誤|error)\s*(碼|code)',
-    r'版本\s*(對照|比較|差異|相容)',
-    r'(行為|behavior)\s*(定義|規範)',
-    r'(是否|能否|可否)\s*(支[援持]|相容|兼容)',
-]
-
-# 比較/對照模式（需要精確資訊）
-GROUNDING_COMPARE_PATTERNS = [
-    r'比較', r'對照', r'差異', r'區別', r'不同',
-    r'vs\.?', r'versus', r'compared to',
-    r'哪[個種].*更', r'選擇.*還是',
-]
-
-# 強制 grounding 關鍵字（高信心觸發）
-GROUNDING_FORCE_KEYWORDS = [
-    '根據文件', '依文件', '依照規範', '按照手冊',
-    '依據說明', '一定要', '保證正確',
-    'according to', 'as per', 'specification says',
-]
-
-# 排除模式（這些問題通常不需要 grounding）
-GROUNDING_EXCLUDE_PATTERNS = [
-    r'^(什麼是|explain|介紹|說明)\s',  # 概念解釋類
-    r'^how\s+to|^如何|^怎麼',  # 操作指引類（除非含數值）
-    r'(建議|推薦|最佳實踐)',  # 主觀建議類
 ]
 
 # ============================================================

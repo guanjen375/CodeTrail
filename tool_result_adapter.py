@@ -90,26 +90,6 @@ def _render_refs(refs: object) -> str:
     return "\n".join(f"source: {_source_label(ref)}" for ref in refs)
 
 
-def _render_excluded(excluded: object, hint: object = "") -> str:
-    if not isinstance(excluded, list) or not excluded:
-        return ""
-    rows = [_source_label(item) for item in excluded]
-    lines = [f"excluded_figures: {rows[0]}"]
-    lines.extend(f"excluded_figure: {row}" for row in rows[1:])
-    if hint:
-        lines.append(f"review: {hint}")
-    return "\n".join(lines)
-
-
-def _render_excluded_text(payload: dict[str, Any]) -> str:
-    excluded = payload.get("excluded_text")
-    if not isinstance(excluded, list) or not excluded:
-        return ""
-    return "\n".join([
-        "excluded_text: " + _json(item) for item in excluded
-    ] + ["review: use review_text(action=\"list\") to inspect the current OCR revisions."])
-
-
 def _render_query_knowledge(payload: dict[str, Any]) -> str:
     if payload.get("error"):
         return str(payload["error"])
@@ -117,28 +97,12 @@ def _render_query_knowledge(payload: dict[str, Any]) -> str:
     # Prefer the actual evidence text, then append only compact source labels.
     primary = str(payload.get("text") or payload.get("display") or "")
     # Put bounded provenance before bulk REF text so result-budget truncation
-    # cannot remove the source/page and review lane first.
+    # cannot remove the source/page and verification status first.
     parts = [part for part in (
         _render_refs(payload.get("refs")),
-        _render_excluded(payload.get("excluded_figures"), payload.get("review_hint")),
-        _render_excluded_text(payload),
         primary,
     ) if part]
     return "\n".join(parts) or "No matching knowledge-base evidence."
-
-
-def _render_query_knowledge_strict(payload: dict[str, Any]) -> str:
-    if payload.get("refused"):
-        primary = f"refused: {payload.get('reason') or 'insufficient evidence'}"
-    else:
-        primary = str(payload.get("answer") or payload.get("reason") or "No strict answer produced.")
-    parts = [part for part in (
-        _render_refs(payload.get("refs")),
-        _render_excluded(payload.get("excluded_figures"), payload.get("review_hint")),
-        _render_excluded_text(payload),
-        primary,
-    ) if part]
-    return "\n".join(parts)
 
 
 def _render_query_table(payload: dict[str, Any]) -> str:
@@ -274,8 +238,6 @@ def _render_payload(tool_name: str, payload: object) -> str:
         return _render_query_table(payload)
     if tool_name == "query_knowledge" and isinstance(payload, dict):
         return _render_query_knowledge(payload)
-    if tool_name == "query_knowledge_strict" and isinstance(payload, dict):
-        return _render_query_knowledge_strict(payload)
     if tool_name == "code_rag_search":
         return _render_code_rag(payload)
     if isinstance(payload, str):
@@ -371,9 +333,7 @@ def _status_for(tool_name: str, payload: object, body: str) -> tuple[str, str | 
             return ingest_status, ingest_step
     if _has_structured_error(payload):
         return "error", "Correct the reported input or environment problem, then retry once."
-    if isinstance(payload, dict) and (
-        payload.get("refused") is True or payload.get("has_ref") is False
-    ):
+    if isinstance(payload, dict) and payload.get("has_ref") is False:
         return "partial", "Use another indexed source or ingest evidence; do not infer the missing answer."
     if body.lstrip().startswith("✗ 驗證未通過") and "patch 已套用" in body:
         return "partial", "The patch remains applied; run lint/tests separately and inspect the reported failure."

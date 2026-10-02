@@ -30,7 +30,7 @@
   server context 還放得下的程度（`_next_output_budget()`），加不上去就不送——
   同一個預算重送是逐字相同的請求，greedy 取樣必然重播同一個 `length`。
 * **驗證等級不足**（沒有第二個通道、anchor 覆蓋不全）→ `unverified`，正常入庫，
-  但 strict query 用不到它。
+  但 REF 會標為待覆核，回答審核也不把它當可信證據。
 
 ── import 紀律 ────────────────────────────────────────────────────────
 本模組只 `import figure_extract`（門面已是 PEP 562 lazy `__getattr__`），
@@ -3236,7 +3236,7 @@ def _reconcile_terminal_sample_shapes(payload_a: dict, payload_b: dict):
     table 少一列/一欄沒有 schema 內的安全表示，所以仍 hard fail；terminal 不同：每個
     line 本來就是獨立原子，SequenceMatcher 能保住共同 subsequence。insert/delete 的行
     不擇一，正文放單一 `▯`，alternatives 留「該行原文」與空字串（另一樣本缺行）。
-    因此順序不變、差異不消失，而且 strict gate 一定擋下。
+    因此順序不變、差異不消失，而且一定標為待覆核。
     """
     lines_a = list(payload_a["lines"])
     lines_b = list(payload_b["lines"])
@@ -4978,7 +4978,7 @@ def _extract_vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: d
     if empty_tiles:
         # **blocker，不是 note**：容忍空白片是為了「不要整張圖消失」，不是為了
         # 「假裝它是完整的」。只記 note 的話 `_decide_status()` 攔不住——剩下那幾片
-        # 只要 anchor 全中就會升成 `corroborated` 進 strict query，而中間缺一片
+        # 只要 anchor 全中就會升成 `corroborated` 被當成可信證據，而中間缺一片
         # （模型把有內容的 tile 誤回空）從 payload 上完全看不出來。
         findings.block(
             "blank_tile_dropped",

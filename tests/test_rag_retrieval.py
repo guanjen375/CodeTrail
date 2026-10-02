@@ -1,4 +1,4 @@
-"""RAG 檢索端:reranker / MMR、檢索回歸、雙訊號(context_signals)與 strict KB 拒答閘。
+"""RAG 檢索端:reranker / MMR、檢索回歸、雙訊號(context_signals)與檢索路徑(trace)。
 
 合併自三份測試(2026-09-02),各自的脈絡分段保留如下。smoke 成員資格逐條保留:只有
 test_contextual_signals.py 有逐條標的 smoke(拒答閘與 reranker passage 那幾條),
@@ -11,7 +11,8 @@ reranker 名次(它本身合併自 test_rag_rerank_policy.py 與 test_rerank_mmr
 test_rag_retrieval_regressions.py —— 檢索回歸:BM25 tokenizer 保留數值／hex 字面、
 hybrid search 的 BM25-only 候選、multi-query 不得覆寫 RRF 尺度、reranker 看到完整 pool
 與晚段文字、source filter 先於 top_k、overlap 前綴不重複計入 BM25、embedding 輸入含
-source、strict MCP 查詢必須把 is_strict_mode 傳進檢索。
+source、英文數值題略過擴寫但不吞依賴失敗(原 test_strict_query_language.py 的非 strict
+那一條)、strict 檢索移除後檢索 API 不再接受 is_strict_mode。
 
 test_contextual_signals.py —— 雙訊號(retrieval 含 ctx / gate 只看原文)的不變式回歸測試。
 核心不變式(規格 §2):`ctx` 是 LLM 生成物,只准影響「哪些 chunk 被撈上來、排第幾」。
@@ -23,7 +24,6 @@ test_contextual_signals.py —— 雙訊號(retrieval 含 ctx / gate 只看原�
 """
 from __future__ import annotations
 
-import ast
 import builtins
 import contextvars
 import hashlib
@@ -41,7 +41,6 @@ import context_signals
 import kb_cache
 import knowledge
 import RAG
-import utils
 from knowledge import Candidate, KnowledgeBase
 from knowledge_store import KnowledgeStoreError
 from runtime_dependencies import DependencyError
@@ -75,7 +74,7 @@ def test_knowledge_rerank_policy_embedding_does_not_call_main_model(monkeypatch,
     monkeypatch.setattr(knowledge, "_gated_completion", fail_llm)
 
     with pytest.raises(DependencyError, match="RAG reranker unavailable"):
-        kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
+        kb._rerank_with_model("question", candidates, top_k=2)
 
 
 def test_knowledge_rerank_policy_main_model_rejects_missing_reranker(monkeypatch, tmp_path):
@@ -92,7 +91,7 @@ def test_knowledge_rerank_policy_main_model_rejects_missing_reranker(monkeypatch
     monkeypatch.setattr(knowledge, "_gated_completion", fake_llm)
 
     with pytest.raises(DependencyError, match="RAG reranker unavailable"):
-        kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
+        kb._rerank_with_model("question", candidates, top_k=2)
     assert called["value"] is False
 
 
@@ -102,7 +101,7 @@ def test_knowledge_rerank_policy_error_raises_when_unavailable(monkeypatch, tmp_
     monkeypatch.setattr(kb, "_check_reranker_available", lambda: False)
 
     with pytest.raises(DependencyError, match="RAG reranker unavailable"):
-        kb._rerank_with_model("question", _kb_candidates(), top_k=2, is_strict_mode=True)
+        kb._rerank_with_model("question", _kb_candidates(), top_k=2)
 
 
 def test_knowledge_rerank_policy_embedding_handles_rerank_exception(monkeypatch, tmp_path):
@@ -118,7 +117,7 @@ def test_knowledge_rerank_policy_embedding_handles_rerank_exception(monkeypatch,
     monkeypatch.setattr(knowledge, "_gated_completion", fail_llm)
 
     with pytest.raises(DependencyError, match="RAG reranker unavailable.*boom"):
-        kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
+        kb._rerank_with_model("question", candidates, top_k=2)
 
 
 def _code_candidates():
@@ -256,7 +255,7 @@ def test_rerank_returns_scores_alongside_chunks(monkeypatch, tmp_path: Path):
         lambda **kwargs: [1.0, 5.0, 3.0][: len(kwargs["documents"])],
     )
 
-    ranked = kb._rerank_with_model("question", candidates, top_k=3, is_strict_mode=True)
+    ranked = kb._rerank_with_model("question", candidates, top_k=3)
 
     assert [chunk["id"] for _score, chunk in ranked] == ["1", "2", "0"]
     assert [score for score, _chunk in ranked] == [5.0, 3.0, 1.0]
@@ -307,6 +306,57 @@ def _loaded_kb(tmp_path: Path, chunks: list[dict]) -> knowledge.KnowledgeBase:
 def test_bm25_tokenizer_preserves_numeric_and_hex_literals(tmp_path: Path, token: str):
     kb = knowledge.KnowledgeBase(str(tmp_path / "missing.json"))
     assert token.lower() in kb._tokenize_for_bm25(f"offset {token} value")
+
+
+@pytest.mark.smoke
+def test_english_numeric_query_skips_expansion_without_hiding_dependency_failure(
+    tmp_path: Path, monkeypatch,
+):
+    """數值題(中英文)不得走 20 秒的擴寫呼叫;但這是查詢決策,不是例外退路。
+
+    原 tests/test_strict_query_language.py 的非 strict 部分(strict 檢索移除後保留):
+    其他問題的兩個擴寫後端仍必須 fail-loud。
+    """
+    kb = knowledge.KnowledgeBase(str(tmp_path / "missing.json"))
+    kb.loaded = True
+    kb.chunks = [{"id": "reset", "source": "startup.pdf", "content": "37 ms"}]
+    candidates = [knowledge.Candidate(
+        0, kb.chunks[0], rrf_score=0.02, gate_score=0.1,
+    )]
+    monkeypatch.setattr(kb, "_get_embedding", lambda _question: [1.0, 0.0])
+    monkeypatch.setattr(kb, "_search_once", lambda *_args: candidates)
+    monkeypatch.setattr(knowledge, "MULTI_QUERY_SKIP_NUMERIC", True)
+    monkeypatch.setattr(knowledge, "MULTI_QUERY_ENABLED", True)
+    monkeypatch.setattr(knowledge, "MULTI_QUERY_TYPES", ["key_terms"])
+    monkeypatch.setattr(knowledge, "USE_QUERY_EXPANSION", True)
+    calls = []
+
+    def unavailable(**kwargs):
+        calls.append(kwargs["source"])
+        raise DependencyError("selected expansion server unavailable")
+
+    monkeypatch.setattr(knowledge, "_gated_completion", unavailable)
+    for question in (
+        "Warm reset delay is how many ms?",
+        "Warm reset delay 是多少毫秒？",
+        "HOW MUCH memory does reset require?",
+        "How long is the reset delay?",
+        "What is the maximum reset delay?",
+        "What is the minimum reset delay?",
+    ):
+        assert kb._hybrid_search(question) == candidates
+        assert kb._last_expansion == {"triggered": False, "queries": []}
+    assert calls == []
+
+    # The fast path is a query decision, never an exception fallback. Both
+    # enabled expansion backends must still fail loudly for other questions.
+    question = "Explain the warm reset sequence"
+    with pytest.raises(DependencyError, match="selected expansion server"):
+        kb._hybrid_search(question)
+    monkeypatch.setattr(knowledge, "MULTI_QUERY_ENABLED", False)
+    with pytest.raises(DependencyError, match="selected expansion server"):
+        kb._hybrid_search(question)
+    assert calls == ["kb_multi_query", "kb_query_expansion"]
 
 
 def test_hybrid_search_keeps_bm25_only_results(monkeypatch, tmp_path: Path):
@@ -392,14 +442,14 @@ def test_reranker_sees_full_pool_and_late_passage_text(monkeypatch, tmp_path: Pa
 
     monkeypatch.setattr(knowledge.llama_client, "rerank", fake_rerank)
 
-    results = kb._rerank_with_model("find the late fact", candidates, top_k=12, is_strict_mode=True)
+    results = kb._rerank_with_model("find the late fact", candidates, top_k=12)
 
     assert len(captured) == 30
     assert any("LATE_NUMERIC_FACT_0xBEEF" in doc for doc in captured)
     assert results[0][1]["id"] == "20"
 
 
-def test_strict_rerank_is_not_skipped_when_candidates_fit_output_pool(monkeypatch, tmp_path: Path):
+def test_rerank_is_not_skipped_when_candidates_fit_output_pool(monkeypatch, tmp_path: Path):
     kb = knowledge.KnowledgeBase(str(tmp_path / "missing.json"))
     candidates = [
         knowledge.Candidate(
@@ -418,7 +468,7 @@ def test_strict_rerank_is_not_skipped_when_candidates_fit_output_pool(monkeypatc
         return list(range(len(kwargs["documents"])))
 
     monkeypatch.setattr(knowledge.llama_client, "rerank", fake_rerank)
-    kb._rerank_with_model("low confidence", candidates, top_k=12, is_strict_mode=True)
+    kb._rerank_with_model("low confidence", candidates, top_k=12)
 
     assert calls == 1
 
@@ -480,27 +530,6 @@ def test_embedding_input_includes_source_and_cache_key(monkeypatch, tmp_path: Pa
     assert len(calls) == 2
     assert "revision_a.md" in calls[0]
     assert "revision_b.md" in calls[1]
-
-
-def test_strict_mcp_query_passes_strict_flag_to_retrieval():
-    tree = ast.parse(Path("mcp_server.py").read_text(encoding="utf-8"))
-    strict_fn = next(
-        node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "query_knowledge_strict"
-    )
-    kb_calls = [
-        node for node in ast.walk(strict_fn)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "KB"
-        and node.func.attr == "query"
-    ]
-    assert kb_calls
-    assert any(
-        kw.arg == "is_strict_mode" and isinstance(kw.value, ast.Constant) and kw.value.value is True
-        for kw in kb_calls[0].keywords
-    )
 
 
 # ── 原 test_contextual_signals.py:雙訊號(retrieval 含 ctx / gate 只看原文)的不變式 ──
@@ -979,7 +1008,7 @@ def test_should_rerank_branches_all_read_gate(
         for i, (r, g) in enumerate(candidates_kwargs)
     ]
 
-    assert kb._should_rerank(candidates, top_k=3, is_strict_mode=False) is expected, branch
+    assert kb._should_rerank(candidates, top_k=3) is expected, branch
 
 
 def test_lexical_numeric_evidence_uses_gate_bm25(tmp_path: Path, monkeypatch):
@@ -1059,52 +1088,6 @@ def test_metadata_top_emb_score_is_the_gate_score(tmp_path: Path, monkeypatch):
     assert meta_off["top_emb_score"] == pytest.approx(meta_off["top_retrieval_score"])
 
 
-def test_refuse_answer_reads_top_emb_score_not_retrieval_score():
-    """拒答閘只看 gate 分數：retrieval 再高也救不了弱原文。"""
-    weak_content_strong_ctx = {
-        "has_ref": True,
-        "top_emb_score": config.WEAK_REF_THRESHOLD - 0.05,   # gate：弱
-        "top_retrieval_score": 0.99,                          # 含 ctx：很高
-        "has_authoritative_chunk": True,
-    }
-
-    assert utils.should_refuse_answer("這個 spec 的預設值是什麼", weak_content_strong_ctx) is True
-
-    strong_content = dict(weak_content_strong_ctx, top_emb_score=config.WEAK_REF_THRESHOLD + 0.05)
-    assert utils.should_refuse_answer("這個 spec 的預設值是什麼", strong_content) is False
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize(
-    "question",
-    (
-        "The ingested synthetic specification does not define orbit_lock_epoch.",
-        "已匯入的合成規格沒有定義 orbit_lock_epoch。",
-    ),
-)
-def test_refuse_answer_rejects_explicitly_missing_identifier(question: str):
-    """Strong same-document retrieval must not prove an explicitly absent field."""
-    metadata = {
-        "has_ref": True,
-        "top_emb_score": config.WEAK_REF_THRESHOLD + 0.2,
-        "top_retrieval_score": 0.99,
-        "has_authoritative_chunk": True,
-        "retrieved_chunks": ["The synthetic specification defines unrelated router limits."],
-    }
-
-    assert utils.should_refuse_answer(question, metadata) is True
-
-    metadata["retrieved_chunks"] = [
-        "This specification intentionally says nothing about orbit_lock_epoch."
-    ]
-    assert utils.should_refuse_answer(question, metadata) is True
-
-    metadata["retrieved_chunks"] = [
-        "The synthetic specification explicitly defines orbit_lock_epoch."
-    ]
-    assert utils.should_refuse_answer(question, metadata) is False
-
-
 # ============================================================
 # 證據文本面：ctx 不得出現
 # ============================================================
@@ -1126,7 +1109,7 @@ def test_ctx_never_reaches_ref_text_or_retrieved_chunks(tmp_path: Path, monkeypa
     assert CTX_TEXT not in model_output, "ctx 出現在 [REF] 證據文本裡"
     assert CTX_TEXT not in display_output, "ctx 出現在 UI 來源顯示裡"
     assert all(CTX_TEXT not in text for text in meta["retrieved_chunks"]), (
-        "ctx 出現在 strict 逐句驗證的來源裡"
+        "ctx 出現在 eval 用的 retrieved_chunks 證據來源裡"
     )
 
 
@@ -1420,11 +1403,12 @@ def test_query_exposes_the_partial_trace_when_retrieval_raises(tmp_path: Path, m
 
 
 @pytest.mark.smoke
-def test_strict_all_excluded_records_the_stop_reason_and_the_excluded_figures(
+def test_trace_schema_2_has_no_strict_fields_and_labels_the_flagged_figure(
     tmp_path: Path, monkeypatch
 ):
-    """審核 BLOCKER 4:strict 把召回的全部當成待覆核圖排除時,程式在更新 stage 之前就
-    返回,紀錄看起來像「停在 hybrid、泛用拒答」。要記停止原因與被排除的圖。"""
+    """strict 檢索移除後 trace 升到 schema 2:`query.strict`、`strict_excluded` 與
+    strict_all_excluded* 停止原因都不再出現;待覆核的圖照樣進 REF(帶狀態),而 trace 的
+    最終 REF 仍與 refs 逐筆對齊——data flywheel 兩版紀錄都要讀得懂,分不清版本就會誤讀。"""
     monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
     figure = _chunk("fig-a", "暫存器 CTRL 重置值 0x0001 的表格內容夠長可以通過噪音過濾。" * 3,
                     ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[1.0, 0.0])
@@ -1437,14 +1421,33 @@ def test_strict_all_excluded_records_the_stop_reason_and_the_excluded_figures(
     kb = KnowledgeBase(str(path))
     _go_offline(kb, monkeypatch)
 
-    _model, _display, meta = kb.query("CTRL 重置值是什麼", is_strict_mode=True)
+    _model, _display, meta = kb.query("CTRL 重置值是什麼")
 
-    assert meta["has_ref"] is False
     trace = meta["trace"]
-    assert trace["stopped"] == "strict_all_excluded"
-    assert trace["stage"] == "strict"
-    assert len(trace["strict_excluded"]["figures"]) == 1
-    assert trace["strict_excluded"]["figures"][0]["verification_status"] == "needs_review"
+    assert trace["schema"] == knowledge.TRACE_SCHEMA == 2
+    assert "strict" not in trace["query"]
+    assert "strict_excluded" not in trace
+    assert trace["stage"] == "done" and trace["stopped"] is None
+    assert meta["has_ref"] is True
+    assert [ref["verification_status"] for ref in meta["refs"]] == ["needs_review"]
+    assert [entry["source"] for entry in trace["final"]] == [ref["source"] for ref in meta["refs"]]
+    assert "excluded_figures" not in meta and "excluded_text" not in meta
+
+
+@pytest.mark.smoke
+def test_kb_query_and_rerank_reject_the_removed_strict_parameter(tmp_path: Path):
+    """strict 檢索已移除:檢索 API 不再接受 is_strict_mode。
+
+    留著一個不再有作用的參數,呼叫端會以為自己拿到了較嚴格的檢索——那是無聲的退化。
+    """
+    import inspect
+
+    for fn in (KnowledgeBase.query, KnowledgeBase._rerank_with_model,
+               KnowledgeBase._should_rerank):
+        assert "is_strict_mode" not in inspect.signature(fn).parameters, fn.__name__
+    kb = KnowledgeBase(str(tmp_path / "missing.json"))
+    with pytest.raises(TypeError):
+        kb.query("question", is_strict_mode=True)
 
 
 @pytest.mark.smoke

@@ -49,7 +49,7 @@ def _log_notification(message: dict) -> None:
         handle.write(json.dumps(message, ensure_ascii=False) + "\n")
 
 
-# 工具目錄必須逐字等於真的 server 的 19 個名稱與順序 —— client 在 start()
+# 工具目錄必須逐字等於真的 server 的公開名稱與順序(mcp_contract.PUBLIC_TOOL_ORDER)—— client 在 start()
 # 就驗這件事,stub 自己編一組名字的話,整批取消契約測試就繞過了那道驗證。
 # 慢工具挑 ingest_document:取消契約本來就是為它存在的。
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -59,7 +59,7 @@ SLOW_TOOL = "ingest_document"
 FAST_TOOL = "list_dir"
 READ_ONLY_TOOLS = frozenset({
     "list_dir", "read_file", "grep_code", "code_rag_search", "file_info",
-    "query_knowledge", "query_knowledge_strict", "git_status", "git_diff",
+    "query_knowledge", "git_status", "git_diff",
     "analyze_file",
 })
 

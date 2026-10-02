@@ -60,9 +60,11 @@ from textual.widgets import Button, Collapsible, Markdown, OptionList, Static, T
 from textual.widgets.option_list import Option
 
 import client_attachments
+import client_audit
 import client_config
 import client_engine
 import client_events
+import client_kb
 import client_paths
 import client_review
 import client_store
@@ -103,6 +105,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
     ("/compact", "立刻壓縮目前對話"),
     ("/review", "審查 HEAD 到工作目錄的淨變更，含新增檔案；不寫聊天歷史"),
+    ("/kb", "知識庫：/kb 看狀態，/kb add <路徑> 匯入，/kb review 覆核，/kb remove <文件> 移除"),
     ("/queue", "待送訊息:list / add / edit / cancel / resume"),
     ("/supplement", "補充目前任務(/supplement <文字>,安全點才送入)"),
     ("/status", "目前模型、context、壓縮模式與 session 位置"),
@@ -126,6 +129,8 @@ HELP_TAIL = (
     f"單則最多 {client_attachments.MAX_ATTACHMENTS} 個附件，補充訊息不處理附件。\n"
     "專案外檔案（@~/Downloads/…、@/tmp/…）：先 /import on 並重開 aicode，每次匯入仍需核准；"
     "SSH 連線時先把檔案傳到這台主機（例如 ~/Downloads）。\n"
+    "知識庫：/kb add @路徑 直接匯入（PDF／Markdown／文字／圖片／ELF／binary，可反覆查詢）；"
+    "/kb review 覆核待確認的圖表與 OCR，確認或修改都會跳出核准框。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
     "滑鼠左鍵拖曳選取，放開即複製；雙擊／三擊完成文字選取也會複製，並保留反白。\n"
@@ -192,7 +197,8 @@ class HistoryEntry:
     """要貼回畫面的一則。"""
 
     kind: Literal[
-        "user", "summary", "assistant", "assistant_error", "reasoning", "tool", "tool_orphan", "cancelled"
+        "user", "summary", "assistant", "assistant_error", "reasoning", "tool", "tool_orphan", "cancelled",
+        "audit",
     ]
     text: str = ""
     tool: str = ""
@@ -247,6 +253,11 @@ def history_entries(transcript: Sequence[Mapping[str, Any]]) -> list[HistoryEntr
         if record.get("type") == "turn_cancelled":
             open_calls = {}
             entries.append(HistoryEntry(kind="cancelled", text="這一輪已取消；原始訊息保留。"))
+            continue
+        if record.get("type") == client_events.TYPE_AUDIT:
+            # 審核卡接在它審的那則答案後面。**不重設 open_calls**:它不是模型歷史,
+            # 不得改變工具結果的群組配對。
+            entries.append(HistoryEntry(kind="audit", structured=dict(record)))
             continue
         if record.get("type") == "compaction":
             open_calls = {}
@@ -578,6 +589,23 @@ class SummaryBlock(Collapsible):
         )
 
 
+class AuditBlock(Collapsible):
+    """主回答之後的審核卡(審核模型／小模型):標題一行結論,展開看逐項依據。
+
+    內容與即時、重播共用 :func:`client_audit.render_card`。所有字串來自模型與文件,
+    一律以 ``Text`` 呈現(不解析 markup)。審核卡**不是**模型歷史的一部分。
+    """
+
+    def __init__(self, record: Mapping[str, Any] | None) -> None:
+        title, lines, level = client_audit.render_card(record)
+        self._body = Static(Text("\n".join(lines)), classes="tool-output")
+        super().__init__(self._body, title="", collapsed=True, classes=f"entry audit -audit-{level}")
+        self.record = dict(record) if isinstance(record, Mapping) else None
+        self.level = level
+        self.summary = title
+        self.title = Text(title)
+
+
 # ============================================================
 # 核准框
 # ============================================================
@@ -830,6 +858,235 @@ class ReviewScreen(ModalScreen[bool]):
     def on_unmount(self) -> None:
         if self.running:
             self.app.coordinator.cancel(block=False, review_id=self.review_id)
+
+
+# ============================================================
+# 知識庫(/kb)
+# ============================================================
+class KbResultBlock(Collapsible):
+    """一個 `/kb` 動作的結果:標題一行摘要,展開看完整工具輸出。
+
+    不寫聊天歷史、不進 session 檔(知識庫動作不是對話內容),所以換 session 後不重播。
+    """
+
+    def __init__(self, outcome: client_kb.KbOutcome) -> None:
+        self._body = Static(Text(outcome.detail or "(沒有工具輸出)"), classes="tool-output")
+        # 標題用 Text:檔名可能含 `[...]`,str 會被 Textual 當成 markup。
+        super().__init__(self._body, title=Text(outcome.title), collapsed=True,
+                         classes="entry summary kb-result")
+        self.outcome = outcome
+
+
+class KbReviewScreen(ModalScreen[None]):
+    """`/kb review`:待處理清單。清單在背景讀(UI 執行緒零 FS);寫入一律交給協調器。
+
+    Esc 收起;知識庫動作進行中 Esc 只提示(Ctrl-C 才中斷那個動作)。
+    """
+
+    BINDINGS = [Binding("escape", "close_kb", "關閉", show=False)]
+    AUTO_FOCUS = "#kb-review-list"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items: tuple[client_kb.ReviewItem, ...] = ()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="kb-review"):
+            yield Static(Text("知識庫覆核", style="bold"))
+            yield Static(Text(
+                "↑/↓ 選擇、Enter 查看與確認、Esc 關閉；確認或修改都會再跳出核准框顯示完整參數。",
+                style="dim",
+            ))
+            yield Static(Text("讀取中…"), id="kb-review-status")
+            yield OptionList(id="kb-review-list")
+
+    def on_mount(self) -> None:
+        self.reload()
+
+    def reload(self, note: str = "") -> None:
+        self.set_status((note + "\n" if note else "") + "讀取中…")
+        self.app._kb_load_items(self, note)
+
+    def set_status(self, text: str) -> None:
+        self.query_one("#kb-review-status", Static).update(Text(text))
+
+    def show_items(self, items: Sequence[client_kb.ReviewItem], error: str = "", note: str = "") -> None:
+        self.items = tuple(items)
+        listing = self.query_one("#kb-review-list", OptionList)
+        listing.clear_options()
+        # 每一列都包成 Text:檔名、原因來自文件與 artifact,裡面的 `[...]` 不得被當成 markup。
+        listing.add_options([Option(Text(item.title), id=str(index))
+                             for index, item in enumerate(self.items)])
+        if error:
+            status = f"讀取失敗：{error}"
+        elif not self.items:
+            status = "目前沒有待處理的項目。"
+        else:
+            counts: dict[str, int] = {}
+            for item in self.items:
+                counts[item.label] = counts.get(item.label, 0) + 1
+            status = "共 " + "、".join(f"{label} {count}" for label, count in counts.items())
+        self.set_status((note + "\n" if note else "") + status)
+        if self.items:
+            listing.highlighted = 0
+            listing.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        try:
+            index = int(event.option_id or "")
+        except ValueError:
+            return
+        if 0 <= index < len(self.items):
+            self.app._kb_open_item(self, self.items[index])
+
+    def action_close_kb(self) -> None:
+        if self.app.coordinator.kb_busy:
+            self.set_status("知識庫動作進行中；Ctrl-C 可以中斷，結束後再關閉。")
+            return
+        self.dismiss(None)
+
+
+class KbItemScreen(ModalScreen[str | None]):
+    """一筆待處理項目的明細與動作。回傳 "confirm"／"edit"／"retry";返回是 None。
+
+    明細在背景讀;按鈕只在明細允許時才可按。確認的意思是**你對照過原圖／原文**,
+    所以按鈕文字直接寫出來,送出前還有一次核准框(完整參數)。
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "返回", show=False),
+        Binding("y", "choose('confirm')", "確認", show=False),
+        Binding("e", "choose('edit')", "修改", show=False),
+        Binding("r", "choose('retry')", "重試", show=False),
+    ]
+    AUTO_FOCUS = "#kb-back"
+
+    def __init__(self, item: client_kb.ReviewItem) -> None:
+        super().__init__()
+        self.item = item
+        self.detail: client_kb.FigureDetail | client_kb.OcrDetail | None = None
+        self._enabled: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        confirm = "對照原文無誤，確認 (y)" if self.item.category == "ocr" else "對照原圖無誤，確認 (y)"
+        with Vertical(id="kb-item"):
+            yield Static(Text(self.item.title, style="bold"))
+            with VerticalScroll(id="kb-item-body"):
+                yield Static(Text("讀取中…"), id="kb-item-detail")
+            with Horizontal(id="kb-item-buttons"):
+                yield Button(confirm, id="kb-confirm", variant="success", disabled=True)
+                yield Button("修改 (e)", id="kb-edit", disabled=True)
+                yield Button("重試失敗的圖 (r)", id="kb-retry", disabled=True)
+                yield Button("返回 (Esc)", id="kb-back")
+
+    def on_mount(self) -> None:
+        if self.item.category == "error":
+            self.show_detail(None, "這是 review artifact 的讀取錯誤；請檢查 .codetrail/figures 是否被改動，"
+                                   "或重新匯入該文件。")
+            return
+        self.app._kb_load_detail(self)
+
+    def show_detail(self, detail: Any, error: str = "") -> None:
+        self.detail = detail
+        body = self.query_one("#kb-item-detail", Static)
+        if detail is None:
+            body.update(Text(error or "讀不到這一項的明細。"))
+            self._enabled = set()
+        elif isinstance(detail, client_kb.OcrDetail):
+            text = Text("\n".join(detail.lines))
+            if detail.blocked:
+                text.append(f"\n\n⚠ {detail.blocked}", style="bold")
+            text.append("\n\n── 原始 OCR ──\n", style="bold")
+            text.append(detail.original or "(空白)")
+            text.append("\n\n── 目前正文 ──\n", style="bold")
+            text.append(detail.text or "(空白)")
+            body.update(text)
+            self._enabled = ({"confirm"} if detail.can_confirm else set()) | (
+                {"edit"} if detail.can_edit else set())
+        else:
+            text = Text("\n".join(detail.lines))
+            if detail.blocked:
+                text.append(f"\n\n⚠ {detail.blocked}", style="bold")
+            text.append("\n\n── 內容 ──\n", style="bold")
+            text.append(detail.preview)
+            if detail.payload_json:
+                text.append("\n\n── canonical JSON（確認時送出的就是這一份）──\n", style="bold")
+                text.append(detail.payload_json)
+            body.update(text)
+            self._enabled = (({"confirm"} if detail.can_confirm else set())
+                             | ({"edit"} if detail.can_edit else set())
+                             | ({"retry"} if detail.can_retry else set()))
+        for choice, widget_id in (("confirm", "#kb-confirm"), ("edit", "#kb-edit"), ("retry", "#kb-retry")):
+            self.query_one(widget_id, Button).disabled = choice not in self._enabled
+
+    def action_choose(self, choice: str) -> None:
+        if choice in self._enabled:
+            self.dismiss(choice)
+
+    def action_back(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        choice = {"kb-confirm": "confirm", "kb-edit": "edit", "kb-retry": "retry"}.get(event.button.id or "")
+        if choice is None:
+            self.dismiss(None)
+        else:
+            self.action_choose(choice)
+
+
+class KbEditScreen(ModalScreen[str | None]):
+    """修改 canonical JSON 或 OCR 正文:Ctrl+S 送出、Esc 取消。
+
+    送出前只做本地檢查(JSON、重複鍵、kind 不變、長度),server 的 validator 仍是權威;
+    檢查不過就留在這裡,原文不丟。
+    """
+
+    BINDINGS = [
+        Binding("ctrl+s", "submit_edit", "送出", show=False, priority=True),
+        Binding("escape", "cancel_edit", "取消", show=False),
+    ]
+    AUTO_FOCUS = "#kb-edit-text"
+
+    def __init__(self, title: str, hint: str, initial: str,
+                 validator: Callable[[str], str | None]) -> None:
+        super().__init__()
+        self.edit_title = title
+        self.hint = hint
+        self.initial = initial
+        self.validator = validator
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="kb-edit"):
+            yield Static(Text(self.edit_title, style="bold"))
+            yield Static(Text(self.hint, style="dim"))
+            yield TextArea(self.initial, id="kb-edit-text")
+            yield Static(Text(""), id="kb-edit-error")
+            with Horizontal(id="kb-edit-buttons"):
+                yield Button("送出 (Ctrl+S)", id="kb-edit-submit", variant="primary")
+                yield Button("取消 (Esc)", id="kb-edit-cancel")
+
+    def show_error(self, message: str) -> None:
+        self.query_one("#kb-edit-error", Static).update(Text(message))
+
+    def action_submit_edit(self) -> None:
+        text = self.query_one("#kb-edit-text", TextArea).text
+        problem = self.validator(text)
+        if problem:
+            self.show_error(problem)
+            return
+        self.dismiss(text)
+
+    def action_cancel_edit(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "kb-edit-submit":
+            self.action_submit_edit()
+        else:
+            self.action_cancel_edit()
 
 
 class QueueChoiceScreen(ModalScreen[str | None]):
@@ -1188,9 +1445,10 @@ class _AttachmentPreview:
             scope_kwargs = {"external": scope} if scope is not None else {}
             try:
                 completion = client_attachments.completions(text, cursor, root, **scope_kwargs)
-                summary = client_attachments.describe(
-                    client_attachments.resolve(text, root, **scope_kwargs)
-                )
+                resolution = client_attachments.resolve(text, root, **scope_kwargs)
+                # `/kb add @路徑` 是入庫,不是附件:摘要講匯入知識庫,不講 analyze_file／read_file。
+                summary = (client_kb.describe_add(resolution) if client_kb.is_add_command(text)
+                           else client_attachments.describe(resolution))
             except Exception:  # noqa: BLE001 - 預覽壞掉只是少一份提示,不得帶走 UI
                 completion, summary = None, ()
             self._target.post_message(self.Ready(generation, text, cursor, completion, summary))
@@ -1219,6 +1477,9 @@ class CodeTrailApp(App[int]):
     .entry.reasoning { color: $text-muted; }
     .entry.tool { margin: 0 0 1 0; }
     .tool-output { color: $text-muted; }
+    AuditBlock.-audit-ok > CollapsibleTitle { color: $success; }
+    AuditBlock.-audit-warn > CollapsibleTitle { color: $warning; }
+    AuditBlock.-audit-bad > CollapsibleTitle { color: $error; }
     #completions { height: auto; max-height: 8; padding: 0 1; color: $text-muted; }
     #activity { display: none; height: auto; max-height: 3; }
     #composer { height: auto; }
@@ -1255,6 +1516,17 @@ class CodeTrailApp(App[int]):
     #review-body { height: 1fr; border: round $primary-darken-2; padding: 0 1; }
     #review-report { height: auto; }
     #review-close { margin-top: 1; }
+    KbReviewScreen, KbItemScreen, KbEditScreen { align: center middle; }
+    #kb-review, #kb-item, #kb-edit {
+        width: 95%; height: 90%; border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #kb-review-status { height: auto; max-height: 6; color: $text-muted; }
+    #kb-review-list { height: 1fr; }
+    #kb-item-body { height: 1fr; border: round $primary-darken-2; padding: 0 1; }
+    #kb-item-buttons, #kb-edit-buttons { height: auto; padding: 1 0 0 0; }
+    #kb-item-buttons Button, #kb-edit-buttons Button { margin: 0 2 0 0; }
+    #kb-edit-text { height: 1fr; }
+    #kb-edit-error { height: auto; color: $error; }
     """ + client_theme.THEME_CSS
 
     BINDINGS = [
@@ -1273,9 +1545,12 @@ class CodeTrailApp(App[int]):
         show_reasoning: bool = False,
         keep_historical_reasoning: bool = False,
         theme: str = client_config.DEFAULT_THEME,
+        auditor: client_audit.AuditTarget | None = None,
     ) -> None:
         super().__init__()
         self.engine = engine
+        #: 審核模型(小模型)的端點,preflight 觀測過 live n_ctx;None = 不審核。
+        self.auditor = auditor
         self.compactor = compactor
         self.banner = tuple(banner)
         # 啟動資訊只在 /status 查閱；初始對話區連 WARN 也不重播。
@@ -1299,6 +1574,7 @@ class CodeTrailApp(App[int]):
             on_reasoning=self._reasoning_from_worker,
             compactor=compactor,
             on_prime=self._prime_from_worker,
+            auditor=auditor,
         )
         self._ui_thread_id = threading.get_ident()
         self._assistant: AssistantBlock | None = None
@@ -1307,6 +1583,11 @@ class CodeTrailApp(App[int]):
         self._tools: dict[str, ToolBlock] = {}
         self._approval_screens: dict[str, ApprovalScreen] = {}
         self._review_screen: ReviewScreen | None = None
+        #: `/kb review` 的畫面(開著時輸入框拿不到焦點);`_kb_jobs`:KB 動作的 kbID → 發起它的
+        #: 覆核畫面(從輸入框發起的是 None);`_kb_phase`:動作進行中狀態列的那一段字。
+        self._kb_screen: KbReviewScreen | None = None
+        self._kb_jobs: dict[str, KbReviewScreen | None] = {}
+        self._kb_phase = ""
         self._queue_revisions: dict[str, int] = {}
         self._turn_started: float | None = None
         self._spinner = 0
@@ -1596,6 +1877,8 @@ class CodeTrailApp(App[int]):
                 widgets.append(ErrorLine(entry.text))
             elif entry.kind == "summary":
                 widgets.append(SummaryBlock(entry.text, dropped=entry.dropped, kept=entry.kept))
+            elif entry.kind == "audit":
+                widgets.append(AuditBlock(entry.structured))
             elif entry.kind == "reasoning":
                 block = ReasoningBlock()
                 block.append(entry.text)
@@ -1693,6 +1976,10 @@ class CodeTrailApp(App[int]):
                 self._review_screen.accept_event(event)
             self._refresh_status()
             return
+        if event.get("kbID") is not None:
+            self._on_kb_event(event)
+            self._refresh_status()
+            return
         kind = event.get("type")
         if kind == client_events.TYPE_QUEUE:
             self._on_queue_event(event)
@@ -1729,9 +2016,19 @@ class CodeTrailApp(App[int]):
             self._append(ErrorLine(str(event.get("message", ""))))
             self._refresh_status()
             return
+        if kind == client_events.TYPE_AUDIT:
+            self._on_audit(event)
+            return
         if kind == client_events.TYPE_STEP_FINISH:
             self._on_step_finish(event)
             return
+
+    def _on_audit(self, event: Mapping[str, Any]) -> None:
+        """審核卡接在答案後面(終結事件之前到)。別段對話的不收。"""
+        if event.get("sessionID") != self.engine.session_id:
+            return
+        record = event.get("audit")
+        self._append(AuditBlock(record if isinstance(record, Mapping) else None))
 
     def _on_queue_event(self, event: Mapping[str, Any]) -> None:
         if event.get("sessionID") != self.engine.session_id:
@@ -1771,12 +2068,14 @@ class CodeTrailApp(App[int]):
             return
         part = client_events.event_part(event)
         operation, phase = part.get("operation"), part.get("phase")
-        if operation not in ("response", "compact") or phase not in (
+        if operation not in ("response", "compact", client_audit.OPERATION) or phase not in (
             "preparing", "waiting_model", "waiting_response", "prompt_processing",
             "generating", "tool", "approval", "validating", "persisting",
         ):
             return
         if phase in ("validating", "persisting") and operation != "compact":
+            return
+        if operation == client_audit.OPERATION and phase in ("tool", "approval"):
             return
         if phase == "preparing":
             self._reset_phase(compacting=operation == "compact")
@@ -1785,7 +2084,7 @@ class CodeTrailApp(App[int]):
             return
         if phase in ("generating", "validating", "persisting", "tool", "approval"):
             self._activity_generating = True
-        if operation == "compact" or phase in ("tool", "approval"):
+        if operation in ("compact", client_audit.OPERATION) or phase in ("tool", "approval"):
             self._clear_thinking()
         activity: dict[str, Any] = {"operation": operation, "phase": phase}
         percent = part.get("percent")
@@ -1959,6 +2258,9 @@ class CodeTrailApp(App[int]):
             if self.coordinator.reviewing:
                 self._append(NoticeLine("工作區審查進行中；輸入保留在草稿，可用 /queue add 保留到聊天。"))
                 return False
+            if self.coordinator.kb_busy:
+                self._append(NoticeLine("知識庫動作進行中；輸入保留在草稿，可用 /queue add 保留到聊天。"))
+                return False
             self._choose_message_mode(text)
             self._refresh_completions()
             return False
@@ -2050,6 +2352,9 @@ class CodeTrailApp(App[int]):
         回合、核准、審查進行中一律拒絕(同 Codex 的 /theme 與這裡的 /think):選單的
         Esc／Ctrl-C 只收選單,與「中斷這一輪」不能在同一個時刻搶同一個按鍵。
         """
+        if self.coordinator.kb_busy:
+            self._append(NoticeLine("知識庫動作進行中，不能切換主題。"))
+            return
         if (
             self.coordinator.busy
             or self.coordinator.pending_approvals()
@@ -2134,6 +2439,9 @@ class CodeTrailApp(App[int]):
             lines.append(IMPORT_USAGE)
             self._append(NoticeLine("\n".join(lines)))
             return
+        if self.coordinator.kb_busy:
+            self._append(NoticeLine("知識庫動作進行中，不能變更外部匯入設定。"))
+            return
         if (
             self.coordinator.busy
             or self.coordinator.pending_approvals()
@@ -2202,6 +2510,9 @@ class CodeTrailApp(App[int]):
         排隊 worker 也會開始新回合,所以閒置時仍須檢查 pending 佇列:
         有待送項目就不准切换;沒有項目時背景也沒有可啟動的下一輪。
         """
+        if self.coordinator.kb_busy:
+            self._append(NoticeLine(f"知識庫動作進行中,{what} 要等它結束;Ctrl-C 可以中斷它。"))
+            return True
         if self.coordinator.busy:
             self._append(NoticeLine(f"這一輪還在跑,{what} 要等它結束;Ctrl-C 可以中斷它。"))
             return True
@@ -2340,6 +2651,222 @@ class CodeTrailApp(App[int]):
         if leave:
             self._leave()
 
+    # ---- 知識庫(/kb)----------------------------------------------------
+    def _kb_refused(self, what: str) -> bool:
+        """`/kb` 只在閒置時可用:回合、核准、審查、另一個知識庫動作進行中一律拒絕。"""
+        if self.coordinator.kb_busy:
+            self._append(NoticeLine(f"知識庫動作進行中，{what} 要等它結束；Ctrl-C 可以中斷它。"))
+            return True
+        if (
+            self.coordinator.busy
+            or self.coordinator.pending_approvals()
+            or self.coordinator.reviewing
+            or self._review_screen is not None
+            or self._kb_screen is not None
+        ):
+            self._append(NoticeLine(f"回合、核准或審查進行中，不能使用 {what}。"))
+            return True
+        return False
+
+    def _cmd_kb(self, argument: str) -> None:
+        """`/kb` 看狀態、`/kb add <路徑>` 入庫、`/kb review` 覆核、`/kb remove <文件>` 移除。
+
+        這裡只做字串判斷:讀知識庫交給背景執行緒,寫入交給協調器的 KB 動作(同一條工具路徑,
+        ASK 工具照樣跳核准框)。不建立 session、不寫聊天歷史。
+        """
+        sub, _, rest = argument.partition(" ")
+        sub, rest = sub.strip().lower(), rest.strip()
+        if sub not in ("", "add", "remove", "review"):
+            self._append(NoticeLine(client_kb.USAGE))
+            return
+        if self._kb_refused(f"/kb {sub}".strip()):
+            return
+        if sub == "":
+            self._kb_read(client_kb.overview, self._show_kb_overview)
+            return
+        if sub == "review":
+            if rest:
+                self._append(NoticeLine("/kb review 不接受參數。"))
+                return
+            screen = KbReviewScreen()
+            self._kb_screen = screen
+            self.push_screen(screen, self._kb_review_closed)
+            return
+        if sub == "remove" and not rest:
+            self._kb_read(client_kb.document_names, self._show_kb_documents)
+            return
+        try:
+            action = client_kb.KbAction.add(rest) if sub == "add" else client_kb.KbAction.remove(rest)
+        except client_kb.KbUsageError as exc:
+            self._append(NoticeLine(str(exc)))
+            return
+        self._kb_start(action)
+
+    def _kb_read(self, reader: Callable[[Any], Any], done: Callable[[Any, str], None]) -> None:
+        """在背景執行緒讀知識庫(會碰檔案系統),結果搬回 UI 執行緒;UI 執行緒零 FS。"""
+        root = self.engine.options.root
+
+        def _body() -> None:
+            try:
+                result, error = reader(root), ""
+            except Exception as exc:  # noqa: BLE001 - 讀不到照實顯示,不當成「沒有待辦」
+                result, error = None, f"{type(exc).__name__}: {exc}"
+            self._from_worker(done, result, error)
+
+        threading.Thread(target=_body, name="codetrail-kb-read", daemon=True).start()
+
+    def _show_kb_overview(self, result: Any, error: str) -> None:
+        if error or result is None:
+            self._append(ErrorLine(f"/kb：讀不到知識庫：{error or '沒有結果'}"))
+            return
+        self._append(NoticeLine(result.render()))
+
+    def _show_kb_documents(self, names: Any, error: str) -> None:
+        if error:
+            self._append(ErrorLine(f"/kb remove：讀不到知識庫：{error}"))
+            return
+        listed = "、".join(names or ()) or "（知識庫是空的）"
+        self._append(NoticeLine(f"可移除的文件：{listed}\n用法：/kb remove <文件>（移除前會跳出核准框）。"))
+
+    def _kb_start(self, action: client_kb.KbAction, *, screen: KbReviewScreen | None = None) -> bool:
+        """把一個寫入動作交給協調器(佔回合鎖、取消導向它);回傳有沒有真的開始。"""
+        try:
+            job = client_kb.KbJob(self.engine, action, approve=self.coordinator.request_approval)
+            kb_id = self.coordinator.start_kb(job)
+        except (client_turns.TurnCoordinator.Busy, client_turns.QueueError) as exc:
+            message = str(exc) if isinstance(exc, client_turns.QueueError) else "回合進行中"
+            note = f"知識庫動作沒有開始：{message}"
+            if screen is not None and screen.is_attached:
+                screen.set_status(note)
+            else:
+                self._append(NoticeLine(note))
+            return False
+        except Exception as exc:  # noqa: BLE001 - 動作開不起來不得帶走 UI
+            self._append(ErrorLine(f"知識庫動作沒有開始：{type(exc).__name__}: {exc}"))
+            return False
+        self._kb_jobs[kb_id] = screen
+        self._reset_phase()
+        self._kb_phase = f"{client_kb.action_verb(action.kind)} {action.label}"
+        self._turn_started = time.monotonic()
+        if screen is not None and screen.is_attached:
+            screen.set_status(f"{self._kb_phase}：進行中（Ctrl-C 中斷）…")
+        self._refresh_status()
+        return True
+
+    def _on_kb_event(self, event: Mapping[str, Any]) -> None:
+        kb_id = str(event.get("kbID", ""))
+        screen = self._kb_jobs.get(kb_id)
+        if event.get("type") == "kb_progress":
+            message = str(event.get("message", ""))
+            if kb_id in self._kb_jobs and message:
+                self._kb_phase = message
+                if screen is not None and screen.is_attached:
+                    screen.set_status(f"{message}（Ctrl-C 中斷）")
+            return
+        if not client_events.is_terminal_event(event):
+            return
+        self._kb_jobs.pop(kb_id, None)
+        outcome = client_kb.KbOutcome.from_dict(event.get("kb_outcome"))
+        self._kb_phase = ""
+        self._turn_started = None
+        self._reset_phase()
+        self._append(KbResultBlock(outcome))
+        if screen is not None and screen.is_attached:
+            screen.reload(note=outcome.title)
+
+    def _kb_review_closed(self, _result: Any = None) -> None:
+        self._kb_screen = None
+        self._refresh_status()
+        self.query_one("#prompt", PromptInput).focus()
+
+    def _kb_load_items(self, screen: KbReviewScreen, note: str = "") -> None:
+        def done(items: Any, error: str) -> None:
+            if screen.is_attached:
+                screen.show_items(items or (), error, note)
+
+        self._kb_read(client_kb.review_items, done)
+
+    def _kb_load_detail(self, item_screen: KbItemScreen) -> None:
+        item = item_screen.item
+        reader = client_kb.ocr_detail if item.category == "ocr" else client_kb.figure_detail
+
+        def done(detail: Any, error: str) -> None:
+            if item_screen.is_attached:
+                item_screen.show_detail(detail, error)
+
+        self._kb_read(lambda root: reader(root, item), done)
+
+    def _kb_open_item(self, review_screen: KbReviewScreen, item: client_kb.ReviewItem) -> None:
+        if self.coordinator.kb_busy:
+            review_screen.set_status("知識庫動作進行中；請等它結束再選下一項。")
+            return
+        item_screen = KbItemScreen(item)
+        self.push_screen(
+            item_screen, lambda choice: self._kb_item_chosen(review_screen, item_screen, choice),
+        )
+
+    def _kb_item_chosen(self, review_screen: KbReviewScreen, item_screen: KbItemScreen,
+                        choice: str | None) -> None:
+        """明細回來的選擇 → 對應的寫入動作。內容一律取自畫面上顯示的那份明細。"""
+        detail = item_screen.detail
+        if choice is None or detail is None:
+            return
+        try:
+            if choice == "retry" and isinstance(detail, client_kb.FigureDetail):
+                self._kb_start(client_kb.KbAction.retry(detail), screen=review_screen)
+            elif choice == "confirm":
+                action = (client_kb.KbAction.ocr_confirm(detail) if isinstance(detail, client_kb.OcrDetail)
+                          else client_kb.KbAction.figure_fix(detail, detail.payload_json))
+                self._kb_start(action, screen=review_screen)
+            elif choice == "edit":
+                self._kb_edit(review_screen, detail)
+        except client_kb.KbUsageError as exc:
+            review_screen.set_status(str(exc))
+
+    def _kb_edit(self, review_screen: KbReviewScreen, detail: Any) -> None:
+        if isinstance(detail, client_kb.OcrDetail):
+            screen = KbEditScreen(
+                f"修改 OCR 正文：{detail.item.source} 第 {detail.item.page} 頁",
+                "對照原 PDF 改成正確的逐字正文；送出只更新正文，之後再按「確認」才算人工確認。",
+                detail.text, client_kb.validate_text_edit,
+            )
+
+            def submitted(text: str | None) -> None:
+                if text is not None:
+                    self._kb_start(client_kb.KbAction.ocr_correct(detail, text), screen=review_screen)
+        else:
+            kind = detail.item.kind
+            screen = KbEditScreen(
+                f"修改內容：{detail.item.source} 第 {detail.item.page} 頁",
+                f"把 {client_kb.UNREADABLE_GLYPH} 或錯字改成原圖上的字；不要改 id、欄位名與 kind。"
+                "送出代表你已對照原圖確認，會再跳出核准框。",
+                detail.payload_json, lambda text: client_kb.validate_payload_edit(text, kind),
+            )
+
+            def submitted(text: str | None) -> None:
+                if text is not None:
+                    self._kb_start(client_kb.KbAction.figure_fix(detail, text), screen=review_screen)
+
+        self.push_screen(screen, submitted)
+
+    def _close_kb_screen(self, *, copy_first: bool) -> bool:
+        """閒置時 Ctrl-C／Ctrl-D 收起最上層的知識庫畫面(不算中斷、也不算離開)。
+
+        編輯畫面的 Ctrl-C 先複製選取,沒有選取只提示——不得因為習慣性的 Ctrl-C 丟掉修改。
+        """
+        screen = self.screen
+        if not isinstance(screen, (KbReviewScreen, KbItemScreen, KbEditScreen)):
+            return False
+        if isinstance(screen, KbEditScreen) and copy_first:
+            if not self._copy_selection():
+                screen.show_error("Esc 取消修改；Ctrl+S 送出。")
+            return True
+        try:
+            screen.dismiss(None)
+        except Exception:  # noqa: BLE001 - 畫面已經不在了
+            pass
+        return True
+
     def _cmd_status(self, _argument: str) -> None:
         path = self.engine.store.path(self.engine.session_id) if self.engine.session_id else None
         lines = [
@@ -2357,6 +2884,7 @@ class CodeTrailApp(App[int]):
             f"待送訊息={len(self.coordinator.queue_snapshot(pending_only=True))}"
             f"({'暫停, /queue resume' if self.coordinator.queue_paused else '依序等待'})",
             f"外部匯入={self._external_import_status()}",
+            f"審核模型={self._auditor_status()}",
         ]
         if self.engine.store_error:
             lines.append(
@@ -2403,6 +2931,14 @@ class CodeTrailApp(App[int]):
                 self._review_screen.request_close()
             elif self.coordinator.cancel(block=False, review_id=self._review_screen.review_id):
                 self._review_screen.query_one("#review-progress", Static).update(Text("正在中斷審查…"))
+            return
+        if self.coordinator.kb_busy:
+            # 知識庫動作(含等核准中):中斷那個動作;覆核畫面留著顯示結果。
+            if self.coordinator.cancel(block=False):
+                self._cancelling = True
+                self._refresh_status()
+            return
+        if self._close_kb_screen(copy_first=True):
             return
         picker = self.screen
         if self._close_picker():
@@ -2454,6 +2990,8 @@ class CodeTrailApp(App[int]):
             return
         if self._close_picker():
             return
+        if not self.coordinator.kb_busy and self._close_kb_screen(copy_first=False):
+            return
         if self._busy_notice("Ctrl-D"):
             return
         self._leave()
@@ -2493,6 +3031,13 @@ class CodeTrailApp(App[int]):
         if self.coordinator.busy:
             self._turn_started = time.monotonic()
             self._reset_phase(compacting=True)
+
+    def _auditor_status(self) -> str:
+        auditor = self.auditor
+        if auditor is None:
+            return "未啟用(這個入口不審核)"
+        return (f"{auditor.model} · {auditor.base_url} · n_ctx={auditor.n_ctx}"
+                "(只審核用到知識庫的回答)")
 
     def _note_prime(self, reason: str, outcome: Any) -> None:
         self._last_prime = (time.time(), reason, outcome)
@@ -2608,6 +3153,8 @@ class CodeTrailApp(App[int]):
         """
         if self._cancelling:
             return "中斷中"
+        if self._kb_phase:
+            return self._kb_phase
         if self._activity is not None:
             operation = self._activity["operation"]
             phase = self._activity["phase"]
@@ -2622,6 +3169,11 @@ class CodeTrailApp(App[int]):
                 "validating": "驗證摘要中",
                 "persisting": "儲存摘要中",
             }
+            if operation == client_audit.OPERATION:
+                # 審核模型(小模型)在主回答之後的那一段;prefill 細節沿用同一套取樣。
+                if phase == "prompt_processing":
+                    return f"審核 · {self._prompt_phase()}"
+                return "審核中（小模型）"
             label = self._prompt_phase() if phase == "prompt_processing" else labels[phase]
             if "tool" in self._activity:
                 label += f" {self._activity['tool']}"

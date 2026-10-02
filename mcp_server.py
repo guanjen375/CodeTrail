@@ -245,11 +245,6 @@ from media import set_sandbox_root, ocr_image, read_elf, read_binary, read_pdf, 
 from external_import import import_external_file as _import_external_file
 from http_client import close_session
 from runtime_policy import EXTRA_BUILD_COMMANDS, resolve_runtime_policy
-from utils import (
-    answer_with_self_check,
-    needs_grounding,
-    should_refuse_answer,
-)
 from scripts.required_model_servers_check import (
     render_report as _render_required_model_report,
     run_checks as _run_required_model_checks,
@@ -544,7 +539,7 @@ _RESULT_SAFETY_MAX_CHARS = {
 _DEFAULT_RESULT_SAFETY_MAX_CHARS = 200_000
 _READ_ONLY_TOOLS = frozenset({
     "list_dir", "read_file", "grep_code", "code_rag_search", "file_info",
-    "query_knowledge", "query_knowledge_strict", "query_table", "git_status", "git_diff",
+    "query_knowledge", "query_table", "git_status", "git_diff",
     "analyze_file",
 })
 
@@ -818,54 +813,6 @@ def _register_public_tools() -> None:
         _real_mcp_tool(*args, **kwargs)(mcp_lease.record_tool_calls(name, wrapper))
 
 
-def _figure_review_hint(excluded) -> str:
-    """把 strict gate 排除掉的圖整理成一句給人/模型看的提示。
-
-    workflow §4 Step 4 要求「回應要指出可用的 page/figure 與待覆核原因」。
-    只放在獨立欄位,**不覆寫既有穩定的 `reason` 值**(那是下游在比對的常數)。
-
-    分兩種來源,因為可做的事完全不同:
-      - **structured figure**(有 `figure_id`)→ `review_figures` 列得到、可以 fix。
-      - **舊 KB legacy VL chunk**(沒有 `figure_id`)→ 本輪**不會**出現在
-        `review_figures` 裡,也沒有 canonical payload 可以 fix。把使用者導向那條
-        流程只會讓他找不到圖。這種只能回去看原始 PDF 頁,或改用有原生文字的來源。
-    """
-    if not excluded:
-        return ""
-    structured, legacy = [], []
-    for item in excluded:
-        if not isinstance(item, dict):
-            continue
-        where = f"{item.get('source', '?')} p.{item.get('page', '?')}"
-        index = item.get("figure_index")
-        if index is not None:
-            where += f" 第 {index} 張"
-        reasons = "、".join(str(r) for r in (item.get("reasons") or [])) or "未提供原因"
-        line = (f"{where}({item.get('figure_kind', '?')},"
-                f"{item.get('verification_status', '?')};{reasons})")
-        (structured if item.get("figure_id") else legacy).append(line)
-
-    parts = ["有圖片/表格內容未通過驗證、**待覆核**,因此未納入 REF。"
-             "這是 verified-or-abstain 的刻意行為,不是查不到。"]
-    if structured:
-        shown = structured[:5]
-        more = f" 等共 {len(structured)} 張" if len(structured) > len(shown) else ""
-        parts.append(
-            "可覆核(結構化抽取):" + "；".join(shown) + more + "。"
-            "用 review_figures(action=\"list\") 看原因與原圖,"
-            "確認後用 review_figures(action=\"fix\", ..., confirm_against_image=True) 覆核。"
-        )
-    if legacy:
-        shown = legacy[:5]
-        more = f" 等共 {len(legacy)} 張" if len(legacy) > len(shown) else ""
-        parts.append(
-            "不可覆核(舊 KB legacy 視覺辨識):" + "；".join(shown) + more + "。"
-            "這些**不會**出現在 review_figures 裡,本輪沒有升級成可信狀態的路徑;"
-            "要確認數值請直接看原始 PDF 的那一頁,或改用有原生文字的來源重新入庫。"
-        )
-    return "".join(parts)
-
-
 @_tool()
 def query_knowledge(
     question: Annotated[str, Field(description="Natural-language question in English or Chinese.")],
@@ -887,14 +834,17 @@ def query_knowledge(
             "display": str,       # 給人看的摘要(REF 來源列表)
             "refs": list[dict],   # [{source, page/section, score, 以及 structured figure
                                   #   的 figure_id/figure_kind/verification_status/
-                                  #   reasons/row_range/line_range/truncated}, ...]
+                                  #   reasons/row_range/line_range/truncated,
+                                  #   content_sha256/content_chars}, ...]
             "top_score": float,
             "has_ref": bool,
-            "excluded_figures": list[dict],  # 被 gate 排除的圖(這條路徑通常是空的;
-                                  #   非 strict 模式會回未驗證內容,只是帶上狀態)
-            "excluded_text": list[dict],  # 未獨立驗證 OCR 的來源、頁码與原因
-            "review_hint": str,   # excluded_figures 非空時的人可讀提示(否則 "")
         }
+
+    未通過驗證的圖面／OCR 內容照樣回傳,但 REF 文字與 refs metadata 都帶狀態
+    (verification_status / text_verification_status / reasons),不是只靠 prompt 提醒模型。
+    refs 的 content_sha256 / content_chars 是 `text` 裡該 REF `content:` 之後實際印出的
+    那段字串的身分:客戶端的回答審核用它把模型看過的內容區對回這筆 metadata
+    (偽造的 `[REFn]` 段落對不上雜湊),這兩鍵不進模型可見文字。
     """
     KB.last_trace = None  # 重載失敗時不得拿上一題的 trace 充數
     try:
@@ -909,9 +859,6 @@ def query_knowledge(
             "refs": [],
             "top_score": 0.0,
             "has_ref": False,
-            "excluded_figures": [],
-            "excluded_text": [],
-            "review_hint": "",
             "error": "knowledge base not loaded",
         }
     try:
@@ -930,197 +877,13 @@ def query_knowledge(
         top_score=top_score,
         trace=meta.get("trace"),
     )
-    excluded = meta.get("excluded_figures", [])
     return {
         "text": text,
         "display": display,
         "refs": refs,
         "top_score": top_score,
         "has_ref": meta.get("has_ref", False),
-        "excluded_figures": excluded,
-        "excluded_text": meta.get("excluded_text", []),
-        "review_hint": _figure_review_hint(excluded),
     }
-
-
-@_tool()
-def query_knowledge_strict(
-    question: Annotated[str, Field(description="High-risk factual or numeric question requiring grounded refusal.")],
-    source: Annotated[Optional[str], Field(description="Optional indexed document basename to restrict retrieval.")] = None,
-) -> dict:
-    """Strict-mode KB query: server-side LLM with refuse + 2-stage self-check.
-
-    這是 server-side 嚴格模式(answer_with_self_check) —
-    把強制 `should_refuse_answer` + 兩階段自我檢查打包成一個工具。
-    選用本工具就是顯式要求 strict，不受自動題型/語言分類降級。
-    用於規格/數值/限制類問題,要求模型只用 KB 內容回答,並逐句檢查 [REF] 根據。
-
-    跟一般 `query_knowledge` 的差別:
-      - `query_knowledge` 只回傳 KB 上下文,要呼叫端的模型自己組答案;
-      - `query_knowledge_strict` 在 server-side 直接呼叫主 llama-server
-        (用 `config.MODEL` 這顆主模型,不是呼叫端選的那顆),套用嚴格模式 prompt
-        並做自我檢查,然後回傳定稿答案。
-
-    什麼時候用:
-      - 問規格、上限、預設值、錯誤碼這類「答錯比不答更糟」的問題。
-      - 一般概念解釋、操作指引、找 code 位置 → 用 `query_knowledge` 就好。
-
-    Returns:
-        {
-          "answer": str,           # 嚴格模式定稿;refused 時為 None
-          "refused": bool,         # True 時代表 KB 證據太弱已拒答
-          "strict": bool,          # True 時代表跑了兩階段自我檢查
-          "reason": str,           # grounding 偵測理由 / refuse 理由(穩定值,不含圖片訊息)
-          "refs": list[dict],      # 用到的 REF 摘要
-          "top_score": float,      # KB top hybrid score
-          "top_emb_score": float,  # KB top embedding score(refuse 判斷用)
-          "excluded_figures": list[dict],  # 被 strict gate 排除的圖片/表格:
-                                   #   [{source, page, figure_id, figure_index,
-                                   #     figure_kind, verification_status, reasons}, ...]
-                                   #   **四條回傳路徑都有這個 key**(沒有就是空 list)
-          "review_hint": str,      # excluded_figures 非空時的人可讀提示,指向 review_figures
-          "excluded_text": list[dict],  # 所有回傳路徑保留未驗證 OCR 的來源/頁碼/原因
-        }
-
-    圖片內容的硬閘:未通過驗證(needs_review / unverified / legacy_unverified)的
-    structured 或 VL chunk 在 code 層就被排除,不會進 REF、也不影響門檻計算,所以
-    strict 模式**不會用未驗證的圖片數值回答**。被排除的那些會出現在
-    `excluded_figures`,連同待覆核原因 —— 全部候選都被排除時,拒答理由旁邊仍看得到
-    「哪一頁、哪一張圖可用但待覆核」,才不會變成「查不到」的假象。
-
-    注意:
-      - 這個 tool 會占用主 llama-server 的算力;呼叫端看不到中間
-        streaming(會被導向 stderr,只有最終定稿經 MCP 回來)。
-      - llama-server 不可用時 answer 會以 "[ERROR] ..." 開頭。
-    """
-    KB.last_trace = None  # 重載失敗時不得拿上一題的 trace 充數
-    try:
-        _ensure_kb_fresh()
-    except Exception as exc:
-        _record_kb_failure(mode="mcp_query_knowledge_strict", question=question, exc=exc,
-                           trace=None)
-        raise
-    if not KB.loaded:
-        result = {
-            "answer": None,
-            "refused": True,
-            "strict": False,
-            "reason": "knowledge_base_not_loaded",
-            "refs": [],
-            "top_score": 0.0,
-            "top_emb_score": 0.0,
-            "excluded_figures": [],
-            "excluded_text": [],
-            "review_hint": "",
-        }
-        _record_kb_interaction(
-            mode="mcp_query_knowledge_strict",
-            question=question,
-            answer="[KB_NOT_LOADED]",
-            refs=[],
-            top_score=0.0,
-            extra_meta={"refused": True, "strict": False, "reason": result["reason"]},
-        )
-        return result
-
-    try:
-        knowledge_ctx, _display, meta = KB.query(
-            question, is_strict_mode=True, source=source
-        )
-    except Exception as exc:
-        _record_kb_failure(mode="mcp_query_knowledge_strict", question=question, exc=exc,
-                           trace=getattr(KB, "last_trace", None))
-        raise
-    refs = meta.get("refs", [])
-    top_score = meta.get("top_score", 0.0)
-    top_emb_score = meta.get("top_emb_score", 0.0)
-    # strict gate 排除掉的圖:**四條回傳路徑都要帶**。少任何一條,「全部候選都被
-    # gate 排除」時使用者只會看到拒答,看不到「有圖可用但待覆核」(契約 §13.3)。
-    excluded_figures = meta.get("excluded_figures", [])
-    excluded_text = meta.get("excluded_text", [])
-    review_hint = _figure_review_hint(excluded_figures)
-
-    if should_refuse_answer(question, meta, require_grounding=True):
-        result = {
-            "answer": None,
-            "refused": True,
-            "strict": True,
-            "reason": "weak_ref_for_spec_question",
-            "refs": refs,
-            "top_score": top_score,
-            "top_emb_score": top_emb_score,
-            "excluded_figures": excluded_figures,
-            "excluded_text": excluded_text,
-            "review_hint": review_hint,
-        }
-        _record_kb_interaction(
-            mode="mcp_query_knowledge_strict",
-            question=question,
-            answer="[REFUSED:weak_ref]",
-            refs=refs,
-            top_score=top_score,
-            extra_meta={"refused": True, "strict": True, "top_emb_score": top_emb_score},
-            trace=meta.get("trace"),
-        )
-        return result
-
-    if not knowledge_ctx:
-        result = {
-            "answer": None,
-            "refused": True,
-            "strict": True,
-            "reason": "no_kb_ctx",
-            "refs": refs,
-            "top_score": top_score,
-            "top_emb_score": top_emb_score,
-            "excluded_figures": excluded_figures,
-            "excluded_text": excluded_text,
-            "review_hint": review_hint,
-        }
-        _record_kb_interaction(
-            mode="mcp_query_knowledge_strict",
-            question=question,
-            answer=f"[REFUSED:{result['reason']}]",
-            refs=refs,
-            top_score=top_score,
-            extra_meta={"refused": True, "strict": True, "top_emb_score": top_emb_score},
-            trace=meta.get("trace"),
-        )
-        return result
-
-    # Automatic detection only supplies a diagnostic reason. Explicit strict
-    # intent already selected the retrieval and refusal gates above.
-    grounding_needed, grounding_reason = needs_grounding(question)
-    reason = grounding_reason if grounding_needed else "explicit_strict"
-    base_ctx = f"專案路徑: {AICODE_ROOT}"
-    _log(f"[MCP] query_knowledge_strict: strict mode on (reason={reason})")
-    # answer_with_self_check 會 stream 到 stdout — MCP stdio 不能讓它污染協定
-    # 通道。把 stdout 暫時導到 stderr(會跟 _log 一起顯示在 server 日誌)。
-    with contextlib.redirect_stdout(sys.stderr):
-        answer = answer_with_self_check(question, base_ctx, knowledge_ctx, binary_ctx="")
-
-    result = {
-        "answer": answer,
-        "refused": False,
-        "strict": True,
-        "reason": reason or "strict_mode",
-        "refs": refs,
-        "top_score": top_score,
-        "top_emb_score": top_emb_score,
-        "excluded_figures": excluded_figures,
-        "excluded_text": excluded_text,
-        "review_hint": review_hint,
-    }
-    _record_kb_interaction(
-        mode="mcp_query_knowledge_strict",
-        question=question,
-        answer=answer or "[EMPTY]",
-        refs=refs,
-        top_score=top_score,
-        extra_meta={"refused": False, "strict": True, "top_emb_score": top_emb_score},
-        trace=meta.get("trace"),
-    )
-    return result
 
 
 @_tool()
@@ -2118,6 +1881,9 @@ def _clean_subprocess_output(text: str) -> str:
 # 改走 CLI(workflow.md §1 點名的真實 bug)。
 _INGEST_TIMEOUT_SECONDS = 600      # 與 config.MCP_CALL_TIMEOUT_SECONDS(660 秒)對齊
 _PREFLIGHT_TIMEOUT_SECONDS = 180   # preflight 零 VL / 零 embedding / 零寫入,不該吃滿 10 分鐘
+# ingest_document 走文件路徑(document mode)的副檔名。圖片 / binary / ELF 三組來自 media。
+# 提成模組常數:TUI 的 `/kb add` 在呼叫前先做同一個副檔名檢查,smoke 契約釘住兩邊一致。
+INGEST_TEXT_EXTENSIONS = frozenset({".pdf", ".md", ".txt"})
 _TERMINATE_GRACE_SECONDS = 5.0
 _READER_JOIN_SECONDS = 10.0
 _HEARTBEAT_EVERY_LINES = 50
@@ -2409,7 +2175,7 @@ def ingest_document(
     呼叫 AICODE_ROOT/RAG.py 把指定檔案切 chunk + 算 embedding,再以通過身分
     驗證的文件 basename 為單位更新或加入 AICODE_ROOT/knowledge.json。查詢端會自動
     偵測檔案變更:下一次
-    query_knowledge / query_knowledge_strict 會先重載 KB 再查,不依賴人工
+    query_knowledge 會先重載 KB 再查,不依賴人工
     記得 reload。想「立即」載入並確認 chunk 數,可呼叫 reload_knowledge_base()。
 
     **KB 只有 knowledge.json 一個檔要管**:向量是程式自管的 cache(藏在
@@ -2422,8 +2188,8 @@ def ingest_document(
     hash 必須是產物生成時的 PDF SHA-256；不呼叫 MinerU 或外部 OCR。文字只認
     text_level 標題、頁碼採 page_idx+1，圖表仍走既有 structured verification。
     產物不可信或表格沒有唯一 structured owner 時失敗，不改走 native 文字。
-    OCR 文字預設未驗證，normal REF 會標示，strict 排除並列在 excluded_text；
-    review_text 對照來源確認目前版本且通過品質／來源檢查後，才可進 strict。
+    OCR 文字預設未驗證，REF 文字與 refs metadata 都會標示未確認；
+    review_text 對照來源確認目前版本且通過品質／來源檢查後，才標為已確認。
 
     ── PDF 的圖:兩條 lane(範圍不同,不要混為一談)──────────────────
 
@@ -2449,10 +2215,8 @@ def ingest_document(
       unverified        結構合法、未發現衝突,但沒有獨立證據
       legacy_unverified 舊 KB 缺欄位的 figure chunk(含所有既有 VL diagram chunk)
     前三種算可信;後三種合稱 flagged(那是查詢 filter,不是第七種狀態)。
-    **query_knowledge_strict 在 code 層排除 flagged 的圖片內容**,不會用未驗證的
-    圖片數值回答 register / bit range / 規格數字;它會改成指出哪一頁、哪一張圖
-    可用但待覆核。query_knowledge 會回,但 REF 與 metadata 都帶 status/reasons。
-    要覆核或修正 → `review_figures(action="list" | "fix")`。
+    query_knowledge 會回 flagged 的內容,但 REF 與 metadata 都帶 status/reasons,
+    不得當成已驗證的數值。要覆核或修正 → `review_figures(action="list" | "fix")`。
 
     **preflight**(`preflight_only=True`,只支援 .pdf):在任何 VL 呼叫、embedding
     與 KB 寫入**之前**算出候選數 / tile 數 / VL 呼叫次數 / image token 估計與是否
@@ -2469,7 +2233,7 @@ def ingest_document(
     動 KB 之前先做 capability probe,不通過就 fail-loud 指出缺哪一項能力。
 
     **舊 KB**:先前入庫的圖片 chunk 缺欄位,載入時會在記憶體內標
-    `legacy_unverified`(不回寫檔案),strict 查詢不再用它回答數值。要恢復可信度
+    `legacy_unverified`(不回寫檔案),查詢時一律標成待覆核。要恢復可信度
     就 remove_document 後重新 ingest 那份 PDF。
 
     **文件身分是檔名(basename)**:KB 用 `spec.pdf` 這種檔名當文件識別,所以
@@ -2581,7 +2345,7 @@ def ingest_document(
     if not doc_path.is_file():
         return f"錯誤: 檔案不存在 {shown_path}"
 
-    TEXT_EXTENSIONS = {".pdf", ".md", ".txt"}
+    TEXT_EXTENSIONS = INGEST_TEXT_EXTENSIONS
     ext = doc_path.suffix.lower()
     shown_ext = ingest_notify.strip_markers(ext)
     all_supported = TEXT_EXTENSIONS | IMAGE_EXTENSIONS | BINARY_EXTENSIONS | ELF_EXTENSIONS
@@ -3169,11 +2933,8 @@ def review_figures(
     前三種算可信;後三種合稱 **flagged** —— 那是查詢 filter,不是第七種狀態。
     多個 chunk 聚合時一律取**最差**的成員狀態。
 
-    **strict query 的硬閘**:`query_knowledge_strict` 在 code 層排除 flagged 的圖片
-    內容,不會用未驗證的圖片數值回答 register / bit range / 規格數字;它會改成指出
-    哪些 page/figure 可用但待覆核(回傳的 `excluded_figures`)。`query_knowledge`
-    可以回未驗證內容,但 REF 與 machine-readable metadata 都帶 status / reasons /
-    row 或 line range,不是只靠 prompt 提醒模型。
+    `query_knowledge` 可以回未驗證內容,但 REF 與 machine-readable metadata 都帶
+    status / reasons / row 或 line range,不是只靠 prompt 提醒模型。
 
     action="list"(唯讀):
       回每張圖的 document_id、figure_id、revision、page/bbox、kind、
@@ -3431,7 +3192,7 @@ def review_figures(
 def reload_knowledge_base() -> str:
     """Reload the in-memory KnowledgeBase from AICODE_ROOT/knowledge.json.
 
-    KB 是 module-level singleton。query_knowledge / query_knowledge_strict
+    KB 是 module-level singleton。query_knowledge
     每次查詢前會自動偵測 knowledge.json 變更並重載,平常不必手動呼叫;
     這個工具用於「立即」載入並回報 chunk 數(例如 ingest 後想馬上確認狀態),
     或在自動偵測疑似失效時強制重載。

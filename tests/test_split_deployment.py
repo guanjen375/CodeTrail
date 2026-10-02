@@ -36,7 +36,8 @@ def _authorize(monkeypatch):
     monkeypatch.setattr(config, "DEPLOYMENT_MODE", "client")
     monkeypatch.setattr(config, "MODEL_ENDPOINTS", {r: v["base_url"] for r, v in services.items()})
     for role, attr in (("main", "LLAMA_BASE_URL"), ("embedding", "LLAMA_EMBED_BASE_URL"),
-                       ("reranker", "LLAMA_RERANK_BASE_URL"), ("vl", "LLAMA_VL_BASE_URL")):
+                       ("reranker", "LLAMA_RERANK_BASE_URL"), ("vl", "LLAMA_VL_BASE_URL"),
+                       ("auditor", "LLAMA_AUDITOR_BASE_URL")):
         monkeypatch.setattr(config, attr, services[role]["base_url"])
 
 
@@ -130,7 +131,8 @@ def test_client_setup_requires_no_local_inference_artifacts(tmp_path, monkeypatc
     for name in ("detect_gpus", "scan_models", "_check_tmux", "check_llama_binary", "_detect_python"):
         monkeypatch.setattr(set_config, name, forbidden)
     args = ["--mode", "client", "--yes"]
-    for role, flag in (("main", "main"), ("embedding", "embed"), ("reranker", "rerank"), ("vl", "vl")):
+    for role, flag in (("main", "main"), ("embedding", "embed"), ("reranker", "rerank"), ("vl", "vl"),
+                       ("auditor", "auditor")):
         args += [f"--{flag}-url", _services()[role]["base_url"], f"--{flag}-model", f"ct-{role}-v1"]
     assert set_config.run(set_config._parser().parse_args(args)) == 0
     profile = deployment.load_effective_profile({"HOME": str(home)})

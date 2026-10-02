@@ -53,6 +53,12 @@ _TMP_HOME = Path(tempfile.mkdtemp(prefix="codetrail-tests-home-"))
                 "embedding": {"port": 65534, "base_url": "http://127.0.0.1:65534"},
                 "reranker": {"port": 65533, "base_url": "http://127.0.0.1:65533"},
                 "vl": {"port": 65532, "base_url": "http://127.0.0.1:65532"},
+                # 審核模型同樣指向必定沒人聽的 port(內建預設 8084 可能真的有人在跑)。
+                "auditor": {
+                    "model": "example-auditor-model",
+                    "port": 65531,
+                    "base_url": "http://127.0.0.1:65531",
+                },
             },
         }
     ),

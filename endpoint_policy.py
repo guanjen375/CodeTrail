@@ -27,13 +27,19 @@ import os
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
-MODEL_ROLES = ("main", "embedding", "reranker", "vl")
+MODEL_ROLES = ("main", "embedding", "reranker", "vl", "auditor")
+#: 加入審核模型之前的四角色。舊 B 端 client.json 的 grants 只有這四個:載入合法
+#: (否則連重新匯入 manifest 都做不到),但**不授權**任何 auditor 端點。
+LEGACY_MODEL_ROLES = ("main", "embedding", "reranker", "vl")
 _ROLE_PATHS = {
     "main": {"", "/", "/health", "/props", "/slots", "/v1/models", "/completion",
              "/v1/chat/completions", "/v1/chat/completions/input_tokens", "/tokenize", "/detokenize"},
     "embedding": {"", "/", "/health", "/props", "/v1/models", "/embedding", "/v1/embeddings"},
     "reranker": {"", "/", "/health", "/props", "/v1/models", "/reranking"},
     "vl": {"", "/", "/health", "/props", "/v1/models", "/v1/chat/completions"},
+    # 審核模型:客戶端只用 chat 與精確 token 計數(gate 前必須先數)。
+    "auditor": {"", "/", "/health", "/props", "/v1/models", "/v1/chat/completions",
+                "/v1/chat/completions/input_tokens", "/tokenize", "/detokenize"},
 }
 for _paths in _ROLE_PATHS.values():
     _paths.add("/slots")
@@ -127,11 +133,23 @@ def canonical_direct_base_url(url: str) -> str:
 
 
 def validate_model_endpoints(value) -> dict[str, str]:
-    if not isinstance(value, dict) or (value and set(value) != set(MODEL_ROLES)):
-        raise EndpointPolicyError("model_endpoints must be empty or name all four model roles")
+    """`{}`、剛好五角色、或剛好舊四角色(沒有 auditor)。
+
+    舊四角色是升級相容:載入合法,但 auditor 沒有 grant,任何審核模型端點都不會被
+    授權(fail-closed);重新匯入 A 的五角色 manifest 後才完整。
+    """
+    if not isinstance(value, dict) or (
+        value and set(value) != set(MODEL_ROLES) and set(value) != set(LEGACY_MODEL_ROLES)
+    ):
+        missing = sorted(set(MODEL_ROLES) - set(value)) if isinstance(value, dict) else []
+        raise EndpointPolicyError(
+            "model_endpoints must be empty or name all five model roles"
+            + (f" (missing: {', '.join(missing)})" if missing else "")
+            + ";請在 B 以 ./scripts/configure-advanced.sh 重新匯入 A 的 endpoint manifest"
+        )
     result = {role: canonical_direct_base_url(url) for role, url in value.items()}
     if len(set(result.values())) != len(result):
-        raise EndpointPolicyError("the four model roles require distinct model endpoints")
+        raise EndpointPolicyError("the model roles require distinct model endpoints")
     return result
 
 
@@ -140,15 +158,18 @@ def _ensure_split(url: str, role: str) -> None:
 
     grants = validate_model_endpoints(getattr(config, "MODEL_ENDPOINTS", {}))
     if not grants:
-        raise EndpointPolicyError("client deployment requires owner-only client.json model_endpoints for all four roles")
+        raise EndpointPolicyError("client deployment requires owner-only client.json model_endpoints for all model roles")
     parts, _ = _url_parts(url)
     origin = canonical_direct_base_url(urlunsplit((parts.scheme, parts.netloc, "", "", "")))
     configured = {"main": config.LLAMA_BASE_URL, "embedding": config.LLAMA_EMBED_BASE_URL,
-                  "reranker": config.LLAMA_RERANK_BASE_URL, "vl": config.LLAMA_VL_BASE_URL}
+                  "reranker": config.LLAMA_RERANK_BASE_URL, "vl": config.LLAMA_VL_BASE_URL,
+                  # 舊 B 端沒有 auditor:設定是空字串,下面一律不比對(不 raise、不放行)。
+                  "auditor": getattr(config, "LLAMA_AUDITOR_BASE_URL", "") or ""}
     candidates = ("main",) if role == "kb_context" else ((role,) if role in MODEL_ROLES else MODEL_ROLES)
     matches = [name for name in candidates
                if grants.get(name) == origin
-               and (role in MODEL_ROLES or canonical_direct_base_url(configured[name]) == origin)
+               and (role in MODEL_ROLES
+                    or (configured[name] and canonical_direct_base_url(configured[name]) == origin))
                and parts.path in _ROLE_PATHS[name]]
     if not matches:
         raise EndpointPolicyError(f"{role} endpoint is not authorized by client.json model_endpoints")

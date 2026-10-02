@@ -111,8 +111,8 @@ def test_yes_missing_value_errors_name_the_flag(tmp_path):
 
     # 兩顆 GPU → 每個 role 都要 GPU 旗標(缺 --vl-gpu 驗證)
     no_vl_gpu = run(
-        tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2",
+        tmp_path, "--yes", "--main-model", "1", "--auditor-model", "1", "--rerank-model", "1",
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
         *NUM_FLAGS, "--models-dir", str(models),
     )
     assert no_vl_gpu.returncode == 2
@@ -129,9 +129,9 @@ def test_yes_missing_value_errors_name_the_flag(tmp_path):
 
     # reranker internal buffer 現在也是使用者題 → 缺 --rerank-ctx 一樣報錯
     no_rerank_ctx = run(
-        tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        "--ctx", "65536", "--models-dir", str(models),
+        tmp_path, "--yes", "--main-model", "1", "--auditor-model", "1", "--rerank-model", "1",
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", "--ctx", "65536", "--auditor-ctx", "32768", "--models-dir", str(models),
     )
     assert no_rerank_ctx.returncode == 2
     assert "--rerank-ctx" in no_rerank_ctx.stderr
@@ -143,7 +143,7 @@ def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
 
     # main 先按 Enter(無效)再輸入 3(超出 1-2,無效)才輸入 1;
     # main GPU 先輸入 5(不存在)再輸入 1;其餘照標準作答。
-    stdin = "\n3\n1\n5\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\n\n"
+    stdin = "\n3\n1\n5\n1\n65536\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\n\n"
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models), stdin=stdin)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【主聊天模型】 — 偵測到的候選" in proc.stdout
@@ -153,20 +153,21 @@ def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
     assert "設定摘要" in proc.stdout
     assert "(預設)" not in proc.stdout             # 不再有任何預設標記
     assert "建議配置" not in proc.stdout           # 不再有建議配置頁
-    # 一個角色問完才換下一個(五段標題依序出現;第 5 段是壓縮模式)
-    for step, title in ((1, "主聊天模型"), (2, "embedding 模型"),
-                        (3, "reranker 模型"), (4, "VL 模型"), (5, "壓縮模式")):
-        assert f"=== [{step}/5] {title} ===" in proc.stdout
+    # 一個角色問完才換下一個(六段標題依序出現:兩個聊天模型、三個附屬模型,第 6 段是壓縮模式)
+    for step, title in ((1, "主聊天模型"), (2, "審核模型（小模型）"), (3, "embedding 模型"),
+                        (4, "reranker 模型"), (5, "VL 模型"), (6, "壓縮模式")):
+        assert f"=== [{step}/6] {title} ===" in proc.stdout
     assert (
-        proc.stdout.index("=== [1/5]") < proc.stdout.index("=== [2/5]")
-        < proc.stdout.index("=== [3/5]") < proc.stdout.index("=== [4/5]")
-        < proc.stdout.index("=== [5/5]")
+        proc.stdout.index("=== [1/6]") < proc.stdout.index("=== [2/6]")
+        < proc.stdout.index("=== [3/6]") < proc.stdout.index("=== [4/6]")
+        < proc.stdout.index("=== [5/6]") < proc.stdout.index("=== [6/6]")
     )
     assert (tmp_path / "home" / "start.sh").exists()
     deployment = read_deployment(tmp_path)
     assert deployment["services"]["main"]["ctx"] == 65536
     assert "threads" not in deployment["services"]["main"]["parameters"]
     assert deployment["services"]["reranker"]["ctx"] == 8192
+    assert deployment["services"]["auditor"]["ctx"] == 32768
 
 def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
@@ -186,7 +187,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         cwd=REPO_ROOT,
         env={**build_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
         # 全部答完,摘要頁按 q → 不寫入
-        input="1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\nq\n",
+        input="1\n1\n65536\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -203,7 +204,7 @@ def test_summary_invalid_input_reprompts_instead_of_aborting(tmp_path):
     models = make_models(tmp_path)
     proc = run(
         tmp_path, "--no-preview", "--models-dir", str(models),
-        stdin="1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\nzz\nq\n",
+        stdin="1\n1\n65536\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\nzz\nq\n",
     )
     assert proc.returncode == 0, proc.stderr
     assert "無效輸入 'zz'" in proc.stdout
@@ -216,13 +217,14 @@ def test_flags_override_model_and_gpu(tmp_path):
     proc = run(
         tmp_path,
         "--yes", "--no-preview", "--models-dir", str(models),
-        "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "2", "--embed-gpu", "1", "--rerank-gpu", "2", "--vl-gpu", "2",
-        *NUM_FLAGS,
+        "--main-model", "1", "--auditor-model", "1", "--rerank-model", "1",
+        "--main-gpu", "2", "--auditor-gpu", "1", "--embed-gpu", "1", "--rerank-gpu", "2",
+        "--vl-gpu", "2", *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr
     services = read_deployment(tmp_path)["services"]
     assert services["main"]["gpu"] == "GPU-bbbb-2000"
+    assert services["auditor"]["gpu"] == "GPU-aaaa-5090"
     # aux 三顆各自記自己的卡(embed=GPU 1、rerank/vl=GPU 2)
     assert services["embedding"]["gpu"] == "GPU-aaaa-5090"
     assert services["reranker"]["gpu"] == "GPU-bbbb-2000"
@@ -424,7 +426,7 @@ def test_interactive_main_ctx_rejects_above_maximum(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n9999999\n65536\noff\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n9999999\n65536\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "無效輸入:請輸入 1024-1048576 的整數" in proc.stdout
     assert read_deployment(tmp_path)["services"]["main"]["ctx"] == 65536
@@ -441,9 +443,10 @@ def test_small_main_ctx_clamps_batch_instead_of_failing_validation(tmp_path):
     proc = run(
         tmp_path,
         "--yes", "--no-preview", "--models-dir", str(models),
-        "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        "--ctx", "1024", "--threads", "8", "--rerank-ctx", "8192",
+        "--main-model", "1", "--auditor-model", "1", "--rerank-model", "1",
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", "--ctx", "1024", "--auditor-ctx", "32768", "--threads", "8",
+        "--rerank-ctx", "8192",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout
     deployment = read_deployment(tmp_path)
@@ -631,8 +634,8 @@ def test_incomplete_shards_are_reported_with_missing_names(tmp_path):
     proc = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--rerank-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        *NUM_FLAGS,
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr
     assert "模型不完整已剔除" in proc.stdout
@@ -824,7 +827,7 @@ def test_dense_vl_skips_cpu_moe_question_with_reason(tmp_path):
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
                 stdin=STDIN_STANDARD)
     assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert proc.stdout.count("略過 CPU-MoE 提問") == 2   # main 與 VL 各一次
+    assert proc.stdout.count("略過 CPU-MoE 提問") == 3   # main、審核模型(VL 主檔)與 VL 各一次
     assert "dense 模型" in proc.stdout
     vl_params = read_deployment(tmp_path)["services"]["vl"]["parameters"]
     assert "cpu_moe" not in vl_params and "n_cpu_moe" not in vl_params
@@ -849,8 +852,8 @@ def test_only_vl_main_candidate_proceeds_with_warning(tmp_path):
     proc = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--rerank-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        *NUM_FLAGS,
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr
     assert "同時當 main" in proc.stdout
@@ -911,7 +914,7 @@ def test_interactive_prompt_accepts_typed_n_cpu_moe(tmp_path):
     # main、main GPU(選 2 = 15000 MiB free)、ctx、CPU-MoE 層數先 abc(無效)再 3、
     # embed GPU、reranker、reranker GPU、reranker ctx、VL GPU、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n2\n65536\nabc\n3\noff\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n2\n65536\nabc\n3\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "主聊天模型 CPU-MoE 留在 RAM 的層數(0-1024)" in proc.stdout
@@ -932,7 +935,7 @@ def test_interactive_n_cpu_moe_over_max_index_means_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\n42\noff\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n65536\n42\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "推薦數值:" in proc.stdout
@@ -946,7 +949,7 @@ def test_interactive_cpu_moe_zero_means_no_offload(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\n0\noff\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n65536\n0\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "0 = 不 offload" in proc.stdout
@@ -963,7 +966,7 @@ def test_build_without_n_cpu_moe_support_degrades_to_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\n3\noff\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n65536\n3\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "不支援 --n-cpu-moe" in proc.stdout
@@ -986,10 +989,10 @@ def test_model_path_flag_rescues_missing_category(tmp_path):
 
     proc = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
-        "--main-model", "1",
+        "--main-model", "1", "--auditor-model", "1",
         "--rerank-model", str(external / "my-reranker.gguf"),
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        *NUM_FLAGS,
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout
     deployment = read_deployment(tmp_path)
@@ -1014,9 +1017,9 @@ def test_flat_dir_vl_pairing_fails_loud_on_yes(tmp_path):
     models = make_flat_vl_models(tmp_path)
     proc = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
-        "--main-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        *NUM_FLAGS,
+        "--main-model", "1", "--auditor-model", "1",
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", *NUM_FLAGS,
     )
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "--vl-model" in proc.stderr
@@ -1025,10 +1028,10 @@ def test_flat_dir_vl_pairing_fails_loud_on_yes(tmp_path):
     # 明確 --vl-model 之後可過:唯一 mmproj 與明確指定的模型配對
     explicit = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
-        "--main-model", "1",
+        "--main-model", "1", "--auditor-model", "1",
         "--vl-model", str(models / "flat" / "media-large-q4.gguf"),
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        *NUM_FLAGS,
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", *NUM_FLAGS,
     )
     assert explicit.returncode == 0, explicit.stderr + explicit.stdout
     deployment = read_deployment(tmp_path)
@@ -1039,10 +1042,11 @@ def test_flat_dir_vl_pairing_asks_explicitly_in_interactive(tmp_path):
     """互動模式遇到混放目錄:VL 是多候選 → 必答題,選定後唯一 mmproj 自動配對。"""
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_flat_vl_models(tmp_path)
-    # main(3 候選選 1)、main GPU、ctx、embed GPU、reranker 唯一自動、reranker GPU、
-    # reranker ctx、VL 明確選 [2] media-large、VL GPU、摘要確認。
+    # main(3 候選選 1)、main GPU、ctx、DSpark、審核模型(3 候選選 1)、審核 GPU、審核 ctx、
+    # embed GPU、reranker 唯一自動、reranker GPU、reranker ctx、VL 明確選 [2] media-large、
+    # VL GPU、壓縮模式、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\noff\n2\n2\n8192\n2\n2\n1\n\n")
+                stdin="1\n1\n65536\noff\n1\n2\n32768\n2\n2\n8192\n2\n2\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【VL 模型】 — 偵測到的候選" in proc.stdout
     deployment = read_deployment(tmp_path)
@@ -1712,10 +1716,11 @@ def test_maintenance_dry_run_pins_gpus_and_binds_loopback(tmp_path):
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    for port in ("8080", "8081", "8082", "8083"):
+    for port in ("8080", "8081", "8082", "8083", "8084"):
         assert f"_port={port}" in proc.stdout
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-aaaa-5090") == 1
-    assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-bbbb-2000") == 3
+    # embedding、reranker、審核模型、VL 都在 GPU 2(YES_TWO_GPU)。
+    assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-bbbb-2000") == 4
     # 安全預設:只綁 127.0.0.1,不暴露 0.0.0.0
     assert "main_bind_host=127.0.0.1" in proc.stdout
     assert "0.0.0.0" not in proc.stdout
@@ -1746,7 +1751,7 @@ def test_allow_remote_binds_all_interfaces_with_warning(tmp_path):
     assert "0.0.0.0" in proc.stdout  # 警告文字
 
     deployment = read_deployment(tmp_path)
-    for role in ("main", "embedding", "reranker", "vl"):
+    for role in ("main", "embedding", "reranker", "vl", "auditor"):
         assert deployment["services"][role]["bind"] == "all-interfaces"
 
     dry = subprocess.run(
@@ -2210,9 +2215,10 @@ def test_rerun_has_no_carryover_current_answers_win(tmp_path):
     models = make_models(tmp_path)
     first = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
-        "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
-        "--ctx", "32768", "--threads", "12", "--rerank-ctx", "4096",
+        "--main-model", "1", "--auditor-model", "1", "--rerank-model", "1",
+        "--main-gpu", "1", "--auditor-gpu", "2", "--embed-gpu", "2", "--rerank-gpu", "2",
+        "--vl-gpu", "2", "--ctx", "32768", "--auditor-ctx", "16384", "--threads", "12",
+        "--rerank-ctx", "4096",
     )
     assert first.returncode == 0, first.stderr
     assert read_deployment(tmp_path)["services"]["main"]["ctx"] == 32768
@@ -2223,6 +2229,7 @@ def test_rerun_has_no_carryover_current_answers_win(tmp_path):
     assert "沿用" not in rerun.stdout
     deployment = read_deployment(tmp_path)
     assert deployment["services"]["main"]["ctx"] == 65536      # 本次旗標值,不是舊值
+    assert deployment["services"]["auditor"]["ctx"] == 32768   # 審核模型同樣不沿用舊值
     # 這次沒給 --threads → 舊值不沿用,直接不寫 -t
     assert "threads" not in deployment["services"]["main"]["parameters"]
     assert deployment["services"]["reranker"]["ctx"] == 8192
@@ -2289,7 +2296,7 @@ def test_client_to_local_resets_remote_endpoints_and_revokes_grants(tmp_path):
         "services": {
             role: {"model": f"ct-{role}-v1", "identity_alias": f"ct-{role}-v1",
                    "base_url": f"http://10.20.30.40:{8080 + index}"}
-            for index, role in enumerate(("main", "embedding", "reranker", "vl"))
+            for index, role in enumerate(("main", "embedding", "reranker", "vl", "auditor"))
         },
     }))
     prepared = run(tmp_path, "--mode", "client", "--yes", "--endpoint-manifest",
@@ -2301,7 +2308,7 @@ def test_client_to_local_resets_remote_endpoints_and_revokes_grants(tmp_path):
     home = tmp_path / "home"
     profile = load_effective_profile({"HOME": str(home)})
     assert [service.base_url for service in profile.services.values()] == [
-        f"http://localhost:{8080 + index}" for index in range(4)
+        f"http://localhost:{8080 + index}" for index in range(5)
     ]
     settings = sc.client_config.load_client_settings({"HOME": str(home)})
     assert settings.model_endpoints == {}
@@ -2609,7 +2616,7 @@ def test_a_manifest_with_a_foreign_target_is_refused_whole(tmp_path):
 def test_quitting_at_the_summary_writes_nothing(tmp_path):
     models = _offline_fixture(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-               stdin="1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\nq\n")
+               stdin="1\n1\n65536\noff\n1\n2\n32768\n2\n1\n2\n8192\n2\n1\nq\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "未寫入任何檔案" in proc.stdout
     assert not (_home(tmp_path) / ".config").exists()

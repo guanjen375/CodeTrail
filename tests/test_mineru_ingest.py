@@ -208,29 +208,36 @@ def test_mineru_replaced_text_owner_keeps_known_quality_repairs(monkeypatch, art
     assert summary["failed"] == []
 
 
-@pytest.mark.parametrize("route", ["normal", "not_loaded", "refused", "no_context", "answered"])
-def test_mineru_exclusion_survives_every_mcp_query_return(tmp_path, monkeypatch, route):
+@pytest.mark.parametrize("route", ["loaded", "not_loaded"])
+def test_mineru_ocr_status_survives_the_mcp_query_return(tmp_path, monkeypatch, route):
+    """MinerU OCR 的未確認狀態必須原樣穿過 MCP 邊界(strict 移除後只剩 query_knowledge)。
+
+    refs 的 text_verification_status 是客戶端回答審核判定「待覆核」的依據;REF 文字裡的
+    lane 標示是模型看得到的那一份。任一在 MCP 這層被丟掉,未確認的 OCR 就會被當成可信證據。
+    """
     from tests._harness import import_mcp_module, tool_fn
 
     mcp = import_mcp_module(monkeypatch, tmp_path)
-    excluded = [{"source": "spec.pdf", "page": 2, "origin": "mineru_text",
-                 "text_lane": "mineru", "reason": "mineru_text_not_independently_verified"}]
-    metadata = {"refs": [], "top_score": 0.0, "top_emb_score": 0.0,
-                "has_ref": False, "excluded_figures": [], "excluded_text": excluded}
-    context = "" if route == "no_context" else "reference"
+    refs = [{"source": "spec.pdf", "page": 2, "text_lane": "mineru",
+             "text_id": "text_" + "a" * 24, "text_revision": 1,
+             "text_verification_status": "unverified",
+             "text_review_reason": "mineru_text_not_independently_verified"}]
+    context = ("[REF1]\n  text_lane: mineru（OCR 未經獨立驗證） text_id=text_" + "a" * 24
+               + "\n  content: reference")
+    metadata = {"refs": refs, "top_score": 0.1, "top_emb_score": 0.1, "has_ref": True}
     monkeypatch.setattr(mcp, "KB", SimpleNamespace(
         loaded=route != "not_loaded", query=lambda *a, **kw: (context, "", metadata)))
     monkeypatch.setattr(mcp, "_ensure_kb_fresh", lambda: None)
     monkeypatch.setattr(mcp, "_record_kb_interaction", lambda **kw: None)
-    monkeypatch.setattr(mcp, "should_refuse_answer", lambda *a, **kw: route == "refused")
-    monkeypatch.setattr(mcp, "needs_grounding", lambda *a: (True, "numeric"))
-    monkeypatch.setattr(mcp, "answer_with_self_check", lambda *a, **kw: "answer")
-    result = tool_fn(mcp, "query_knowledge" if route == "normal" else
-                     "query_knowledge_strict")("question")
-    assert result["excluded_text"] == ([] if route == "not_loaded" else excluded)
-    if route == "no_context":
-        assert result["reason"] == "no_kb_ctx"
-        assert result["refused"] is True
+
+    result = tool_fn(mcp, "query_knowledge")("question")
+
+    if route == "not_loaded":
+        assert result["refs"] == [] and result["error"] == "knowledge base not loaded"
+    else:
+        assert result["refs"] == refs
+        assert "OCR 未經獨立驗證" in result["text"]
+    assert "excluded_text" not in result and "excluded_figures" not in result
 
 
 def test_mineru_preloaded_artifact_cannot_bind_another_same_named_pdf(tmp_path, monkeypatch):

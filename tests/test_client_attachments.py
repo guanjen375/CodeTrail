@@ -48,7 +48,7 @@ pytestmark = pytest.mark.smoke
 READ_ONLY = frozenset(
     {
         "list_dir", "read_file", "grep_code", "code_rag_search", "file_info",
-        "query_knowledge", "query_knowledge_strict", "query_table", "git_status", "git_diff",
+        "query_knowledge", "query_table", "git_status", "git_diff",
         "analyze_file",
     }
 )
