@@ -21,7 +21,7 @@ import endpoint_policy
 import process_env
 from deployment_profile import (
     ROLES, DeploymentProfile, ProfileError,
-    auditor_unconfigured_reason, export_client_profile, load_effective_profile,
+    export_client_profile, load_effective_profile,
 )
 from scripts import set_config
 
@@ -53,14 +53,9 @@ def _host_url() -> str:
 
 
 def _print_manifest(profile: DeploymentProfile, server_url: str) -> None:
-    if profile.mode == "model-host":
-        reason = auditor_unconfigured_reason(profile)
-        if reason:
-            # 升級前的 A 還沒有審核模型:先講這個修法,而不是「沒開 LAN」。
-            raise set_config.SetupError(reason)
     if profile.mode != "model-host" or any(service.bind != "all-interfaces"
                                             for service in profile.services.values()):
-        raise set_config.SetupError("匯出給 B 前，必須在 model-host 設定中明確允許所有模型（含審核模型）LAN 存取。")
+        raise set_config.SetupError("匯出給 B 前，必須在 model-host 設定中明確允許四個模型 LAN 存取。")
     manifest = export_client_profile(profile, server_url)
     print("\n=== Endpoint manifest：請依組織允許方式保存以下 JSON 並移到 B ===")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -84,9 +79,9 @@ def _configure_role(role: str, *, offer_restart: bool, prompt_compaction: bool =
         args.models_dir = set_config._input(f"模型目錄 [Enter={default_models}]: ").strip() or str(default_models)
         args.llama_bin = set_config._input(f"llama-server 執行檔 [Enter={default_binary}]: ").strip() or str(default_binary)
     if role == "model-host":
-        print("A 的模型 API（主模型、審核模型與三個附屬模型）預設只允許本機；LAN 模式會綁 0.0.0.0。")
+        print("A 的四個模型 API 預設只允許本機；LAN 模式會綁 0.0.0.0。")
         print("LAN 模式的 llama-server 沒有認證，只能在組織允許的可信網段開放。")
-        args.allow_remote = set_config._input_optional("允許 B 透過 LAN 呼叫這些模型？[y/N] ").strip().lower() in {"y", "yes"}
+        args.allow_remote = set_config._input_optional("允許 B 透過 LAN 呼叫四個模型？[y/N] ").strip().lower() in {"y", "yes"}
         if args.allow_remote:
             server_url = _host_url()
         else:
@@ -152,7 +147,7 @@ def configure_local(home: Path) -> int:
         ) from exc
     if previous is not None and previous.mode != "local":
         print(f"目前角色是 {previous.mode}；這次改為 local：模型與工作區在本機。")
-        print("確認寫入後會移除先前 B 的端點授權，所有模型使用本機端點；取消不寫入。")
+        print("確認寫入後會移除先前 B 的端點授權，四個模型使用本機端點；取消不寫入。")
         print("A/B 分離部署、交易還原及 manifest 請用 ./scripts/configure-advanced.sh。")
     try:
         return _configure_role("local", offer_restart=True, prompt_compaction=False,
@@ -172,10 +167,6 @@ def _existing_for_role(home: Path, role: str) -> DeploymentProfile | None:
         if profile.mode != role:
             print(f"目前角色是 {profile.mode}；將進入 {role} 互動設定。")
             return None
-        reason = auditor_unconfigured_reason(profile)
-        if reason:
-            # 升級前的設定還沒有審核模型:視為需要重新設定,不是「既有設定可用」。
-            raise ProfileError(reason)
         if role == "model-host":
             if any(not service.identity_alias for service in profile.services.values()):
                 raise ProfileError("model-host 缺少版本 identity alias")
@@ -184,7 +175,7 @@ def _existing_for_role(home: Path, role: str) -> DeploymentProfile | None:
             endpoints = endpoint_policy.validate_model_endpoints(
                 {name: service.base_url for name, service in profile.services.items()})
             if settings.model_endpoints != endpoints:
-                raise ProfileError("各角色端點與 client.json 的明確授權不一致")
+                raise ProfileError("四個端點與 client.json 的明確授權不一致")
         return profile
     except (ProfileError, client_config.ClientConfigError, endpoint_policy.EndpointPolicyError) as exc:
         print(f"既有設定無效，需重新確認：{exc}")
@@ -221,7 +212,7 @@ def _ensure_host_ready(profile: DeploymentProfile) -> int:
     from scripts import launch_servers
     ready, reachable, issues = _host_readiness(profile)
     if ready:
-        print("所有模型已 ready，live alias、主模型 n_ctx 與已啟用的 DSpark 狀態已核對。")
+        print("四個模型已 ready，live alias、主模型 n_ctx 與已啟用的 DSpark 狀態已核對。")
         return 0
     sessions = set_config.running_codetrail_sessions()
     if reachable or sessions:
@@ -234,7 +225,7 @@ def _ensure_host_ready(profile: DeploymentProfile) -> int:
     ready, _reachable, issues = _host_readiness(profile)
     if not ready:
         raise set_config.SetupError("模型啟動後 live 驗證未通過：" + "; ".join(issues))
-    print("所有模型已 ready；可用 nvidia-smi 與 tmux attach 觀察。")
+    print("四個模型已 ready；可用 nvidia-smi 與 tmux attach 觀察。")
     return 0
 
 
@@ -262,7 +253,7 @@ def device(home: Path) -> int:
         if result.code or not result.committed:
             return result.code
         if _existing_for_role(home, "client") is None:
-            raise set_config.SetupError("設定後沒有完整的五角色端點授權（含審核模型）。")
+            raise set_config.SetupError("設定後沒有完整的四角色端點授權。")
     # aicode owns the TTY/dependency gate and normal live preflight. The checkout
     # is only the executable location; the caller's project remains the sandbox.
     return process_env.run(["bash", str(REPO_ROOT / "aicode")], cwd=caller_root,

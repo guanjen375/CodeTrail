@@ -23,7 +23,6 @@ from deployment_profile import (  # noqa: E402
     add_loader_arguments,
     load_effective_profile,
     loader_kwargs,
-    service_unconfigured,
 )
 from deployment_status import query_gpu_processes  # noqa: E402
 from runtime_dependencies import DependencyError  # noqa: E402
@@ -48,8 +47,8 @@ def _positive_int(value: str) -> int:
 
 def _roles(scope: str) -> tuple[str, ...]:
     if scope == "aux":
-        return ("embedding", "reranker", "auditor", "vl")
-    return ("main", "embedding", "reranker", "auditor", "vl")
+        return ("embedding", "reranker", "vl")
+    return ("main", "embedding", "reranker", "vl")
 
 
 def _sessions(scope: str, args: argparse.Namespace) -> tuple[str, ...]:
@@ -269,7 +268,7 @@ def _parser() -> argparse.ArgumentParser:
     # 隱藏旗標:契約測試不能碰開發機上真的在跑的那兩個 session。
     parser.add_argument("--main-session", help=argparse.SUPPRESS)
     parser.add_argument("--aux-session", help=argparse.SUPPRESS)
-    # port 檢查要知道 profile 的每個 port,所以 stop 也認同一組 loader 旗標。
+    # port 檢查要知道 profile 的四個 port,所以 stop 也認同一組 loader 旗標。
     add_loader_arguments(parser)
     return parser
 
@@ -374,11 +373,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         forced: dict[int, str] = {}
         for role in _roles(args.scope):
             service = profile.service(role)
-            if service_unconfigured(service):
-                # 舊設定還沒選審核模型:這個角色本來就不會被啟動,沒有 port 可驗。
-                # 停止不得因此失敗(否則升級後連 ~/start.sh stop 都會紅)。
-                print(f"[i] {role}（審核模型）尚未設定，略過 port 檢查")
-                continue
             try:
                 pids = _listener_pids(service.port)
                 if pids is None:

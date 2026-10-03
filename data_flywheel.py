@@ -28,6 +28,7 @@
     "reproducibility": {
         "repo_commit": "abc123",
         "model_tag": "<CODE_MODEL>",   // 使用者設定的主模型 bare name 或 GGUF 路徑
+        "strict_mode": true,
         "patch_enabled": false,
         "container_enabled": false,
         "tool_calls": ["read_file:main.py", "grep:error"],
@@ -35,17 +36,16 @@
     }
 }
 
-metadata.trace（知識庫查詢；由 `knowledge.KnowledgeBase.query()` 產生，schema 2）：
+metadata.trace（知識庫查詢；由 `knowledge.KnowledgeBase.query()` 產生）：
   stage        走到哪一步結束：start / hybrid / gate / rerank / mmr / merge / done
-  query        模型送進來的問題、source 過濾、top_k
+  query        模型送進來的問題、source 過濾、strict、top_k
   kb           knowledge.json 檔名、store_generation、chunk 數
   settings     這次生效的檢索設定（門檻、reranker、MMR、BM25、expansion…）
   expansion    有沒有觸發 query expansion、擴寫出哪些查詢（None = 未知）
   candidates   hybrid 候選（chunk id / 來源 / 頁 / 章節 / rrf / retrieval / gate / bm25）
-  stopped      提早結束的原因：no_candidates / gate_none_passed / rerank_empty / mmr_empty；
-               正常走完是 null
-  （schema 1 的舊紀錄另有 query.strict、strict_excluded 與 strict_all_excluded* 這幾個
-   stopped 值：那是已移除的 strict 檢索留下的，`trace` 子命令照樣讀得懂。）
+  stopped      提早結束的原因：no_candidates / strict_all_excluded / gate_none_passed /
+               rerank_empty / mmr_empty / strict_all_excluded_after_merge；正常走完是 null
+  strict_excluded  strict 排除的圖與 OCR 文字（完整清單，含 status / reasons）
   decision     門檻、min_gate_score、top gate 分數與 margin 風險；candidates[].passed 標
                每個候選有沒有通過 gate，gate_passed_count 是通過的總數
   rerank       有沒有真的跑 cross-encoder、輸入幾個；scores = 評過分的**每一個**，
@@ -171,6 +171,7 @@ def get_reproducibility_info(folder: str = None) -> dict:
         {
             'repo_commit': str or None,   # Git commit hash
             'model_tag': str,             # 使用的模型
+            'strict_mode': bool,          # 是否啟用嚴格模式
             'patch_enabled': bool,        # 是否啟用 patch 工具
             'container_enabled': bool,    # 是否使用容器
             'tool_calls': list,           # 工具呼叫摘要（由 agent 補充）
@@ -188,6 +189,7 @@ def get_reproducibility_info(folder: str = None) -> dict:
     info = {
         'repo_commit': None,
         'model_tag': model_tag,
+        'strict_mode': config.STRICT_MODE,
         'patch_enabled': config.PATCH_ENABLED,
         'container_enabled': container_runner.CONTAINER_ENABLED,
         'tool_calls': [],  # 由 agent 補充
@@ -936,20 +938,13 @@ def print_trace(interaction: Interaction, *, max_candidates: int = 8) -> None:
             print(f"  快照: {len(trace['blobs'])} 個原始檔")
         return
     kb = trace.get("kb") or {}
-    query = trace.get("query") or {}
-    # schema 1 的舊紀錄才有 strict 欄位（已移除的 strict 檢索）；新紀錄不印這一段。
-    legacy_strict = f"  strict={query.get('strict')}" if "strict" in query else ""
     print(f"  stage={trace.get('stage')}  kb={kb.get('path')} gen={str(kb.get('store_generation', ''))[:8]} "
-          f"chunks={kb.get('chunks')}{legacy_strict}"
+          f"chunks={kb.get('chunks')}  strict={trace.get('query', {}).get('strict')}"
           + (f"  快照={kb.get('snapshot')}" if kb.get("snapshot") else ""))
     if trace.get("stopped"):
-        excluded = trace.get("strict_excluded")
-        legacy_excluded = (
-            f"  (strict 排除 圖 {len(excluded.get('figures') or [])} / "
-            f"OCR 文字 {len(excluded.get('text') or [])})"
-            if isinstance(excluded, dict) else ""
-        )
-        print(f"  ✗ 提早結束: {trace['stopped']}{legacy_excluded}")
+        excluded = trace.get("strict_excluded") or {}
+        print(f"  ✗ 提早結束: {trace['stopped']}  "
+              f"(strict 排除 圖 {len(excluded.get('figures') or [])} / OCR 文字 {len(excluded.get('text') or [])})")
     expansion = trace.get("expansion")
     if expansion is None:
         print("  expansion: 未知")

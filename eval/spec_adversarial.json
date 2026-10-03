@@ -23,13 +23,13 @@
   },
   {
     "id": "spec_adv_003",
-    "question": "在沒有指定 source 的情況下，系統預設的 top_k 值是多少？",
+    "question": "在 STRICT_MODE 關閉的情況下，系統預設的 top_k 值是多少？",
     "expected": {
       "keywords": ["KNOWLEDGE_TOP_K", "5"],
       "refs": ["spec"],
       "gold_chunks": ["KNOWLEDGE_TOP_K"],
       "gold_evidence": ["5"],
-      "_description": "測試條件性問題：需要理解 source 限定不改變預設 top_k"
+      "_description": "測試條件性問題：需要理解 STRICT_MODE 對 top_k 的影響"
     }
   },
   {

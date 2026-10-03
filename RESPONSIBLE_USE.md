@@ -50,7 +50,7 @@ limitations.
 ## Keep a human in the decision loop
 
 LLM output and retrieval results are probabilistic. File citations, high scores,
-and the auditor model's answer audit reduce some errors but do not establish correctness.
+strict mode, and self-checks reduce some errors but do not establish correctness.
 
 - Review patches and commands before approval; use the smallest necessary scope.
 - Run the appropriate project-specific validation before deployment.

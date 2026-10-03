@@ -277,7 +277,7 @@ def render_text_lane(payload: dict) -> list[str]:
         return []
     lane = data["mineru"]
     lines = [f"[MinerU] 文字 lane：{lane['readable_page_count']}/{lane['page_count']} 頁有可讀文字；"
-             "OCR 未獨立驗證，查詢時 REF 會標示未確認，確認前不算可信證據。"]
+             "OCR 未獨立驗證，strict 排除這些文字。"]
     if lane["missing_total"]:
         shown = lane["missing_pages"][:MAX_LISTED_ITEMS]
         remaining = lane["missing_total"] - len(shown)

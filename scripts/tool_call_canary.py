@@ -123,6 +123,7 @@ IMPLICIT_READ_ONLY_FRONTEND_TOOLS = frozenset(
         "code_rag_search",
         "file_info",
         "query_knowledge",
+        "query_knowledge_strict",
         "git_status",
         "git_diff",
         "analyze_file",

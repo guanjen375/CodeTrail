@@ -20,9 +20,18 @@ from config import (
     NUM_CTX_FULL_MODE,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     ALLOWED_DOT_DIRS,
+    STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
+    STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD,
+    PRIORITY_RULE_WITH_BINARY, PRIORITY_RULE_WITHOUT_BINARY,
     get_answer_rules,
-    # 回答中的 claim 樣式（extract_evidence_mapping 供 eval 評估引用覆蓋）
-    CLAIM_EVIDENCE_PATTERNS,
+    # P0 改進：Claim-to-Evidence 強制化
+    CLAIM_TO_EVIDENCE_ENABLED, CLAIM_EVIDENCE_STRICT, CLAIM_EVIDENCE_PATTERNS,
+    # P0-1 改進：needs_grounding 偵測器
+    NEEDS_GROUNDING_ENABLED, GROUNDING_NUMERIC_PATTERNS, GROUNDING_SPEC_PATTERNS,
+    GROUNDING_COMPARE_PATTERNS, GROUNDING_FORCE_KEYWORDS, GROUNDING_EXCLUDE_PATTERNS,
+    # P0-2 改進：句子級證據覆蓋率
+    SENTENCE_EVIDENCE_ENABLED, SENTENCE_EVIDENCE_DELETE, SENTENCE_EVIDENCE_MIN_LEN,
+    SENTENCE_EVIDENCE_WHITELIST,
 )
 
 
@@ -278,7 +287,7 @@ def _default_ctx_budget() -> int:
     **每次讀 `config.N_CTX`,不做 import 期快照**(AGENTS.md §3:動態值只用
     `import config`)。`mcp_server` 收到 `--n-ctx <觀測值>` 之後會覆寫
     `config.N_CTX`,而那個覆寫發生在這個模組 import 之後 —— 快照的話
-    server 端的 internal 呼叫會拿 deployment profile 的舊值當上限,於是
+    `query_knowledge_strict` 會拿 deployment profile 的舊值當上限,於是
     llama-server 從 prompt 前面靜默截掉。
     """
     return _config.N_CTX
@@ -449,9 +458,415 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
         return msg
 
 
+def is_spec_question(question: str) -> bool:
+    """判斷是否為規格/文件類問題"""
+    q_lower = question.lower()
+    return any(kw.lower() in q_lower for kw in SPEC_QUESTION_KEYWORDS)
+
+
+def needs_grounding(question: str) -> tuple[bool, str]:
+    """
+    P0-1: 智能判斷問題是否需要證據支持（取代純關鍵字觸發）
+
+    偵測特徵：
+    - 數值詢問（多少、幾個、預設值、上限下限）
+    - 規格/標準詢問（RFC、API 參數、錯誤碼、版本對照）
+    - 比較/對照類問題
+    - 強制 grounding 關鍵字
+
+    Returns:
+        (needs_grounding: bool, reason: str)
+        reason 用於 debug 和日誌
+    """
+    if not NEEDS_GROUNDING_ENABLED:
+        # 降級到舊邏輯：純關鍵字檢查
+        is_spec = is_spec_question(question)
+        has_strict_kw = any(kw.lower() in question.lower() for kw in STRICT_MODE_KEYWORDS)
+        if is_spec or has_strict_kw:
+            return True, "legacy_keyword"
+        return False, ""
+
+    q_lower = question.lower()
+
+    # 1. 檢查排除模式（概念解釋、操作指引等通常不需要 grounding）
+    for pattern in GROUNDING_EXCLUDE_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            # 排除模式命中，但如果同時有數值詢問則仍需 grounding
+            has_numeric = any(re.search(p, q_lower, re.IGNORECASE)
+                            for p in GROUNDING_NUMERIC_PATTERNS)
+            if not has_numeric:
+                return False, "excluded_pattern"
+
+    # 2. 強制 grounding 關鍵字（高優先級）
+    for kw in GROUNDING_FORCE_KEYWORDS:
+        if kw.lower() in q_lower:
+            return True, f"force_keyword:{kw}"
+
+    # 3. 數值詢問模式
+    for pattern in GROUNDING_NUMERIC_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            return True, f"numeric:{pattern}"
+
+    # 4. 規格/標準詢問模式
+    for pattern in GROUNDING_SPEC_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            return True, f"spec:{pattern}"
+
+    # 5. 比較/對照模式
+    for pattern in GROUNDING_COMPARE_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            return True, f"compare:{pattern}"
+
+    # 6. 向後相容：舊的 spec 關鍵字檢查
+    if is_spec_question(question):
+        return True, "legacy_spec_keyword"
+
+    return False, ""
+
+
+def should_use_strict_mode(question: str, knowledge_ctx: str, kb_metadata: dict = None) -> bool:
+    """
+    判斷是否應該啟用嚴格模式（P0-1 升級版）
+
+    新邏輯使用 needs_grounding 偵測器，取代純關鍵字觸發
+    條件：
+    1. STRICT_MODE 開啟
+    2. needs_grounding 偵測器判定需要證據
+    3. 有 knowledge_ctx 或是高信心 grounding 需求
+
+    Returns:
+        bool: 是否啟用嚴格模式
+    """
+    if not STRICT_MODE:
+        return False
+
+    # P0-1: 使用 needs_grounding 偵測器
+    grounding_needed, reason = needs_grounding(question)
+
+    if not grounding_needed:
+        return False
+
+    # 高信心觸發（force_keyword, spec）：即使沒有 knowledge_ctx 也啟用
+    high_confidence_triggers = ['force_keyword', 'legacy_spec_keyword', 'legacy_keyword']
+    if any(reason.startswith(t) for t in high_confidence_triggers):
+        return True
+
+    # 其他情況：需要有 knowledge_ctx 才啟用
+    if knowledge_ctx:
+        return True
+
+    return False
+
+
+_EXPLICIT_MISSING_IDENTIFIER_PATTERNS = (
+    re.compile(
+        r"\b(?:does not|doesn't|did not)\s+"
+        r"(?:define|document|mention|specify)\s+`?"
+        r"([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)`?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:沒有|未|沒)(?:明確)?(?:定義|規定|提到|記載|說明)\s*[`「『]?"
+        r"([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _explicitly_missing_identifier_lacks_evidence(
+    question: str,
+    kb_metadata: dict,
+) -> bool:
+    """Reject a claimed-absent field unless source text affirmatively defines it."""
+    identifiers = {
+        match.group(1).casefold()
+        for pattern in _EXPLICIT_MISSING_IDENTIFIER_PATTERNS
+        for match in pattern.finditer(question)
+    }
+    if not identifiers:
+        return False
+    chunks = kb_metadata.get("retrieved_chunks")
+    if not isinstance(chunks, list) or not all(isinstance(chunk, str) for chunk in chunks):
+        # Older callers without source text keep the score-based contract.
+        return False
+    evidence = "\n".join(chunks).casefold()
+    for identifier in identifiers:
+        if identifier not in evidence:
+            return True
+        escaped = re.escape(identifier)
+        negative_evidence = (
+            rf"\b(?:does not|doesn't|did not)\s+"
+            rf"(?:define|document|mention|specify)\s+`?{escaped}\b",
+            rf"\b(?:says?|states?)\s+(?:nothing|no information)\s+"
+            rf"(?:about|on)\s+`?{escaped}\b",
+            rf"(?:沒有|未|沒)(?:明確)?(?:定義|規定|提到|記載|說明)\s*"
+            rf"[`「『]?{escaped}\b",
+            rf"{escaped}\s*(?:沒有|未|沒)(?:被)?(?:定義|規定|提到|記載|說明)",
+        )
+        if any(re.search(pattern, evidence) for pattern in negative_evidence):
+            return True
+    return False
+
+
+def should_refuse_answer(
+    question: str, kb_metadata: dict, *, require_grounding: bool = False,
+) -> bool:
+    """
+    判斷是否應該拒絕回答（REF 太弱且是 spec 問題或已明示要求 grounding）。
+
+    require_grounding 由顯式 strict 工具傳入；不能因題目語言或自動分類
+    沒命中而跳過證據檢查。未傳入時保留原有 automatic spec 判準。
+
+    改進：
+    - spec 問題只看 embedding score（或 rerank score），不看 hybrid
+      因為 keyword 很容易把分數灌高，造成假陽性
+    - 額外檢查是否命中 type=spec 的 chunk
+
+    `kb_metadata["top_emb_score"]` 依定義是 **gate（content-only）** 分數：
+    KnowledgeBase 保證它不含 LLM 生成的 chunk 脈絡。這一點是拒答閘的正確性
+    前提——讓生成脈絡抬高的分數通過這裡，等於用可能是錯的脈絡替弱原文背書
+    （分數面的循環 grounding）。要改這裡的分數來源，先回去看 knowledge.py 的
+    Candidate.gate_score。
+    """
+    if not kb_metadata:
+        return require_grounding
+
+    if not require_grounding and not is_spec_question(question):
+        return False
+
+    has_ref = kb_metadata.get("has_ref", False)
+    if not has_ref:
+        return True
+
+    # A strong hit on the right document does not prove that a named field is
+    # present.  When the question explicitly says a snake_case identifier is
+    # undefined, require the retrieved source text itself to contain it before
+    # allowing the normal score/type gates to answer.
+    if _explicitly_missing_identifier_lacks_evidence(question, kb_metadata):
+        return True
+
+    # P0-5: 優先使用 embedding score（比 hybrid 更可靠）
+    # 若無 top_emb_score 則 fallback 到 0.0（保守：觸發拒答）
+    # 不再 fallback 到 top_score 因為那是 RRF score，量級不同
+    top_emb_score = kb_metadata.get("top_emb_score", 0.0)
+
+    # spec 問題：embedding score 太低視為弱證據
+    if top_emb_score < WEAK_REF_THRESHOLD:
+        return True
+
+    # 額外檢查：spec 問題最好要命中權威類型（spec/manual/api）的 chunk
+    # 使用 has_authoritative_chunk（包含 manual/api），向後相容 has_spec_chunk
+    has_authoritative = kb_metadata.get("has_authoritative_chunk",
+                                        kb_metadata.get("has_spec_chunk", True))
+    if not has_authoritative and top_emb_score < WEAK_REF_THRESHOLD + 0.1:
+        # 沒有權威類型 chunk 且 embedding score 不夠高，視為弱證據
+        return True
+
+    return False
+
+
+def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
+                          binary_ctx: str = "") -> str:
+    """
+    嚴格模式：兩階段回答 + 自我檢查
+    1. 第一次：正常回答（使用極低溫度）
+    2. 第二次：自我檢查，刪除無根據的推測
+
+    Args:
+        question: 使用者問題
+        base_ctx: 基礎上下文（程式碼等）
+        knowledge_ctx: 知識庫上下文（[REF]）
+        binary_ctx: 二進位/ELF 上下文（[BIN]/[ELF]），優先級最高
+    """
+    print("[STRICT] 啟用嚴格模式 - 兩階段自我檢查")
+
+    # 偵測是否有 BIN/ELF context
+    has_binary = binary_ctx and ("[BIN]" in binary_ctx or "[ELF]" in binary_ctx)
+
+    # 使用中央化的優先級規則（來自 config.py）
+    priority_rule = PRIORITY_RULE_WITH_BINARY if has_binary else PRIORITY_RULE_WITHOUT_BINARY
+
+    # 根據是否有 binary context 調整檢查規則
+    if has_binary:
+        source_rule = "- 必須優先根據 [BIN]/[ELF] 內容回答，其次是 [REF]"
+        check_rule = "1. 逐句檢查：每句話是否能在 [BIN]/[ELF] 或 [REF] 內容裡找到明確根據"
+        mark_rule = "- 有 [BIN]/[ELF] 或 [REF] 明確對應 → 保留並標註來源"
+    else:
+        source_rule = "- 只能根據 [REF] 內容回答，禁止使用常識或經驗補充"
+        check_rule = "1. 逐句檢查：每句話是否能在 [REF] 內容裡找到明確根據"
+        mark_rule = "- 有 [REF] 明確對應 → 保留並標註 REF 編號"
+
+    # 組合完整 context
+    full_ctx = base_ctx
+    if binary_ctx:
+        full_ctx += f"\n{binary_ctx}"
+
+    # 第一階段：正常回答（嚴格模式用極低溫度）
+    first_prompt = f"""{full_ctx}
+{knowledge_ctx}
+
+使用上面的程式碼與參考資料回答問題：
+{question}
+
+重要規則（{priority_rule}）：
+{source_rule}
+- 每個論述都必須標註來源（[BIN]/[ELF] 或 REF 編號）
+- 若資料沒有提到，直接說「文件/檔案中沒有明確說明」
+
+請直接給出清楚的回答。"""
+
+    print("   [1/2] 生成初稿...")
+    print_ctx_usage(len(first_prompt))
+    print()
+    draft = call_llm_stream(first_prompt, temperature=STRICT_MODE_TEMPERATURE)
+
+    if draft.startswith("[ERROR]"):
+        return draft
+
+    print("\n" + "-" * 40)
+    # 第二階段：自我檢查（溫度 0）
+    check_ctx = knowledge_ctx
+    if binary_ctx:
+        check_ctx = f"{binary_ctx}\n{knowledge_ctx}"
+
+    second_prompt = f"""{check_ctx}
+
+上面是你根據文件/檔案給出的初稿回答：
+
+[draft]
+{draft}
+[/draft]
+
+請嚴格檢查並修正：
+{check_rule}
+2. 凡是答案中沒有標註來源的句子，一律視為不可靠
+
+修正規則（嚴格執行）：
+{mark_rule}
+- 合理推論但資料沒明說 → 改成「推測：...」
+- 完全沒根據 → 直接刪除，改成「文件/檔案未提及此點」
+- 不要解釋檢查過程，只輸出修正後的最終回答"""
+
+    print("   [2/2] 自我檢查...")
+    print_ctx_usage(len(second_prompt))
+    print()
+    final = call_llm_stream(second_prompt, temperature=0.0)
+
+    # P0 改進：Claim-to-Evidence 強制驗證
+    if CLAIM_TO_EVIDENCE_ENABLED and not final.startswith("[ERROR]"):
+        final = validate_claim_to_evidence(final, knowledge_ctx)
+
+    return final.strip() if not final.startswith("[ERROR]") else draft
+
+
 # ============================================================
-# Claim-to-Evidence 映射（eval 用：回答中的 claim 對到哪些 REF）
+# P0 改進：Claim-to-Evidence 強制化機制
 # ============================================================
+
+def validate_claim_to_evidence(answer: str, knowledge_ctx: str) -> str:
+    """驗證回答中的 claim 是否有 evidence 支持
+
+    P0-2 升級：句子級證據覆蓋率
+    - 沒有 REF 的關鍵句會被刪除或降級（取決於 SENTENCE_EVIDENCE_DELETE 設定）
+    - 白名單句子（過渡語、結構語）不受影響
+
+    核心規則：
+    1. 數字/限制/預設值等關鍵句必須有 REF 標註
+    2. 沒有 REF 的關鍵句會被刪除或標記為「未經驗證」
+
+    Args:
+        answer: LLM 生成的回答
+        knowledge_ctx: 知識庫上下文（用於驗證 REF 是否存在）
+
+    Returns:
+        驗證後的回答（可能包含警告標記）
+    """
+    if not CLAIM_EVIDENCE_STRICT:
+        return answer
+
+    # 編譯所有需要驗證的 pattern
+    compiled_patterns = [re.compile(p, re.IGNORECASE) for p in CLAIM_EVIDENCE_PATTERNS]
+
+    # P0-2: 編譯白名單 pattern
+    whitelist_patterns = [re.compile(p, re.IGNORECASE) for p in SENTENCE_EVIDENCE_WHITELIST]
+
+    # 解析 knowledge_ctx 中的 REF 編號
+    available_refs = set(re.findall(r'REF(\d+)', knowledge_ctx, re.IGNORECASE))
+
+    # 分割回答為句子
+    sentences = re.split(r'(?<=[。.!?！？])\s*', answer)
+
+    validated_sentences = []
+    unverified_claims = []
+    deleted_count = 0
+
+    for sentence in sentences:
+        if not sentence.strip():
+            validated_sentences.append(sentence)
+            continue
+
+        sentence_stripped = sentence.strip()
+
+        # P0-2: 短句不檢查
+        if len(sentence_stripped) < SENTENCE_EVIDENCE_MIN_LEN:
+            validated_sentences.append(sentence)
+            continue
+
+        # P0-2: 白名單句子不檢查
+        is_whitelisted = any(p.search(sentence_stripped) for p in whitelist_patterns)
+        if is_whitelisted:
+            validated_sentences.append(sentence)
+            continue
+
+        # 檢查句子是否包含需要驗證的 pattern
+        needs_verification = any(p.search(sentence) for p in compiled_patterns)
+
+        if not needs_verification:
+            validated_sentences.append(sentence)
+            continue
+
+        # 檢查句子是否有 REF 標註
+        ref_mentions = re.findall(r'REF\s*(\d+)', sentence, re.IGNORECASE)
+
+        if ref_mentions:
+            # 驗證提到的 REF 是否存在於 knowledge_ctx
+            valid_refs = [r for r in ref_mentions if r in available_refs]
+            if valid_refs:
+                validated_sentences.append(sentence)
+                continue
+
+        # 沒有有效的 REF → 根據設定刪除或降級
+        if SENTENCE_EVIDENCE_ENABLED and SENTENCE_EVIDENCE_DELETE:
+            # P0-2 刪除模式：直接移除無證據句子
+            deleted_count += 1
+            # 不加入 validated_sentences（等同刪除）
+            unverified_claims.append(sentence_stripped)
+        else:
+            # 降級模式：標記為未驗證但保留
+            unverified_claims.append(sentence_stripped)
+            validated_sentences.append(sentence)
+
+    # 重組回答
+    result = ''.join(validated_sentences)
+
+    # 處理刪除後可能的空白問題
+    result = re.sub(r'\n{3,}', '\n\n', result)  # 壓縮過多空行
+
+    # 如果有刪除的句子，附上說明
+    if SENTENCE_EVIDENCE_ENABLED and SENTENCE_EVIDENCE_DELETE and deleted_count > 0:
+        notice = f"\n\n📋 **證據覆蓋檢查**：已移除 {deleted_count} 個無文件支持的陳述。"
+        result += notice
+    elif unverified_claims and len(unverified_claims) <= 5:
+        # 降級模式：附上警告
+        warning = "\n\n⚠️ **未經文件驗證的陳述**（以下內容可能需要進一步確認）：\n"
+        for i, claim in enumerate(unverified_claims[:5], 1):
+            # 截斷過長的句子
+            truncated = claim[:100] + "..." if len(claim) > 100 else claim
+            warning += f"  {i}. {truncated}\n"
+        result += warning
+
+    return result
+
 
 def extract_evidence_mapping(answer: str, knowledge_ctx: str) -> dict:
     """提取回答中的 claim-to-evidence 映射

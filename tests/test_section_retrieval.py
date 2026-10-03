@@ -121,7 +121,7 @@ def test_section_rank_never_substitutes_for_a_members_own_dense_or_lexical_gate(
         assert candidate.gate_score == pytest.approx(0.2)
         assert candidate.retrieval_score == pytest.approx(1.0 if has_ctx else 0.2)
         assert candidate.retrieval_bm25 == candidate.gate_bm25 == 0.0
-    model, _display, metadata = kb.query("unrelatedneedle")
+    model, _display, metadata = kb.query("unrelatedneedle", is_strict_mode=True)
     assert metadata["has_ref"] is False
     assert model == ""
 
@@ -252,35 +252,30 @@ def test_inline_vectors_explicitly_disable_sections_without_embedding_calls(
     {"origin": "mineru_text"}, {"text_lane": "mineru"},
     {"origin": "mineru_text", "text_lane": "mineru"},
 ])
-def test_mineru_text_refs_disclose_lane_and_unverified_status(
+def test_mineru_text_is_excluded_with_page_reasons_and_normal_refs_disclose_lane(
     tmp_path, monkeypatch, provenance,
 ):
-    """未獨立驗證的 OCR 照樣進 REF,但 REF 文字、display 與 refs 都標出 lane 與未確認狀態。
-
-    客戶端的回答審核依 refs 的 text_verification_status 判定「待覆核」;這裡漏標,
-    只靠未確認 OCR 支持的陳述就會被當成有證據。
-    """
     chunks = [_chunk(i, page=i + 1, **provenance) for i in range(2)]
     kb = _memory_kb(tmp_path, monkeypatch, chunks)
 
-    normal, display, normal_meta = kb.query("controller")
+    model, display, metadata = kb.query("controller", is_strict_mode=True)
 
-    assert normal_meta["has_ref"] is True
-    assert "excluded_text" not in normal_meta and "excluded_figures" not in normal_meta
-    assert "text_lane: mineru" in normal and "OCR 未經獨立驗證" in normal
-    assert "·待覆核" in display
+    assert metadata["has_ref"] is False and metadata.get("refs", []) == []
+    assert {entry["page"] for entry in metadata["excluded_text"]} == {1, 2}
+    assert all(entry["reason"] == "mineru_text_not_independently_verified"
+               for entry in metadata["excluded_text"])
+    assert "MinerU" in model and "未經獨立驗證" in model
+    assert "OCR" in display and "member_0" not in model
+    normal, _display, normal_meta = kb.query("controller")
+    assert normal_meta["has_ref"] is True and normal_meta["excluded_text"] == []
+    assert "text_lane: mineru" in normal
     assert all(ref["text_lane"] == "mineru" for ref in normal_meta["refs"])
-    assert all(ref["text_verification_status"] == "unverified" for ref in normal_meta["refs"])
     assert all(ref["verification_status"] == "" for ref in normal_meta["refs"])
 
 
-def test_mineru_text_status_does_not_taint_a_figures_own_verified_evidence(
+def test_strict_mineru_text_exclusion_preserves_a_figures_own_verified_evidence(
     tmp_path, monkeypatch,
 ):
-    """figure 與 MinerU 文字共用 OCR 標題時,figure 自己的驗證狀態不得被 OCR 的未確認狀態污染。
-
-    反過來的錯誤同樣無聲:原生驗證過的表格被標成待覆核,回答審核就永遠給不出 ✔。
-    """
     text = _chunk(0, origin="mineru_text", text_lane="mineru")
     figure = _chunk(
         1, origin="figure_table", structured=True, figure_kind="table",
@@ -292,23 +287,19 @@ def test_mineru_text_status_does_not_taint_a_figures_own_verified_evidence(
     )
     kb = _memory_kb(tmp_path, monkeypatch, [text, figure])
 
-    model, _display, metadata = kb.query("controller")
+    model, _display, metadata = kb.query("controller", is_strict_mode=True)
 
     assert metadata["has_ref"] is True
-    assert "SAFE_CTRL" in model and "member_0" in model
-    figure_refs = [ref for ref in metadata["refs"] if ref["figure_id"] == figure["figure_id"]]
-    text_refs = [ref for ref in metadata["refs"] if not ref["figure_id"]]
-    assert len(figure_refs) == 1 and len(text_refs) == 1
-    assert figure_refs[0]["verification_status"] == knowledge.VERIF_NATIVE
-    assert "text_verification_status" not in figure_refs[0]
-    assert text_refs[0]["text_verification_status"] == "unverified"
+    assert "SAFE_CTRL" in model and "member_0" not in model
+    assert len(metadata["excluded_text"]) == 1
+    assert [ref["figure_id"] for ref in metadata["refs"]] == [figure["figure_id"]]
+    assert metadata["refs"][0]["verification_status"] == knowledge.VERIF_NATIVE
 
 
 @pytest.mark.parametrize("stage", ["neighbor", "merge"])
-def test_neighbor_and_merge_paths_keep_mineru_text_labeled_unverified(
+def test_strict_neighbor_and_merge_paths_cannot_reintroduce_mineru_text(
     tmp_path, monkeypatch, stage,
 ):
-    """鄰接補回與合併都不得洗掉 OCR 出身:refs 仍標未確認、display 仍標待覆核。"""
     chunks = [_chunk(0), _chunk(1, origin="mineru_text", text_lane="mineru")]
     kb = _memory_kb(tmp_path, monkeypatch, chunks)
     if stage == "neighbor":
@@ -316,16 +307,15 @@ def test_neighbor_and_merge_paths_keep_mineru_text_labeled_unverified(
                             lambda _chunks: [kb.chunks[1]])
     else:
         # Even a merge that loses its top-level origin must be checked against
-        # the original member rows before the REF can lose its OCR status.
+        # the original member rows before the content can become a strict REF.
         merged = dict(kb.chunks[1], origin="", text_lane="", member_chunk_idx=[1])
         monkeypatch.setattr(kb, "_merge_adjacent_chunks", lambda _chunks: [merged])
 
-    model, display, metadata = kb.query("controller")
+    model, _display, metadata = kb.query("controller", is_strict_mode=True)
 
-    assert metadata["has_ref"] is True
-    assert "member_1" in model
-    assert [ref["text_verification_status"] for ref in metadata["refs"]] == ["unverified"]
-    assert "·待覆核" in display
+    assert metadata["has_ref"] is False
+    assert metadata["excluded_text"]
+    assert "member_1" not in model
 
 
 def test_mineru_figure_headings_cannot_alias_gate_when_no_generated_ctx_exists(
@@ -345,7 +335,7 @@ def test_mineru_figure_headings_cannot_alias_gate_when_no_generated_ctx_exists(
     assert kb._bm25_score(["ocr_heading_token"], index=kb._bm25_gate) == []
     assert kb._bm25_score(["ocr_heading_token"], index=kb._bm25)
     assert kb._hybrid_search("ocr_heading_token")[0].gate_score == 0.0
-    _model, _display, metadata = kb.query("ocr_heading_token")
+    _model, _display, metadata = kb.query("ocr_heading_token", is_strict_mode=True)
     assert metadata["has_ref"] is False
 
     monkeypatch.setattr(config, "KB_CONTEXT_USE", False)
@@ -356,7 +346,7 @@ def test_mineru_figure_headings_cannot_alias_gate_when_no_generated_ctx_exists(
         kb._precompute_embeddings()
 
 
-def test_mineru_heading_only_numeric_literal_cannot_pass_the_lexical_gate(
+def test_mineru_heading_only_numeric_literal_cannot_pass_strict_lexical_gate(
     tmp_path, monkeypatch,
 ):
     """A real body keyword hit must not launder an OCR heading's numeric value."""
@@ -377,9 +367,9 @@ def test_mineru_heading_only_numeric_literal_cannot_pass_the_lexical_gate(
     gate_bm25 = kb._bm25_score(kb._tokenize_for_bm25(question), index=kb._bm25_gate)[0][0]
     assert gate_bm25 > 0.0, "the verified body must supply a genuine lexical hit"
 
-    _model, _display, metadata = kb.query(question)
+    _model, _display, metadata = kb.query(question, is_strict_mode=True)
 
-    assert metadata["has_ref"] is False, "an OCR heading-only number crossed the lexical gate"
+    assert metadata["has_ref"] is False, "an OCR heading-only number crossed the strict gate"
     assert kb._has_lexical_numeric_evidence(question, gate_bm25, figure) is False
 
 

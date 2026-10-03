@@ -50,7 +50,7 @@ class IngestClosedError(RuntimeError):
 class IngestBusyError(RuntimeError):
     """evidence tool 在 ingest 進行中被呼叫。
 
-    `query_knowledge` / `query_table` 的回傳型別是 dict 且有
+    `query_knowledge` / `query_knowledge_strict` 的回傳型別是 dict 且有
     outputSchema；忙碌時回字串會破壞 structuredContent 契約，所以改成 raise，
     由 `tool_result_adapter.adapt_tool_error` 產生符合 schema 的 structured error。
     """
@@ -60,6 +60,7 @@ class IngestBusyError(RuntimeError):
 # `code_rag_search` 刻意不在裡面：那是程式碼索引，不碰 knowledge.json。
 BUSY_TOOLS: frozenset[str] = frozenset({
     "query_knowledge",
+    "query_knowledge_strict",
     "query_table",
     "reload_knowledge_base",
     "remove_document",
@@ -71,6 +72,7 @@ BUSY_TOOLS: frozenset[str] = frozenset({
 # evidence tools：忙碌時 raise，不回字串。
 EVIDENCE_BUSY_TOOLS: frozenset[str] = frozenset({
     "query_knowledge",
+    "query_knowledge_strict",
     "query_table",
 })
 

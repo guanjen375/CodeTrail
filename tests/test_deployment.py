@@ -712,7 +712,7 @@ def test_the_main_model_resolver_has_no_environment_branch(monkeypatch, tmp_path
 def _fixture(tmp_path: Path):
     paths = {
         role: tmp_path / f"{role}.gguf"
-        for role in ("main", "embedding", "reranker", "vl", "auditor", "mmproj")
+        for role in ("main", "embedding", "reranker", "vl", "mmproj")
     }
     for path in paths.values():
         path.write_bytes(b"fixture")
@@ -729,8 +729,6 @@ def _fixture(tmp_path: Path):
                     "mmproj": str(paths["mmproj"]),
                     "gpu": "GPU-RTX2000ADA",
                 },
-                # 審核模型是必要角色:未設定時 inspect_deployment 會列 issue。
-                "auditor": {"model": str(paths["auditor"]), "gpu": "GPU-RTX2000ADA"},
             },
         },
     )
@@ -741,15 +739,13 @@ def _fixture(tmp_path: Path):
         "embedding": "GPU-RTX2000ADA",
         "reranker": "GPU-RTX2000ADA",
         "vl": "GPU-RTX2000ADA",
-        "auditor": "GPU-RTX2000ADA",
     }
-    roles = ("main", "embedding", "reranker", "vl", "auditor")
     processes = [
         GpuProcess(100 + index, "/opt/llama-server", gpu_for[role], "1000")
-        for index, role in enumerate(roles)
+        for index, role in enumerate(("main", "embedding", "reranker", "vl"))
     ]
     cmdlines = {}
-    for index, role in enumerate(roles):
+    for index, role in enumerate(("main", "embedding", "reranker", "vl")):
         service = profile.service(role)
         args = [
             "/opt/llama-server",
@@ -792,7 +788,6 @@ def test_status_identifies_all_roles_by_cmdline_port(tmp_path):
         "embedding": 101,
         "reranker": 102,
         "vl": 103,
-        "auditor": 104,
     }
 
 
@@ -1964,6 +1959,8 @@ def test_numeric_thresholds_in_unit_range():
         "KNOWLEDGE_THRESHOLD",
         "KNOWLEDGE_THRESHOLD_SHORT",
         "DYNAMIC_THRESHOLD_RATIO",
+        "WEAK_REF_THRESHOLD",
+        "STRICT_MODE_THRESHOLD",
         "LOW_CONFIDENCE_KB_THRESHOLD",
         "CODE_RAG_THRESHOLD",
         "CODE_RAG_THRESHOLD_BUG",

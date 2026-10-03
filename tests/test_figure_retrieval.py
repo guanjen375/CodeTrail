@@ -9,19 +9,18 @@ smoke，這裡改成那一段每條各標）。
 守四件事，每一件失效都是**無聲**的：
 1. generic 的 noise filter / Jaccard dedup / adjacent merge 不得吞掉 structured chunk
    （被吞了只會表現成「注入了也查不到」或「metadata 不見了」，沒有任何錯誤訊息）。
-2. 未通過驗證的圖照樣進 REF，但 REF 文字、display 與 machine-readable refs 都必須帶
-   figure 層級的有效狀態與原因（客戶端的回答審核靠 refs 的狀態判定「待覆核」）——
-   只靠 prompt 提醒模型不算；也不得撐起 has_authoritative_chunk。
-3. display 與 machine-readable metadata 都要帶 status / reasons / range / truncation，
-   不得讓人以為整張表或整份 log 都在 REF 裡。
+2. strict query 必須在 **code 層**排除未通過驗證的圖片，且說得出「哪一頁哪張圖待覆核、
+   為什麼」——只靠 prompt 提醒模型不算。
+3. 一般 query 可以回未驗證內容，但 display 與 machine-readable metadata 都要帶
+   status / reasons / range / truncation，不得讓人以為整張表或整份 log 都在 REF 裡。
 4. 舊 KB（缺欄位）的圖片 chunk 一律降級成 legacy_unverified，且**不回寫檔案**。
 
 ── figure_extract 的 canonical model 契約：payload → validator → render → chunk → KB dict ──
 為什麼這些測試存在（AGENTS.md §1.4 的第二類：無聲失敗風險的契約）：structured figure
 lane 的整個價值就是「不改寫原文、不錯配欄位、不猜字元」。這三件事壞掉的時候**不會有
 任何錯誤訊息**：表格少一欄、log 首行空行被吃掉、`▯` 的位置飄一格、未驗證的內容拿到
-trusted status —— 全都會安靜地變成一個看起來正常的 chunk，然後被當成可信數值引用
-（回答審核也會把它算成有證據）。所以這裡驗的是語義，不是形狀：
+trusted status —— 全都會安靜地變成一個看起來正常的 chunk，然後被 strict query 當成可信
+數值回答出去。所以這裡驗的是語義，不是形狀：
 - terminal 的行序 / 空行 / 可見空白經 JSON round trip 與多 chunk 切分後**逐位元組**相同。
 - register 表的每一格與同一列的身分綁定，兩列只差一個 hex 字元也不得交叉配對。
 - validator 擋掉的每一條都對應一種真實的靜默錯配（無證據 fill-down、`▯` 不對齊、
@@ -29,14 +28,15 @@ trusted status —— 全都會安靜地變成一個看起來正常的 chunk，�
 - `build_figure_chunks` 的批次語義：零部分成功、失敗時 `next_chunk_index` 原封不動。
 真 PDF / 真模型完全不參與：這一段只有純函式，跑完是毫秒級。
 
-── `review_figures` 的 MCP 公開邊界，以及 `query_knowledge` 的回傳鍵與模型可見文字 ──
+── `review_figures` 的 MCP 公開邊界，以及兩個 query 工具的 `excluded_figures` ──
 為什麼不能用 T5 的 `figure_review` 測試代替(AGENTS.md §1.4 第 2 款):
 JSON 解析(含重複 key)、kind 的權威來源、document_id/figure_id 配對、人工確認閘、
 例外分流(可重試的 conflict vs 必須 fail-loud 的路徑違規)、以及輸出渲染的截斷規則
 **全部住在 `mcp_server.py`**。`list_figures` / `apply_fix` 的測試一行都不會經過它們,
 而這些每一條失手都是無聲的:模型會拿到一個看似合理、實際被改寫過的結果。
-strict 檢索移除後,`query_knowledge` 只回證據本身;狀態揭露靠 REF 文字與 refs
-(含給客戶端審核對位用的 content_sha256 / content_chars,它們不得進模型可見文字)。
+`excluded_figures` 同理:strict gate 在 `knowledge.py` 把未驗證的圖擋掉之後,
+若 MCP 的四條回傳路徑漏帶這個欄位,使用者只會看到「拒答」,看不到「有圖可用但
+待覆核」——那正是 workflow §4 Step 4 要求要說出來的東西。
 """
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ import knowledge
 from knowledge import KnowledgeBase
 from tests._harness import import_mcp_module, tool_fn
 
-# ── 原 test_figure_retrieval.py：structured figure chunk 的檢索契約（狀態揭露 / 舊 KB backfill） ──
+# ── 原 test_figure_retrieval.py：structured figure chunk 的檢索契約（strict gate / 揭露 / 舊 KB backfill） ──
 # ============================================================
 # fixtures：照 figure_extract §2.7 的凍結 render 格式組衍生文字
 #
@@ -480,79 +480,99 @@ def test_legacy_vl_verification_metadata_survives_merge(monkeypatch, tmp_path: P
 
 
 # ============================================================
-# 2. 一般查詢的狀態揭露（code 層，不是 prompt）
+# 2. strict gate（code 層，不是 prompt）
 # ============================================================
-# strict 檢索已移除：未通過驗證的圖照樣進 REF，但 REF 文字、display 與 machine-readable
-# refs 都必須帶 figure 層級的有效狀態與原因，也不得撐起 has_authoritative_chunk。客戶端的
-# 回答審核依 refs 的 verification_status 判定「待覆核」——這裡漏標，審核就會把它當可信證據。
 @pytest.mark.smoke
 @pytest.mark.parametrize("status", ["needs_review", "unverified", "legacy_unverified"])
-def test_flagged_figure_is_returned_with_its_status_in_text_and_refs(
-    monkeypatch, tmp_path: Path, status
-):
-    """未驗證的圖仍查得到，但 REF 文字、display 與 refs 都標出狀態與原因，且不算權威。"""
+def test_strict_query_cannot_answer_from_flagged_figure(monkeypatch, tmp_path: Path, status):
+    """workflow §5 evidence ⑦：strict 不得用未驗證的圖回答 register 數值。
+
+    被排除的內容不得殘留在 model_output / refs / retrieved_chunks，也不得撐起
+    has_authoritative_chunk；同時要說得出「哪一頁哪張圖、為什麼」。
+    """
     chunk = _table_chunk(rows=(ROW_A,), span=(1, 1), status=status,
                          reasons=("glyph_conflict", "missing_row"))
     kb = _stub_kb(monkeypatch, tmp_path, [chunk])
 
-    model_text, display, meta = kb.query("CTRL0 的位址是多少？")
+    model_text, display, meta = kb.query("CTRL0 的位址是多少？", is_strict_mode=True)
 
-    assert meta["has_ref"] is True
-    assert "0x4000_0100" in model_text
-    ref = meta["refs"][0]
-    assert ref["figure_id"] == FIG_TABLE
-    assert ref["page"] == 12 and ref["figure_index"] == 2
-    assert ref["verification_status"] == status
-    assert "glyph_conflict" in ref["reasons"]
-    assert f"status: {status}" in model_text
-    assert "review_figures" in model_text
-    assert "·待覆核" in display
-    assert meta["has_authoritative_chunk"] is False
-    assert "excluded_figures" not in meta and "excluded_text" not in meta
+    assert meta["has_ref"] is False
+    assert "0x4000_0100" not in model_text, "未驗證的 register 值洩漏進 strict 上下文"
+    assert meta.get("refs", []) == []
+    assert not any("0x4000_0100" in text for text in meta.get("retrieved_chunks", []))
+    assert meta.get("has_authoritative_chunk", False) is False
+
+    excluded = meta["excluded_figures"]
+    assert len(excluded) == 1
+    assert excluded[0]["page"] == 12 and excluded[0]["figure_index"] == 2
+    assert excluded[0]["figure_id"] == FIG_TABLE
+    assert excluded[0]["verification_status"] == status
+    assert "glyph_conflict" in excluded[0]["reasons"]
+    assert "待覆核" in model_text and "review_figures" in model_text
+    assert "p.12" in model_text and "figure2" in model_text
+    assert "待覆核" in display
+
+    # 同一個 KB 的一般查詢仍然回得到（gate 只作用在 strict）
+    _m2, _d2, meta2 = kb.query("CTRL0 的位址是多少？")
+    assert meta2["has_ref"] is True and meta2["excluded_figures"] == []
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("status", ["native_verified", "corroborated", "human_verified"])
-def test_trusted_figure_is_authoritative_and_not_flagged(monkeypatch, tmp_path: Path, status):
-    """反向：有獨立證據的三種狀態照常是權威證據，不得被標成待覆核。"""
+def test_strict_query_keeps_trusted_figure(monkeypatch, tmp_path: Path, status):
+    """反向：有獨立證據的三種狀態不得被誤擋（gate 不能變成一律封鎖）。"""
     variant = "native" if status == "native_verified" else "crop@200dpi"
     chunk = _table_chunk(rows=(ROW_A,), span=(1, 1), status=status, reasons=(),
                          reason_details=(), model_input_variant=variant)
     kb = _stub_kb(monkeypatch, tmp_path, [chunk])
-    model_text, display, meta = kb.query("CTRL0 的位址是多少？")
+    model_text, _display, meta = kb.query("CTRL0 的位址是多少？", is_strict_mode=True)
 
-    assert meta["has_ref"] is True
+    assert meta["has_ref"] is True and meta["excluded_figures"] == []
     assert "0x4000_0100" in model_text
-    assert meta["refs"][0]["verification_status"] == status
     assert meta["has_authoritative_chunk"] is True
-    assert "待覆核" not in display
 
 
 @pytest.mark.smoke
-def test_legacy_vl_chunks_are_labeled_legacy_unverified(monkeypatch, tmp_path: Path):
-    """舊 VL lane（origin=image/screenshot/diagram）在一般查詢一律標 legacy_unverified。
+def test_strict_gate_returns_cleanly_when_every_candidate_is_excluded(monkeypatch, tmp_path: Path):
+    """全部候選都被排除時必須立刻返回三個值，不得走到 _decision_order(...)[0]。"""
+    chunks = [
+        _table_chunk(rows=(ROW_A,), span=(1, 1), chunk_index=i,
+                     figure_id=f"fig_00000000000000{i:02x}", figure_index=i + 1)
+        for i in range(3)
+    ]
+    kb = _stub_kb(monkeypatch, tmp_path, chunks)
+    result = kb.query("CTRL0 的位址是多少？", is_strict_mode=True)
+
+    assert isinstance(result, tuple) and len(result) == 3
+    model_text, display, meta = result
+    assert meta["has_ref"] is False
+    assert len(meta["excluded_figures"]) == 3
+    assert isinstance(model_text, str) and isinstance(display, str)
+
+
+@pytest.mark.smoke
+def test_strict_gate_excludes_legacy_vl_chunks(monkeypatch, tmp_path: Path):
+    """舊 VL lane（origin=image/screenshot/diagram）同樣進 strict gate。
 
     兩條路徑都要守：直接注入的 chunk（沒有 verification_status），以及經過真實
-    `_load` backfill 的舊 KB。少了任一條，舊 KB 的 VL 數值就會被當成可信證據。
+    `_load` backfill 的舊 KB。少了任一條，舊 KB 的 VL 數值就會重新冒充 strict 證據。
     """
     vl = _plain_chunk("架構圖顯示 NPU 共有 8 個運算核心，SRAM 4MB。" * 3,
                       page=5, doc_type="diagram", origin="diagram", figure_index=1)
     kb = _stub_kb(monkeypatch, tmp_path, [vl])
-    _model_text, display, meta = kb.query("NPU 有幾個核心？")
-    assert meta["refs"][0]["verification_status"] == "legacy_unverified"
-    assert "·待覆核" in display
-    assert meta["has_authoritative_chunk"] is False
+    _model_text, _display, meta = kb.query("NPU 有幾個核心？", is_strict_mode=True)
+    assert meta["has_ref"] is False, "舊 VL chunk 仍能當 strict 證據"
+    assert meta["excluded_figures"][0]["verification_status"] == "legacy_unverified"
 
     loaded = _loaded_kb(monkeypatch, tmp_path, [dict(vl, embedding=[1.0, 0.0])])
     assert loaded.chunks[0]["verification_status"] == "legacy_unverified"
-    _m, _d, meta2 = loaded.query("NPU 有幾個核心？")
-    assert meta2["refs"], "舊 KB 的 VL chunk 應該查得到（只是要標狀態）"
-    assert meta2["refs"][0]["verification_status"] == "legacy_unverified"
+    _m, _d, meta2 = loaded.query("NPU 有幾個核心？", is_strict_mode=True)
+    assert meta2["has_ref"] is False and meta2["excluded_figures"]
 
 
 @pytest.mark.smoke
 def test_flagged_part_taints_the_whole_figure(monkeypatch, tmp_path: Path):
-    """同一張圖的任一 part 待覆核 → 只召回乾淨的 part 時，REF 也標整張圖最差的狀態。
+    """同一張圖的任一 part 待覆核 → 整張圖（含乾淨的 part）都不得進 strict REF。
 
     CONTRACT §3「聚合一律取最差」。被召回的往往剛好是乾淨那一段，逐 chunk 判定會漏。
     """
@@ -562,17 +582,18 @@ def test_flagged_part_taints_the_whole_figure(monkeypatch, tmp_path: Path):
                          status="needs_review", part_index=2, part_total=2)
     # 只召回乾淨那一段
     kb = _stub_kb(monkeypatch, tmp_path, [clean, dirty], recall=[0])
-    _model_text, _display, meta = kb.query("CTRL0 的位址是多少？")
-    assert meta["has_ref"] is True
-    ref = meta["refs"][0]
-    assert ref["verification_status"] == "needs_review", (
-        "同一張圖有 part 待覆核時，乾淨的 part 也不可信"
+    _model_text, _display, meta = kb.query("CTRL0 的位址是多少？", is_strict_mode=True)
+    assert meta["has_ref"] is False, "同一張圖有 part 待覆核時，乾淨的 part 也不可信"
+    excluded = meta["excluded_figures"][0]
+    assert excluded["verification_status"] == "needs_review"
+    assert "glyph_conflict" in excluded["reasons"], (
+        "被排除的原因來自另一段，只收本 chunk 的空 reasons 等於沒有可監督性"
     )
-    assert "glyph_conflict" in ref["reasons"], (
-        "原因來自另一段，只收本 chunk 的空 reasons 等於沒有可監督性"
-    )
-    assert "figure_part_flagged_elsewhere" in ref["reasons"]
-    assert meta["has_authoritative_chunk"] is False, "figure 層級狀態也要套進權威判定"
+    assert "figure_part_flagged_elsewhere" in excluded["reasons"]
+
+    _m2, _d2, meta2 = kb.query("CTRL0 的位址是多少？")
+    assert meta2["has_ref"] is True
+    assert meta2["has_authoritative_chunk"] is False, "figure 層級狀態也要套進權威判定"
 
 
 @pytest.mark.smoke
@@ -611,20 +632,18 @@ def test_revision_mismatch_between_parts_is_treated_as_needs_review(monkeypatch,
     new = _table_chunk(rows=(ROW_B,), span=(2, 2), footnote=False, chunk_index=1, revision=2,
                        status="human_verified", reasons=(), reason_details=())
     kb = _stub_kb(monkeypatch, tmp_path, [old, new])
-    _model_text, _display, meta = kb.query("CTRL0 的位址是多少？")
-    refs = [ref for ref in meta["refs"] if ref["figure_id"] == FIG_TABLE]
-    assert refs
-    for ref in refs:
-        assert ref["verification_status"] == "needs_review"
-        assert "figure_revision_conflict" in ref["reasons"]
-        assert any("revision" in detail for detail in ref["reason_details"])
-    assert meta["has_authoritative_chunk"] is False
+    _model_text, _display, meta = kb.query("CTRL0 的位址是多少？", is_strict_mode=True)
+    assert meta["has_ref"] is False
+    excluded = meta["excluded_figures"][0]
+    assert excluded["verification_status"] == "needs_review"
+    assert "figure_revision_conflict" in excluded["reasons"]
+    assert any("revision" in detail for detail in excluded["reason_details"])
 
 
-def test_lexical_only_flagged_figure_still_carries_its_status(monkeypatch, tmp_path: Path):
-    """dense 分數不夠、靠精確 hex lexical 證據過 gate 的圖，REF 一樣帶待覆核狀態。
+def test_lexical_only_flagged_figure_is_reported(monkeypatch, tmp_path: Path):
+    """dense 分數不夠、但有精確 hex 證據的圖被擋掉時，一樣要列進 excluded_figures。
 
-    register / hex 題主要走 lexical 這條路；這條路漏標狀態，回答審核就會把它當可信證據。
+    register / hex 題主要走 lexical 這條路；只看 gate_score 會讓這類題完全沒有揭露。
     """
     chunk = _table_chunk(rows=(ROW_A,), span=(1, 1))
     kb = _stub_kb(monkeypatch, tmp_path, [chunk])
@@ -634,10 +653,9 @@ def test_lexical_only_flagged_figure_still_carries_its_status(monkeypatch, tmp_p
                                                retrieval_score=0.05, gate_score=0.05,
                                                retrieval_bm25=1.0, gate_bm25=1.0)],
     )
-    model_text, _display, meta = kb.query("0x4000_0100 是哪個 register？")
-    assert meta["has_ref"] is True, "精確 hex 的 lexical 證據應讓候選通過 gate"
-    assert meta["refs"][0]["verification_status"] == "needs_review"
-    assert "status: needs_review" in model_text
+    _model_text, _display, meta = kb.query("0x4000_0100 是哪個 register？", is_strict_mode=True)
+    assert meta["has_ref"] is False
+    assert meta["excluded_figures"], "lexical-only 的候選被排除卻沒有揭露"
 
 
 def test_mixed_status_figure_never_gets_the_spec_weight(monkeypatch, tmp_path: Path):
@@ -764,13 +782,20 @@ def test_trusted_oversized_row_cannot_form_an_empty_authoritative_ref(monkeypatc
     """單一超長 row/line 一列都放不進 REF 時，不得形成「空的權威成功」。
 
     模型手上沒有任何數值，metadata 卻回 has_ref=True + has_authoritative_chunk=True，
-    是最糟的一種無聲失敗——所以這種 REF 仍可回，但必須誠實說沒有完整資料、也不算權威。
+    是最糟的一種無聲失敗——所以 strict 直接 fail-closed，一般查詢也不算權威。
     """
     giant = "0x4000_0100 " * 400
     chunk = _terminal_chunk(lines=[giant], span=(3, 3), total=90, status="corroborated",
                             reasons=(), reason_details=(), oversized_line=True)
     kb = _stub_kb(monkeypatch, tmp_path, [chunk])
     monkeypatch.setattr(knowledge, "KNOWLEDGE_MERGE_MAX_CHARS", 200)
+
+    model_text, _display, meta = kb.query("boot log", is_strict_mode=True)
+    assert meta["has_ref"] is False, "一列都顯示不出來的 REF 不能算 strict 證據"
+    assert meta.get("has_authoritative_chunk", False) is False
+    excluded = meta["excluded_figures"][0]
+    assert "ref_truncated_no_complete_row" in excluded["reasons"]
+    assert excluded["verification_status"] == "corroborated", "排除原因是截斷，不是驗證狀態"
 
     general_text, _d2, meta2 = kb.query("boot log")
     assert meta2["has_ref"] is True, "一般查詢仍可回（但要誠實說沒有完整資料）"
@@ -796,42 +821,6 @@ def test_generic_chunk_truncation_sets_the_machine_flag(monkeypatch, tmp_path: P
     assert "內容已截斷" in model_text
     assert meta["refs"][0]["truncated"] is True
     assert meta["refs"][0]["verification_status"] == "", "純文字 chunk 仍然不是 figure"
-
-
-@pytest.mark.smoke
-def test_ref_content_identity_matches_the_printed_content(monkeypatch, tmp_path: Path):
-    """refs 的 content_sha256／content_chars 必須是 REF 文字裡 `content:` 之後實際印出的那段。
-
-    客戶端的回答審核用它把模型看過的內容區對回這筆 refs metadata：身分與印出內容不一致，
-    對位就會失敗，或配到別筆 REF 的驗證狀態。KB 自己的截斷標記與 structured 截斷 render
-    都算印出內容的一部分；KNOWLEDGE_INCLUDE_CONTENT 關閉時印出的是空字串。
-    """
-    long_plain = _plain_chunk("暫存器說明段落，內容很長。" * 200, chunk_index=0, page=3)
-    figure = _table_chunk(rows=_rows(8, start=5), span=(5, 12), total=40, chunk_index=1,
-                          status="corroborated", reasons=(), reason_details=())
-    kb = _stub_kb(monkeypatch, tmp_path, [long_plain, figure])
-    monkeypatch.setattr(knowledge, "KNOWLEDGE_MERGE_MAX_CHARS", 200)
-
-    model_text, _display, meta = kb.query("暫存器 CTRL 的位址")
-
-    assert len(meta["refs"]) == 2
-    printed_all = []
-    for n, ref in enumerate(meta["refs"], 1):
-        header = model_text.index(f"\n[REF{n}]\n")
-        start = model_text.index("\n  content: ", header) + len("\n  content: ")
-        printed = model_text[start:start + ref["content_chars"]]
-        assert hashlib.sha256(printed.encode("utf-8")).hexdigest() == ref["content_sha256"]
-        tail = model_text[start + ref["content_chars"]:]
-        assert tail == "" or tail.startswith("\n"), "內容區之後必須緊接換行或文字結尾"
-        printed_all.append(printed)
-    assert any("內容已截斷" in printed for printed in printed_all), "KB 截斷標記要算進身分"
-
-    monkeypatch.setattr(knowledge, "KNOWLEDGE_INCLUDE_CONTENT", False)
-    _text, _d, meta_off = kb.query("暫存器 CTRL 的位址")
-    empty = hashlib.sha256(b"").hexdigest()
-    assert meta_off["refs"]
-    assert all(r["content_sha256"] == empty and r["content_chars"] == 0
-               for r in meta_off["refs"])
 
 
 @pytest.mark.smoke
@@ -1067,8 +1056,8 @@ def test_aggregate_reason_details_is_ordered_and_deduped():
     assert knowledge._aggregate_reason_details(members) == fx.aggregate_reason_details(members)
 
 
-def test_figure_refs_aggregate_worst_status_and_reasons(monkeypatch, tmp_path: Path):
-    """同一張圖的每個 part 的 REF 都帶 figure 層級狀態：取最差、reasons 聯集保序。"""
+def test_excluded_figures_aggregate_worst_status_and_reasons(monkeypatch, tmp_path: Path):
+    """同一張圖的多個 part 只列一筆，狀態取最差、reasons 聯集保序。"""
     specs = [
         ("unverified", ("single_channel_only",), ("第一段",)),
         ("needs_review", ("glyph_conflict",), ("第二段",)),
@@ -1081,28 +1070,14 @@ def test_figure_refs_aggregate_worst_status_and_reasons(monkeypatch, tmp_path: P
         for i, (status, reasons, details) in enumerate(specs)
     ]
     kb = _stub_kb(monkeypatch, tmp_path, parts)
-    _model_text, _display, meta = kb.query("CTRL0 的位址是多少？")
+    _model_text, _display, meta = kb.query("CTRL0 的位址是多少？", is_strict_mode=True)
 
-    # figure 層級:狀態取最差、reasons／reason_details 依 KB 順序去重保序聯集。
-    entry = kb._figure_trust_map()[knowledge._figure_key(parts[0])]
-    assert entry["status"] == "needs_review"
-    assert entry["reasons"][:2] == ["single_channel_only", "glyph_conflict"]
-    assert entry["reason_details"][:2] == ["第一段", "第二段"]
-
-    refs = [ref for ref in meta["refs"] if ref["figure_id"] == FIG_TABLE]
-    assert refs, "同一張圖的 part 應該查得到"
-    for ref in refs:
-        assert ref["verification_status"] == "needs_review", "狀態要取最差"
-        assert {"single_channel_only", "glyph_conflict"} <= set(ref["reasons"]), "要涵蓋整張圖的原因"
-        assert {"第一段", "第二段"} <= set(ref["reason_details"])
-        # 每個 REF 先列這一段自己的原因,再接整張圖的聯集(knowledge._figure_reasons_for);
-        # 自己不是最差的那幾段另補「別的 part 待覆核」,讓乾淨的那段也看得出為什麼被降級。
-        if ref["reasons"][0] == "single_channel_only":
-            assert ref["reasons"][:2] == ["single_channel_only", "glyph_conflict"]
-            assert "figure_part_flagged_elsewhere" in ref["reasons"]
-        else:
-            assert ref["reasons"][:2] == ["glyph_conflict", "single_channel_only"]
-            assert "figure_part_flagged_elsewhere" not in ref["reasons"]
+    excluded = meta["excluded_figures"]
+    assert len(excluded) == 1, "同一個 figure_id 只能列一筆"
+    assert excluded[0]["verification_status"] == "needs_review", "狀態要取最差"
+    assert excluded[0]["reasons"][:2] == ["single_channel_only", "glyph_conflict"]
+    assert "figure_part_flagged_elsewhere" in excluded[0]["reasons"]
+    assert excluded[0]["reason_details"][:2] == ["第一段", "第二段"]
 
 
 def test_flagged_structured_chunk_does_not_inherit_spec_weight(tmp_path: Path):
@@ -1124,8 +1099,8 @@ def test_flagged_structured_chunk_does_not_inherit_spec_weight(tmp_path: Path):
 def test_prose_scaffolding_is_recognised_like_terminal():
     """★ prose 的衍生文字與 terminal 同一種 scaffolding，截斷計畫必須認得。
 
-    認不出來就回 None：會被當成「連一行完整資料都沒顯示」而不算權威，REF 也可能
-    留下一個沒有關閉的 code fence。prose 是掃描頁最常見的 kind，這條漏掉等於
+    認不出來就回 None：strict 會把它當成「連一行完整資料都沒顯示」而排除，一般查詢
+    則可能留下一個沒有關閉的 code fence。prose 是掃描頁最常見的 kind，這條漏掉等於
     整批掃描件在 REF 裡都算不出顯示範圍。
     """
     lines = ["[FIGURE kind=prose id=fig_0123456789abcdef rev=1 page=2 lines=1-2/2 "
@@ -2704,7 +2679,7 @@ def test_retrieval_context_rejects_a_non_dict_entry():
     assert chunks[0]["figure_caption"] == ""
 
 
-# ── 原 test_mcp_figure_tools.py：review_figures 的 MCP 公開邊界與 query_knowledge 的回傳鍵（整段皆 smoke） ──
+# ── 原 test_mcp_figure_tools.py：review_figures 的 MCP 公開邊界與 query 工具的 excluded_figures（整段皆 smoke） ──
 FIG = "fig_0123456789abcdef"
 FIG2 = "fig_fedcba9876543210"
 DOC = "docs/npu_spec.pdf::0123456789abcdef"
@@ -3282,34 +3257,37 @@ def test_path_violation_is_fail_loud_not_a_conflict(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# query_knowledge:只回證據本身(strict 已移除),狀態標示進模型可見文字、內容身分只在 structured
+# excluded_figures:四條 strict 回傳路徑 + 一般查詢
 # ---------------------------------------------------------------------------
+_EXCLUDED = [{
+    "source": "npu_spec.pdf", "page": 7, "figure_id": FIG, "figure_index": 1,
+    "figure_kind": "table", "verification_status": figure_extract.VERIF_NEEDS_REVIEW,
+    "reasons": ["glyph_conflict"],
+}]
+
+
 def _stub_query(monkeypatch, mcp, *, meta, context="ctx"):
     class _KB(_FakeKB):
-        def query(self, question, source=None):
+        def query(self, question, is_strict_mode=False, source=None):
             return (context, "display", meta)
     monkeypatch.setattr(mcp, "KB", _KB())
 
 
 @pytest.mark.smoke
-def test_query_knowledge_returns_only_the_evidence_keys(monkeypatch, tmp_path):
-    """excluded_figures／excluded_text／review_hint 只在已移除的 strict 檢索才有值。
-
-    留著恆為空的鍵等於宣稱「沒有東西被排除」;KB 那端就算塞了也不得透出去。
-    """
+def test_query_knowledge_carries_excluded_figures(monkeypatch, tmp_path):
     mcp = _mcp(monkeypatch, tmp_path)
-    _stub_query(monkeypatch, mcp, meta={
-        "refs": [], "top_score": 0.4, "has_ref": False,
-        "excluded_figures": [{"source": "npu_spec.pdf", "page": 7}],
-    })
+    _stub_query(monkeypatch, mcp, meta={"refs": [], "top_score": 0.4,
+                                        "excluded_figures": _EXCLUDED})
 
+    # Core payload contract: the transport adapter renders this separately.
     result = mcp.query_knowledge("reset timing")
 
-    assert set(result) == {"text", "display", "refs", "top_score", "has_ref"}
+    assert result["excluded_figures"] == _EXCLUDED
+    assert "review_figures" in result["review_hint"]
 
 
 @pytest.mark.smoke
-def test_query_knowledge_not_loaded_reports_the_error(monkeypatch, tmp_path):
+def test_query_knowledge_not_loaded_still_has_the_key(monkeypatch, tmp_path):
     mcp = _mcp(monkeypatch, tmp_path)
 
     class _Empty(_FakeKB):
@@ -3317,29 +3295,118 @@ def test_query_knowledge_not_loaded_reports_the_error(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp, "KB", _Empty())
 
     result = mcp.query_knowledge("reset timing")
-    assert result["error"] == "knowledge base not loaded"
-    assert set(result) == {"text", "display", "refs", "top_score", "has_ref", "error"}
-    assert result["refs"] == [] and result["has_ref"] is False
+    assert result["excluded_figures"] == []
+    assert result["review_hint"] == ""
 
 
 @pytest.mark.smoke
-def test_query_transport_keeps_status_labels_and_hides_content_identity(monkeypatch, tmp_path):
-    """模型可見文字精簡且帶 verification_status;REF 內容身分只在 structured(給客戶端審核對位)。"""
+@pytest.mark.parametrize("refuse, grounding, context, expected_reason", [
+    (True, True, "ctx", "weak_ref_for_spec_question"),
+    (False, False, "", "no_kb_ctx"),
+    (False, False, "ctx", "explicit_strict"),
+    (False, True, "ctx", "spec_number"),
+])
+def test_strict_return_paths_all_carry_excluded_figures(
+    monkeypatch, tmp_path, refuse, grounding, context, expected_reason
+):
+    """拒答、缺 context 與顯式 strict 成功都要說得出「哪張圖待覆核」。"""
     mcp = _mcp(monkeypatch, tmp_path)
-    refs = [{"source": "npu_spec.pdf", "page": 7,
-             "verification_status": figure_extract.VERIF_NEEDS_REVIEW,
-             "content_sha256": "0" * 64, "content_chars": 12}]
-    _stub_query(monkeypatch, mcp, meta={"refs": refs, "top_score": 0.4, "has_ref": True},
-                context="[REF] 相關知識參考")
+    _stub_query(monkeypatch, mcp, meta={
+        "refs": [], "top_score": 0.4, "top_emb_score": 0.3,
+        "excluded_figures": _EXCLUDED,
+    }, context=context)
+    monkeypatch.setattr(mcp, "should_refuse_answer", lambda q, m, **kw: refuse)
+    monkeypatch.setattr(mcp, "needs_grounding", lambda q: (grounding, "spec_number"))
+    monkeypatch.setattr(mcp, "answer_with_self_check",
+                        lambda q, b, k, binary_ctx="": "答案")
+
+    result = mcp.query_knowledge_strict("reset assert 最小時間")
+
+    assert result["reason"] == expected_reason, result
+    assert result["refused"] is (refuse or not context), result
+    assert result["strict"] is True, result
+    assert result["excluded_figures"] == _EXCLUDED, result
+    assert "review_figures" in result["review_hint"], result
+    assert "待覆核" in result["review_hint"], result
+
+
+_LEGACY_EXCLUDED = [{
+    "source": "scanned.pdf", "page": 12, "figure_index": 1,
+    "figure_kind": "diagram", "verification_status": figure_extract.VERIF_LEGACY,
+    "reasons": ["legacy_missing_verification"],
+}]
+
+
+@pytest.mark.smoke
+def test_legacy_raster_exclusion_is_not_sent_to_review_figures(monkeypatch, tmp_path):
+    """舊 VL / 純 raster chunk 不會出現在 review_figures,叫使用者去那裡找必然撲空。"""
+    mcp = _mcp(monkeypatch, tmp_path)
+    _stub_query(monkeypatch, mcp, meta={"refs": [], "top_score": 0.4,
+                                        "excluded_figures": _LEGACY_EXCLUDED})
+
+    hint = mcp.query_knowledge("reset timing")["review_hint"]
+
+    assert "scanned.pdf p.12" in hint, hint
+    assert "不可覆核" in hint, hint
+    assert "出現在 review_figures" in hint, hint
+    assert "原始 PDF" in hint, hint
+    # 不得把 legacy 導向 fix 流程
+    assert "confirm_against_image" not in hint, hint
+
+
+@pytest.mark.smoke
+def test_structured_and_legacy_exclusions_are_reported_separately(monkeypatch, tmp_path):
+    mcp = _mcp(monkeypatch, tmp_path)
+    _stub_query(monkeypatch, mcp, meta={
+        "refs": [], "top_score": 0.4,
+        "excluded_figures": _EXCLUDED + _LEGACY_EXCLUDED,
+    })
+
+    hint = mcp.query_knowledge("reset timing")["review_hint"]
+
+    # **不能用「可覆核」當標記**:它是「不可覆核」的子字串。structured 那一段
+    # 若被錯寫成 legacy 文案,`"可覆核" in hint` 照樣成立 —— 使用者被導去看原始
+    # PDF,而那張圖其實 review_figures 修得動。`review_figures` 同理:它也出現在
+    # legacy 那段的否定句「**不會**出現在 review_figures 裡」。
+    # 所以兩段各用自己的完整肯定句當錨點。
+    assert "可覆核(結構化抽取):" in hint, hint
+    assert "不可覆核(舊 KB legacy 視覺辨識):" in hint, hint
+    assert 'review_figures(action="fix"' in hint, hint          # 只有 structured 段有
+    assert "不會**出現在 review_figures 裡" in hint, hint        # 只有 legacy 段有
+    assert hint.index("可覆核(結構化抽取):") < hint.index("不可覆核("), hint
+    assert hint.index("npu_spec.pdf") < hint.index("scanned.pdf"), hint
+
+
+@pytest.mark.smoke
+def test_strict_kb_not_loaded_still_has_the_key(monkeypatch, tmp_path):
+    mcp = _mcp(monkeypatch, tmp_path)
+
+    class _Empty(_FakeKB):
+        loaded = False
+    monkeypatch.setattr(mcp, "KB", _Empty())
+
+    result = mcp.query_knowledge_strict("reset assert 最小時間")
+    assert result["reason"] == "knowledge_base_not_loaded"
+    assert result["excluded_figures"] == []
+    assert result["review_hint"] == ""
+
+
+@pytest.mark.smoke
+def test_query_transport_is_compact_and_keeps_exclusion_guidance(monkeypatch, tmp_path):
+    """Model-visible text is compact while the UI retains the structured payload."""
+    mcp = _mcp(monkeypatch, tmp_path)
+    _stub_query(monkeypatch, mcp, meta={
+        "refs": [{"source": "npu_spec.pdf", "page": 7}],
+        "top_score": 0.4,
+        "excluded_figures": _EXCLUDED,
+    })
     transport = mcp.mcp._tool_manager.get_tool("query_knowledge").fn
 
     result = transport(question="reset timing")
     assert len(result.content) == 1
     text = result.content[0].text
-    assert text.startswith("status: ok"), text
-    assert "npu_spec.pdf p.7 (verification_status=needs_review)" in text, text
-    assert "content_sha256" not in text and "content_chars" not in text, text
-    assert "0" * 64 not in text, text
+    assert text.startswith("status: partial\nnext: "), text
+    assert "npu_spec.pdf p.7" in text, text
+    assert "review_figures" in text and "待覆核" in text, text
     assert '"display"' not in text and '"refs"' not in text, text
-    assert result.structuredContent["refs"] == refs
-    assert "excluded_figures" not in result.structuredContent
+    assert result.structuredContent["excluded_figures"] == _EXCLUDED

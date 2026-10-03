@@ -19,7 +19,6 @@
                             "reason": ..., "tokens": {...}}}
     {"type": "compaction",  "sessionID": ..., "part": {"type": "compaction", ...}}
     {"type": "error",       "sessionID": ..., "message": ...}
-    {"type": "answer_audit", "sessionID": ..., "audit": {...}}   # 只給 TUI(見 TYPE_AUDIT)
 
 **工具名是裸名**(`list_dir`,不是 `codetrail_list_dir`)。
 
@@ -53,10 +52,6 @@ TYPE_TEXT_DELTA = "text_delta"
 TYPE_ACTIVITY = "activity"
 # Local TUI queue state. This is neither assistant output nor a terminal event.
 TYPE_QUEUE = "message_queue"
-#: 主回答之後的審核卡(client_audit)。**同一個字串也是 session 檔的記錄型別**:
-#: 事件只給 TUI(headless 不審核、不出現在 JSONL),記錄只進 transcript、不進模型歷史。
-#: 它不是模型輸出,不進 assistant_text,也不影響 terminal 判定。
-TYPE_AUDIT = "answer_audit"
 
 STATUS_COMPLETED = "completed"
 STATUS_ERROR = "error"
@@ -217,11 +212,6 @@ def activity_event(
     if snapshot is not None:
         part["progress"] = snapshot
     return {"type": TYPE_ACTIVITY, "sessionID": session_id, "part": part}
-
-
-def audit_event(session_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
-    """一筆審核結果(與寫進 session 檔的 ``answer_audit`` 記錄同一份內容)。"""
-    return {"type": TYPE_AUDIT, "sessionID": session_id, "audit": dict(record)}
 
 
 def notice_event(session_id: str, message: str) -> dict[str, Any]:

@@ -3,8 +3,7 @@
 """llama_client — CodeTrail 對 llama.cpp llama-server 的薄封裝。
 
 設計守則
-- 一個角色一個 server / port:主 LLM (8080) / embedding (8081) / reranker (8082) / VL (8083) /
-  審核模型 auditor (8084)。
+- 一個角色一個 server / port:主 LLM (8080) / embedding (8081) / reranker (8082) / VL (8083)。
 - 兩種 endpoint 都用:
     /v1/chat/completions  → tool-calling 流(agent.py 用)
     /completion           → 純文字生成 + 完整 sampling 參數 + stream(utils.py 用)
@@ -752,10 +751,6 @@ def _validate_response_format(response_format: Any) -> dict:
             "(looks like the wrapper and the inner schema got swapped)"
         )
     return response_format
-
-
-#: 公開名:``Engine.complete(response_format=...)``(審核模型)與 VL 共用同一個外殼驗證。
-validate_response_format = _validate_response_format
 
 
 def vision_json_completion(

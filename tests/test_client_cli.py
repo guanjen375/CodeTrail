@@ -467,7 +467,6 @@ def test_startup_diagnostics_keep_warnings_for_status_and_defer_session_creation
 
     monkeypatch.setattr(client_preflight, "check_tool_health", fake_tool_health)
     monkeypatch.setattr(client_preflight, "check_required_servers", lambda result: None)
-    monkeypatch.setattr(client_preflight, "check_auditor", lambda result, profile: None)
     monkeypatch.setattr(client_preflight, "check_ctx_safety", lambda *a: None)
     monkeypatch.setattr(client_preflight, "observe_n_ctx", lambda result, profile: 4096)
 

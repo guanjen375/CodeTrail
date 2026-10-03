@@ -217,7 +217,7 @@ def test_human_carryover_keeps_duplicate_source_provenance(monkeypatch, tmp_path
 
 @pytest.mark.smoke
 def test_quality_is_separate_from_human_confirmation_in_review_and_query(monkeypatch, tmp_path):
-    """The quality fields must survive both product views without bypassing the trust labels."""
+    """The quality fields must survive both product views without bypassing strict trust."""
     import knowledge
     from tests._harness import import_mcp_module
 
@@ -330,12 +330,8 @@ def test_non_table_candidate_still_replaces_its_native_table_span(monkeypatch, t
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("status", ["needs_review", "unverified", "legacy_unverified"])
-def test_flagged_ref_retains_review_label_and_repair_routing(monkeypatch, tmp_path, status):
-    """I3: the REF keeps the review cue while known damage still requires repair.
-
-    strict 檢索移除後,待覆核的圖照樣進 REF;狀態、品質處置與「已知缺陷不得猜補」的
-    提示都必須留在模型看到的 REF 文字與 refs metadata(回答審核也靠它判定待覆核)。
-    """
+def test_strict_exclusion_hint_retains_review_label_and_repair_routing(monkeypatch, tmp_path, status):
+    """I3: keep the strict review cue while known damage still requires repair."""
     from tests import test_figure_retrieval as helpers
 
     chunk = helpers._table_chunk(rows=(helpers.ROW_A,), span=(1, 1), status=status,
@@ -343,12 +339,12 @@ def test_flagged_ref_retains_review_label_and_repair_routing(monkeypatch, tmp_pa
     chunk.update(quality_grade="partial", review_state="unreviewed",
                  auto_disposition="repair_required", quality_issues=["conflicting_text"])
     kb = helpers._stub_kb(monkeypatch, tmp_path, [chunk])
-    model_text, display, meta = kb.query("CTRL0 的位址是多少？")
+    model_text, display, meta = kb.query("CTRL0 的位址是多少？", is_strict_mode=True)
 
-    assert f"status: {status}" in model_text, "The REF lost its review status"
-    assert "auto_disposition: repair_required" in model_text
-    assert "內容有已知缺陷" in model_text
+    assert "待覆核" in model_text, "The strict model hint lost its existing review cue"
+    assert "manual_review（待覆核）才需人工判斷" in model_text
+    assert "repair_required/excluded 需要修復或重新 ingest" in model_text
     assert "review_figures" in model_text and "待覆核" in display
-    assert meta["has_ref"] is True and meta["has_authoritative_chunk"] is False
-    assert meta["refs"][0]["verification_status"] == status
-    assert meta["refs"][0]["auto_disposition"] == "repair_required"
+    assert "0x4000_0100" not in model_text and meta.get("refs", []) == []
+    assert meta["has_ref"] is False and meta.get("has_authoritative_chunk", False) is False
+    assert meta["excluded_figures"][0]["auto_disposition"] == "repair_required"

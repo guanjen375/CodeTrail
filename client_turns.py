@@ -17,12 +17,6 @@
 這三件事原本只有 web 的協調器做齊。前端只剩一個 TUI 之後它們仍然要成立,
 所以搬到這裡:UI 只負責顯示與收鍵,回合語意在這個模組。
 
-* **答後尾段**:主回答寫定之後還有審核(小模型)與壓縮。engine 對已寫定的答案一律
-  拒絕取消,所以 ``send()`` 回來到決定是否壓縮之間由這裡接受取消(``_tail_cancellable``):
-  答案保留、後續的審核與壓縮不再開始、終結事件是 cancelled。審核登記之後的取消導向
-  那一個審核 job(見 :mod:`client_audit`)。尾段在決定壓縮的同一個臨界區關上,之後回到
-  壓縮既有的取消規則 —— 不會有「接受了卻擋不住已經越過檢查的壓縮」。
-
 **取消的兩層語意**(呼叫端要分清楚):
 
 * 核准框的「拒絕」= :meth:`answer_approval` 帶 ``False``:只拒絕**這一個工具**,
@@ -47,7 +41,6 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 import client_attachments
-import client_audit
 import client_engine
 import client_compaction
 import context_budget
@@ -115,7 +108,6 @@ class TurnCoordinator:
         compactor: Any = None,
         approval_timeout: float = APPROVAL_TIMEOUT_SECONDS,
         on_prime: Callable[[str, Any], None] | None = None,
-        auditor: client_audit.AuditTarget | None = None,
     ) -> None:
         self.engine = engine
         self.compactor = compactor
@@ -146,18 +138,6 @@ class TurnCoordinator:
         self._accepting_supplements = False
         self._active_queue_id = ""
         self._review_job: Any = None
-        #: ``_review_job`` 是哪一種工作:"review"(`/review`)或 "kb"(`/kb` 的寫入動作)。
-        #: 兩者都佔回合鎖、取消都導向那個 job;差別只在 UI 的拒絕訊息與 ``reviewing``。
-        self._job_kind = ""
-        #: 審核模型(小模型)的端點;None = 不審核(headless、測試替身)。
-        self._auditor = auditor
-        #: 主回答寫定之後正在跑的審核(取消導向它)。只在 _run_turn 的審核段內有值。
-        self._audit_job: Any = None
-        #: 「答後尾段」:主回答已寫定、終結事件還沒決定。engine 此時拒絕取消(答案已寫定),
-        #: 由協調器接受並阻止後續的審核與壓縮 —— 否則 send() 回來到審核登記之間按 Ctrl-C
-        #: 會「按了沒反應」。begin_turn 依是否有審核模型打開,決定是否壓縮時與 finish_turn 關上。
-        self._tail_cancellable = False
-        self._tail_closed = True
         # 摘要不經 send(on_event=...),但手動／自動壓縮都要回報目前階段。
         # 活動共用 UI bridge;不改 send 的 JSONL 事件流,也不進預熱路徑。
         set_activity = getattr(engine, "set_activity_callback", None)
@@ -181,15 +161,7 @@ class TurnCoordinator:
     @property
     def reviewing(self) -> bool:
         with self._lock:
-            return (self._review_job is not None and self._job_kind == "review"
-                    and not self._turn_done)
-
-    @property
-    def kb_busy(self) -> bool:
-        """`/kb` 的寫入動作(匯入、移除、覆核)正在跑。"""
-        with self._lock:
-            return (self._review_job is not None and self._job_kind == "kb"
-                    and not self._turn_done)
+            return self._review_job is not None and not self._turn_done
 
     def pending_approvals(self) -> tuple[str, ...]:
         with self._lock:
@@ -253,8 +225,6 @@ class TurnCoordinator:
             if not target:
                 raise QueueError("尚未建立對話；先用 /new 或直接輸入第一則訊息。")
             if self._review_job is not None and mode == "supplement":
-                if self._job_kind == "kb":
-                    raise QueueError("知識庫動作不接收補充；原文仍可編輯，或使用 /queue add 保留到聊天。")
                 raise QueueError("工作區審查不接收補充；原文仍可編輯，或使用 /queue add 保留到聊天。")
             if session_id is not None and session_id != target:
                 raise QueueError("對話已切換,訊息未送出;請在原對話重新確認。")
@@ -388,7 +358,6 @@ class TurnCoordinator:
             self._turn_id = secrets.token_hex(8)
             self._accepting_supplements = True
             self._active_queue_id = item.id
-            self._open_tail_locked(model_turn=True)
             item = self._replace_queued_locked(item, status="delivering", reason="正在接收至下一輪。")
         self._queue_event(item)
         try:
@@ -414,7 +383,7 @@ class TurnCoordinator:
         self._queue_event(item)
 
     # ---- 回合邊界 ------------------------------------------------------
-    def begin_turn(self, *, review_job: Any = None, job_kind: str = "review") -> None:
+    def begin_turn(self, *, review_job: Any = None) -> None:
         """取 turn_lock 並標「這一輪開始」——兩步在同一個臨界區內。
 
         兩步之間收到取消的話,:meth:`cancel` 看到的是上一輪留下的
@@ -434,18 +403,6 @@ class TurnCoordinator:
             self._queue_paused = False
             self._accepting_supplements = False
             self._review_job = review_job
-            self._job_kind = job_kind if review_job is not None else ""
-            self._open_tail_locked(model_turn=review_job is None)
-
-    def _open_tail_locked(self, *, model_turn: bool) -> None:
-        """回合開始時重設答後尾段(呼叫端持 ``self._lock``)。
-
-        ``begin_turn`` 與 ``_start_next_queued`` 共用這一處:佇列自己取回合鎖、不經
-        begin_turn,只在其中一邊打開尾段的話,排隊那一輪答完後的 Ctrl-C 會一律被拒絕。
-        """
-        self._audit_job = None
-        self._tail_cancellable = model_turn and self._auditor is not None
-        self._tail_closed = False
 
     def finish_turn(self) -> None:
         """一輪(訊息或手動摘要)結束:標 turn_done、清 engine 旗標、放鎖。
@@ -463,10 +420,6 @@ class TurnCoordinator:
                 if callable(clear):
                     clear()
             self._review_job = None
-            self._job_kind = ""
-            self._audit_job = None
-            self._tail_cancellable = False
-            self._tail_closed = True
         self._turn_lock.release()
 
     def cancel(self, *, block: bool = True, review_id: str | None = None) -> bool:
@@ -492,28 +445,14 @@ class TurnCoordinator:
                 return False
             pending_call = None
             slow_cancel = None
-            if self._audit_job is not None:
-                active_engine = self._audit_job
-            elif self._review_job is not None:
-                active_engine = self._review_job
-            else:
-                active_engine = self.engine
+            active_engine = self._review_job if self._review_job is not None else self.engine
             request = getattr(active_engine, "request_cancel", None)
             if callable(request):
                 decision = request(arm_when_idle=True)
-                if decision.accepted:
-                    pending_call = decision.call
-                    slow_cancel = getattr(active_engine, "cancel_pending", None)
-                elif not (
-                    active_engine is not self._review_job
-                    and self._tail_cancellable
-                    and not self._tail_closed
-                    and getattr(self.engine, "answer_committed", False) is True
-                ):
+                if not decision.accepted:
                     return False
-                # 否則:答案已寫定(或審核已寫定、job 還沒清掉)、終結事件還沒決定 ——
-                # 那端沒有東西可關,這次取消只阻止後續的審核與壓縮(_run_turn 在每一段
-                # 之前看 _cancelled)。review／kb job 的 _tail_cancellable 恆為 False。
+                pending_call = decision.call
+                slow_cancel = getattr(active_engine, "cancel_pending", None)
             else:  # pragma: no cover - 只有測試替身會少這個方法
                 fallback = getattr(self.engine, "cancel", None)
                 if callable(fallback):
@@ -678,47 +617,6 @@ class TurnCoordinator:
         self._publish(event)
         # No queue drain, prime or compaction is allowed on this branch.
 
-    def start_kb(self, job: Any) -> str:
-        """`/kb` 的寫入動作(``client_kb.KbJob``):先佔回合鎖並登記取消目標,再排背景工作。
-
-        與 `/review` 同一套:取消導向 job、核准走 :meth:`request_approval`。不寫聊天歷史、
-        不建立 session、不排佇列、不預熱、不壓縮——知識庫動作不是一輪對話。
-        """
-        self.begin_turn(review_job=job, job_kind="kb")
-        target, turn_id = self.engine.session_id, self.turn_id
-        try:
-            self._spawn(lambda: self._run_kb(job, target, turn_id), f"codetrail-kb-{turn_id}")
-        except BaseException:
-            job.request_cancel()
-            self.finish_turn()
-            raise
-        return turn_id
-
-    def _run_kb(self, job: Any, target: str, turn_id: str) -> None:
-        import client_kb
-
-        def progress(message: str) -> None:
-            self._publish({"type": "kb_progress", "sessionID": target,
-                           "kbID": turn_id, "message": message})
-
-        try:
-            outcome = job.run(progress)
-        except Exception as exc:  # noqa: BLE001 - 一個動作失敗不得帶走協調器
-            outcome = client_kb.KbOutcome.failure(
-                getattr(job, "action", None), f"{type(exc).__name__}: {exc}",
-            )
-        # 發布結果與 cancel 在同一把鎖裡決定(同 `_run_review`):之後的取消一律回 False。
-        with self._lock:
-            outcome = job.finish(outcome)
-            self._turn_done = True
-            if any(item.status in PENDING_QUEUE_STATES for item in self._queue):
-                self._queue_paused = True
-        self.finish_turn()
-        event = client_events.step_finish_event(target, reason=outcome.reason)
-        event.update(kbID=turn_id, kb_outcome=outcome.as_dict())
-        self._publish(event)
-        # 同 review:這條路不排佇列、不預熱、不壓縮。
-
     def prepare_idle(self, reason: str) -> bool:
         """接續歷史先在可取消的回合中壓縮，收尾後才交給零寫入的 prime。"""
         policy = getattr(getattr(self.engine, "options", None), "policy", None)
@@ -832,30 +730,12 @@ class TurnCoordinator:
             self._close_supplements()
             for item in result.notices:
                 self._publish(client_events.notice_event(target, item))
-            # 答後尾段:審核。協調器在答案寫定後接受的取消只阻止後續工作,答案保留。
-            audit_status = self._audit_answer(target, result)
-            with self._lock:
-                # 尾段在「決定要不要壓縮」的同一個臨界區關上:在這之前被接受的取消,壓縮
-                # 整段不做;之後的取消回到既有規則 —— 壓縮進行中由 engine 接受,還沒進
-                # turn_scope 的那一刻 engine 閒置就照實拒絕。尾段若一路開到終結事件前,
-                # 那一刻的取消會被接受卻擋不住已經越過檢查的壓縮(R1-1)。
-                self._tail_closed = True
-                tail_cancelled = self._cancelled
-            compaction_tried = False
-            if not tail_cancelled:
-                compaction_tried = True
-                outcome = self._auto_compact(target, result)
-                compacted = getattr(outcome, "status", None) == "compacted"
+            outcome = self._auto_compact(target, result)
+            compacted = getattr(outcome, "status", None) == "compacted"
             if self.cancelled:
-                # 答案已經給了,但這一輪的結果是「中斷」——cancel 回了 True,
-                # 終結事件就必須是 cancelled,不是 stop。
-                if audit_status == client_audit.STATUS_CANCELLED:
-                    stopped = "答案已完成；審核已中斷。"
-                elif compaction_tried:
-                    stopped = "答案已完成;壓縮已取消。"
-                else:
-                    stopped = "答案已完成；後續工作已中斷。"
-                self._publish(client_events.notice_event(target, stopped))
+                # 壓縮階段被取消:答案已經給了,但這一輪的結果是「中斷」——cancel 回了
+                # True,終結事件就必須是 cancelled,不是 stop。
+                self._publish(client_events.notice_event(target, "答案已完成;壓縮已取消。"))
                 self._pause_queue()
                 self._publish(
                     client_events.step_finish_event(target, reason=client_events.REASON_CANCELLED)
@@ -914,52 +794,6 @@ class TurnCoordinator:
             return
         if compacted:
             self.prime_in_background("compaction")
-
-    def _audit_answer(self, target: str, result: Any) -> str:
-        """主回答寫定之後、壓縮之前的審核(小模型)。回傳記錄的 status;沒有審核回 ""。
-
-        plan 是純函式、job 只是記憶體物件,所以「看取消 → 算 plan → 登記 job」在同一個
-        臨界區:登記之前的取消由 :meth:`cancel` 的尾段規則接住(這裡看到旗標就不審),
-        登記之後的取消導向 job(engine 還沒建就零請求)。審核失敗只影響審核卡:不改
-        回合結果、不暫停佇列。
-        """
-        if self._auditor is None:
-            return ""
-        policy = getattr(getattr(self.engine, "options", None), "policy", None)
-        policy_name = str(getattr(policy, "name", "") or "")
-        with self._lock:
-            if self._cancelled:
-                return ""
-            plan = client_audit.plan_audit(self.engine.messages, result, policy_name=policy_name)
-            if plan is None:
-                return ""
-            job = client_audit.AuditJob(self.engine, self._auditor, activity=self._publish)
-            self._audit_job = job
-        model = self._auditor.model
-        try:
-            record = job.run(plan)
-        except client_events.TurnCancelled:
-            record = client_audit.cancelled_record(plan, model=model)
-        except Exception as exc:  # noqa: BLE001 - 審核失敗不得帶走一則已寫定的答案
-            record = client_audit.error_record(
-                plan, f"審核模型呼叫失敗（{type(exc).__name__}: {exc}）", model=model,
-            )
-        finally:
-            with self._lock:
-                self._audit_job = None
-        self._publish(client_events.audit_event(target, record))
-        try:
-            stored = self.engine.record_audit(record)
-        except Exception as exc:  # noqa: BLE001 - 落檔失敗要講,不中斷
-            stored = False
-            reason = f"{type(exc).__name__}: {exc}"
-        else:
-            reason = str(getattr(self.engine, "store_error", "") or "")
-        if not stored:
-            self._publish(client_events.notice_event(
-                target, f"⚠ 審核結果沒有落檔({reason or '原因不明'});重開這段對話時看不到這張審核卡。",
-            ))
-        return str(record.get("status") or "")
 
     def _run_compaction(self, target: str) -> None:
         compacted = False

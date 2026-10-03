@@ -6,7 +6,7 @@
 
 - [聊天與工具結果](#chat)、[選取與複製](#copy)、[介面主題](#theme)、[thinking](#thinking)
 - [歷史對話](#sessions)、[排隊與補充](#queue)、[工作區審查](#review)、[執行專案內工具](#project-tools)
-- [附件](#attachments)、[知識入庫與查詢](#rag)、[知識庫指令 /kb](#kb)、[回答審核](#answer-audit)、[PDF 圖面覆核](#pdf-review)
+- [附件](#attachments)、[知識入庫與查詢](#rag)、[PDF 圖面覆核](#pdf-review)
 - [表格與 OCR](#text-table-review)、[入庫續跑](#ingest-resume)、[KB 維護](#knowledge-maintenance)
 - [行為 lessons](#lessons)、[build target](#build-context)、[記憶體配置核對](#memory-consistency)
 
@@ -20,7 +20,7 @@ aicode
 ```
 
 正常啟動對話區空白，啟動摘要、壓縮模式與全部 WARN 在 `/status`。
-健康檢查失敗會在終端報錯並拒絕進入 TUI。`/tools` 查看 20 個 MCP 工具，
+健康檢查失敗會在終端報錯並拒絕進入 TUI。`/tools` 查看 21 個 MCP 工具，
 `/help` 查看互動指令。首次直接送出問題或 `/new` 才建立 session。
 訊息裡用 `@` 夾帶檔案：`@` 後面打檔名的一部分即可搜尋整個專案，Tab 補全路徑；把檔案拖進終端機
 或貼上路徑也會自動改寫成 `@`。專案外的截圖與下載檔用 `@~/Downloads/…`（先 `/import on`），
@@ -54,7 +54,7 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 | 看 A 到 B 的呼叫鏈 | `請用 code_rag_search mode=path，query="A -> B"，只列 confirmed edge。` |
 | 看已知檔案 | `請用 file_info 看 src/main.c 大小，再用 read_file 讀前 120 行。` |
 | 查已匯入 spec | `請用 query_knowledge 查 reset timing，回答要附 REF。` |
-| 規格數字要能核對 | `請用 query_knowledge 查最大值，每個數字附 REF。`（回答下方的審核卡會核對引用） |
+| 高風險規格數字 | `請用 query_knowledge_strict 查最大值，證據不足就拒答。` |
 
 完整工具清單見 [MCP 工具清單](mcp-tools.md)。
 
@@ -395,7 +395,7 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
   的 `@` 都不算附件。
 - 回合進行中排到下一輪的訊息，在真正送出時才讀附件；「補充目前任務」不處理附件，含 `@路徑` 的
   補充會被拒絕並保留草稿，請改排到下一輪。
-- 附件只進目前對話，不會建立可反覆查詢的知識庫；要反覆查詢請用 `/kb add`（見[知識庫指令 /kb](#kb)）。
+- 附件只進目前對話，不會建立可反覆查詢的知識庫；要反覆查詢請改用下節的 `ingest_document(...)`。
 
 ### 請模型直接呼叫工具
 
@@ -415,7 +415,7 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 請用工具 analyze_file 分析 build/app.elf，view 設 "disasm"、target 設 "Reset_Handler"，解釋啟動序列。
 ```
 
-`read_file(...)` 適合文字；`analyze_file(...)` 適合圖片、PDF（一次性抽文字）、ELF、firmware binary。這些操作只把附件帶進目前對話，不會建立可長期查詢的知識庫。想讓圖片或附件之後反覆查，改用 `/kb add` 或 `ingest_document(...)`（圖片會自動走 VL 看圖再進 RAG）。
+`read_file(...)` 適合文字；`analyze_file(...)` 適合圖片、PDF（一次性抽文字）、ELF、firmware binary。這些操作只把附件帶進目前對話，不會建立可長期查詢的知識庫。想讓圖片或附件之後反覆查，改用下節的 `ingest_document(...)`（圖片會自動走 VL 看圖再進 RAG）。
 
 <a id="external-attachments"></a>
 
@@ -465,133 +465,50 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 ```
 
 更多副檔名、白名單與圖片/binary 細節見 [RAG、附件與知識庫操作](#rag)。
-如果外部 PDF / spec / 截圖圖片也要注入 RAG，直接 `/kb add @~/Downloads/spec.pdf`（先匯入、
-核准後入庫副本）；或先匯入（`@` 夾帶一次或 `import_external_file`），再把 `.aicode_uploads/...`
-路徑交給 `ingest_document`（圖片會自動走 VL）。
+如果外部 PDF / spec / 截圖圖片也要注入 RAG，先匯入（`@` 夾帶一次或 `import_external_file`），
+再把 `.aicode_uploads/...` 路徑交給 `ingest_document`（圖片會自動走 VL）；完整串接範例見
+[RAG、附件與知識庫操作](#attachments)。
 <a id="rag"></a>
 
 ## 知識入庫與查詢
 
-知識庫是專案根目錄的 `knowledge.json`：入庫把來源切成 chunks、計算向量後寫進去，之後主模型用
-`query_knowledge` 查，只有命中的少量 REF 會進入當次對話，全文不會塞進聊天 context。
-入庫後的下一次查詢會自動偵測變更；`reload_knowledge_base` 只用來立即載入並回報 chunk 數。
-
-<a id="kb"></a>
-
-### 用 `/kb` 直接入庫與覆核（建議）
-
-不必請模型代勞，在 TUI 直接輸入：
-
-```text
-/kb                    知識庫狀態：文件數、段數、待處理項目數與下一步
-/kb add <路徑>         匯入一個檔案；可寫 @路徑 用 Tab 補全，含空白寫 @"路徑"
-/kb review             覆核畫面：待覆核的圖表、需修復、抽取失敗、OCR 待確認
-/kb remove <文件>      移除一份文件（KB 中的檔名）；不給名稱就列出可移除的文件
-```
-
-- 只在閒置時可用：回合、核准、工作區審查或另一個 `/kb` 動作進行中會拒絕並說明。
-- `/kb` 的動作不建立對話、不寫聊天歷史，主模型也看不到；之後的 `query_knowledge` 會自動讀到新內容。
-- 寫入都經過與模型呼叫時相同的工具與權限：`/kb add` 走 `ingest_document`，`/kb remove` 走
-  `remove_document`（核准框），覆核的確認與修改走 `review_figures`／`review_text`（核准框，完整顯示
-  要寫入的內容）。`client.json` 的 `permission` 設為 `deny` 的工具，`/kb` 一樣不能用。
-
-`/kb add` 一次匯入一個檔案，支援下表的副檔名；輸入時補全區就會說明這一行會怎麼匯入，不支援的副檔名在呼叫任何工具前就拒絕。
-
-| 格式 | 處理方式 |
-|---|---|
-| PDF／Markdown／text | 抽文字切段；PDF 圖面另走有來源與驗證狀態的結構化抽取 |
-| PNG／JPG／JPEG／GIF／WebP | VL 分析後入庫 |
-| BIN／DAT／RAW／FW／IMG／ROM／HEX | hex、字串與 magic；遇 ELF magic 改用 ELF 解析 |
-| ELF／SO／O／AXF／OUT／KO | symbols、memmap、relocation、DWARF、strings 等多視角報告 |
-
-- 入庫期間狀態列顯示秒數與已輸出的行數；Ctrl+C 中斷入庫（server 端的入庫程序會一起收掉）。
-- 完成後對話區出現一張結果卡：`✓ 完成`、`⚠ 完成，但有待處理項目` 或 `✗ 失敗`，並寫出這份文件還有
-  幾項要到 `/kb review` 處理；展開可看完整的工具輸出。
-- 逾時（單次上限 600 秒）時，已完成的頁面與圖片保存在續跑紀錄，再執行一次同樣的 `/kb add` 會接著做；
-  結果卡也附上可在終端機執行、沒有時間上限的命令。
-- 專案外的檔案（例如 `/kb add @~/Downloads/spec.pdf`）需要先開啟外部匯入（見
-  [檔案在專案目錄外](#external-attachments)）：先跳出 `import_external_file` 核准框複製進
-  `.aicode_uploads/`，取得落點後才入庫那份副本；拒絕或取不到落點就不入庫。
-- 檔名會參與來源排序，`spec`／`datasheet`、`api`／`reference`、`manual` 等應反映文件真實用途。
-  文件身分是 basename，同名不同路徑會產生衝突，詳見 [KB 維護](#knowledge-maintenance)。
-
-`/kb review` 的使用方式見 [PDF 圖面覆核](#pdf-review)。
-
-### 查詢
-
-```text
-請用 query_knowledge 查 conv2d 輸入大小限制，每個數字附 REF。
-```
-
-多份相似 spec 可用 `source="npu_core_rev_b.md"` 精確限定 basename，篩選在 dense／BM25
-各自取候選前生效。圖片 REF 的 `origin: VL` 提醒內容是視覺辨識結果；未驗證的圖表與未確認的 OCR
-仍會出現在 REF 裡，但 REF 文字與 metadata 都標出狀態與原因（見 [六種驗證狀態](#pdf-review)）。
-與其他來源矛盾時應列出兩邊證據，不能猜一邊。主模型用過知識庫才回答時，回答下方會有一張
-[審核卡](#answer-audit)。
-
-結果 `status: partial` 不能當完整入庫或完整證據；先讀 `next:`、缺席、品質與待辦資訊。
-`chunks=0` 也不算成功取得內容，应檢查來源、VL 狀態與品質排除原因。
-
-### 請模型呼叫入庫工具（進階）
-
-`/kb add` 只用預設參數。需要 `mode`、`preflight_only`、`fresh`、MinerU 或局部重做時，請模型呼叫工具：
+`ingest_document` 把來源切成 chunks、計算向量，寫入專案根目錄的 `knowledge.json`。
+`reload_knowledge_base` 只更新 MCP 記憶體索引並回報 chunk 數；後續查詢也會自動偵測變更。
+全文不會因此塞進聊天 context，只有查詢命中的少量 REF 會進入當次對話。
 
 ```text
 請依序 ingest_document docs/npu_spec.pdf、docs/api_reference.md、docs/faq.txt，
 完成後 reload_knowledge_base，回報 chunks。
-請用 ingest_document 匯入 screenshots/chat.png，mode 設 "chat"。
+請用 query_knowledge 查 conv2d 輸入大小限制，每個數字附 REF。
 ```
+
+| 格式 | 處理方式 |
+|---|---|
+| PDF／Markdown／text | 抽文字切段；PDF 圖面另走有來源與驗證狀態的結構化抽取 |
+| PNG／JPG／JPEG／GIF／WebP | VL 分析後入庫；聊天截圖明示 `mode="chat"` |
+| BIN／DAT／RAW／FW／IMG／ROM／HEX | hex、字串與 magic；遇 ELF magic 改用 ELF 解析 |
+| ELF／SO／O／AXF／OUT／KO | symbols、memmap、relocation、DWARF、strings 等多視角報告 |
 
 圖片直接使用 `ingest_document("docs/block_diagram.png")`；不必先 `analyze_file`，兩者各自
 讀原圖，前者才保存知識庫。外部圖片先 `import_external_file`，再對回傳路徑 ingest。
-<a id="answer-audit"></a>
+圖片 REF 的 `origin: VL` 提醒內容是視覺辨識結果；與文字來源矛盾時應列出兩邊證據，不能猜一邊。
 
-## 回答審核（小模型）
+檔名會參與來源排序，`spec`／`datasheet`、`api`／`reference`、`manual` 等應反映文件真實用途。
+文件身分是 basename，同名不同路徑會產生衝突，詳見 [KB 維護](#knowledge-maintenance)。
 
-主模型這一輪用過 `query_knowledge` 或 `query_table`、而且答完之後，審核模型（設定精靈第 2 題選的
-小模型）會把回答裡**依賴知識庫的陳述**（規格數值、限制、名稱、行為、步驟）逐條拿去對照**這一輪
-查到、主模型看過的證據**，結果以一張「審核」卡顯示在回答下方。程式碼位置、一般建議與推測不在審核範圍；
-「出自哪份文件或第幾頁、圖表編號、版本、驗證狀態、REF 編號」這類出處說明也不列成陳述，由程式依證據標示。
+### 嚴格查詢與限定來源
 
-審核期間狀態列顯示「審核中（小模型）」。卡片標題就是結論，展開可看每一項的依據（證據編號、來源頁碼與引用原文）：
+```text
+請用 query_knowledge_strict 查 reset assert 最小持續時間，證據不足就拒答。
+```
 
-| 卡片 | 意思 | 你可以做什麼 |
-|---|---|---|
-| `審核 ✔ n 項陳述都有知識庫證據` | 每一項都有逐字落在證據裡的引用 | 照常使用，仍以原文件為準 |
-| `審核 ⚠ k 項只有待覆核的圖表／OCR 支持（/kb review）` | 依據是尚未驗證的圖表或未確認的 OCR | 用 `/kb review` 對照原圖確認後再問一次 |
-| `審核 ⚠ k/n 項找不到知識庫證據` | 這幾項在本回合的證據裡找不到，或引用不在證據中 | 請模型補查證據，或當成推測 |
-| `審核 ✘ k 項與知識庫證據矛盾` | 證據明確說的是別的值 | 展開看矛盾的原文 |
-| `審核 ？…未送審或無法核對` | 證據太長沒有全部送審，或工具輸出被截斷、無法核對位置 | 縮小問題範圍再問 |
-| `審核：回答裡沒有需要核對的知識庫陳述` | 回答沒有依賴知識庫的事實陳述 | — |
-| `審核未完成：原因` | 審核模型連不上、逾時、輸出格式錯誤或 context 不夠 | 回答本身已保留；檢查審核模型服務 |
-| `審核已中斷（回答保留）` | 審核中按了 Ctrl+C | — |
+strict 會檢查證據與回答的 REF 支持；明示 strict 後不因中英文題型分類退回一般模式。
+未確認 OCR 出現在 `excluded_text`，未驗證圖面出現在 `excluded_figures`，不能拿來回答數值。
+多份相似 spec 可用 `source="npu_core_rev_b.md"` 精確限定 basename，篩選在 dense／BM25
+各自取候選前生效。一般版與嚴格版都支援。
 
-標題以最差的一類開頭，其他類別依序接在後面，例如「審核 ⚠ 1/4 項找不到知識庫證據、3 項只有待覆核的
-圖表／OCR 支持（/kb review）」；只要有待覆核的項目，標題一定帶 `/kb review`。
-
-判定在程式層，不只信小模型：
-
-- 每一項「有證據」或「矛盾」都必須附上引用，而且引用要逐字落在它所引的那一段證據內（只忽略空白與
-  換行差異；`10² ms` 與 `102 ms` 視為不同）。引用不在證據中就不算有證據。
-- 只靠待覆核圖表或未確認 OCR 支持的陳述，最多是 ⚠，不會是 ✔。
-- 有證據因為太長沒有送審、或工具輸出被截斷而無法核對時，整張卡不會給 ✔。
-- 審核模型的輸出格式錯誤或被截斷時，卡片顯示「審核未完成」，不會當成沒有問題。
-
-使用上要知道：
-
-- 審核卡只給你看，**不會送回主模型**，也不進模型歷史；要模型修正請直接說明哪一點。用 `/session`
-  接回對話時，審核卡會照原順序重播。
-- 審核是核對過引用的提示，**不是證明回答完整正確**：一次最多核對 12 項，可能漏列；引用存在也不等於
-  語意完全支持。只核對本回合查到的證據，前幾輪查到的不算。
-- 審核中按 Ctrl+C 只中斷審核，回答保留，畫面顯示「答案已完成；審核已中斷。」，待送的排隊訊息會暫停，
-  用 `/queue resume` 繼續。審核失敗不影響這一輪的結果，也不暫停排隊。
-- 只有互動的 `aicode` 會審核；`/status` 的「審核模型=」一行列出模型、端點與 n_ctx。
-
-調度：審核模型是獨立的 llama-server（預設 8084、單 slot），有自己的鎖，不佔主模型的鎖，也不會洗掉
-主模型的 prompt cache。審核只在主模型答完之後、同一回合內執行；審核期間這一輪仍算進行中，新輸入照常
-可選「排到下一輪」或「補充目前任務」。沒用到知識庫的回合不審核、沒有額外成本。啟動順序是
-main → embedding → reranker → 審核模型 → VL，VL 最後依剩餘 VRAM 自動 offload；審核模型實際放不放得下
-以 `~/start.sh` 的啟動結果為準。
+結果 `status: partial` 不能當完整入庫或完整證據；先讀 `next:`、缺席、品質與待辦資訊。
+`chunks=0` 也不算成功取得內容，应檢查來源、VL 狀態與品質排除原因。
 <a id="pdf-review"></a>
 
 ## PDF 圖面抽取與人工覆核
@@ -614,13 +531,13 @@ table／terminal 沒抽到內容會回退為 `prose` 逐行轉錄，不以 diagr
 
 | 情況 | 收哪些 | 拿得到什麼 |
 |---|---|---|
-| **結構化 lane 收錄** | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON、逐格/逐行證據、`▯`、驗證狀態，且可用 `/kb review` 覆核 |
+| **結構化 lane 收錄** | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate，且可用 `review_figures` 覆核 |
 | **判定不是圖面** | 封面、logo、商標、裝飾線條、產品照片、單純的 GUI 圖示 | 零 VL 抽取、不產生 figure chunk；判定紀錄留在 review artifact 與 ingest 的缺席清單，原生正文由文字 lane 處理 |
 | **lane 沒收** | 沒有結構性證據的區域、超出上限被丟掉的候選、整頁 abstain 的頁 | **未收為 structured figure**；不代表原生正文缺席。ingest 列出頁碼、bbox、原因及文字通道狀態；需核對來源時用 `analyze_file(path="原本的PDF路徑")` |
 
 掃描版 datasheet 的表格與手機拍的終端機畫面現在會成為 structured figure；因為通常沒有
-獨立原生證據，狀態仍多半是 `unverified` / `needs_review`：查詢照樣回得到，但 REF 標為待覆核，
-回答審核也只給 ⚠，直到你用 `/kb review` 對原圖確認。整頁散文走 `prose`（逐行轉錄），`diagram` 也有自動分類與 structured producer。
+獨立原生證據，狀態仍多半是 `unverified` / `needs_review`，`query_knowledge_strict` 會擋下，
+直到人工對原圖確認。整頁散文走 `prose`（逐行轉錄），`diagram` 也有自動分類與 structured producer。
 
 figure chunk 會帶所在章節與 caption（`Table 3-1 …` / `圖 2-4 …`）。兩者**只當檢索訊號**
 （embedding + BM25 + REF 上一行標示），不進 canonical payload——它們來自鄰近的文字層，
@@ -633,7 +550,7 @@ figure chunk 會帶所在章節與 caption（`Table 3-1 …` / `圖 2-4 …`）�
 內容品質另由 `quality_grade` 表示：`usable`（未發現缺陷且有驗證證據）、`formatting_only`
 （已證明僅排版差異）、`partial`（部分可用）、`structure_error`（重要結構錯誤）、`unusable`
 （無可用內容）、`unknown`（不足以判斷）。`review_state=confirmed` 只來自綁定目前 revision 的
-合法原圖確認紀錄，其他為 `unreviewed`。這兩個欄位不改變下表的可信邊界。
+合法原圖確認紀錄，其他為 `unreviewed`。這兩個欄位不改變下表的 strict 查詢信任邊界。
 
 `auto_disposition` 決定後續處理：`accept`、`manual_review`、`repair_required` 或 `excluded`。
 已知缺字、conflict 與缺行列為需修復；重要結構錯誤／全不可讀的 figure 不入庫，原生文字及完整
@@ -641,7 +558,7 @@ artifacts 保留。部分可用內容保留遮罩與原因，不能猜補缺字�
 已由可靠來源證明轉錄缺漏的 revision（`transcription_source_incomplete`）會標 `fixable=False`，
 須重新 ingest 核對來源；現有 fix 不保留完整來源，任意補字或原樣確認都不能證明已補齊。
 
-| 狀態 | 意思 | 審核時算不算可信證據 |
+| 狀態 | 意思 | strict 查詢用不用 |
 |---|---|---|
 | `native_verified` | 原生表格 geometry 與**至少另一個原生** evidence channel 在 row/cell 結構與 critical token 上一致（單次 `find_tables().extract()` 不算） | ✔ |
 | `corroborated` | 視覺抽取與獨立 PDF 文字/幾何證據**逐格或逐行**一致。terminal 的比對走空白正規化,所以**不等於**逐位元組一致（PDF 文字層證明不了 tab 還是多個 space） | ✔ |
@@ -650,16 +567,18 @@ artifacts 保留。部分可用內容保留遮罩與原因，不能猜補缺字�
 | `unverified` | 結構合法、未發現衝突,但沒有獨立證據（無 anchor 的同模型多次取樣即使全等也只到這級） | ✘ |
 | `legacy_unverified` | 舊 KB 缺欄位的 figure chunk,含所有既有 VL 圖片 / 截圖 / diagram chunk | ✘ |
 
-後三種合稱 **flagged**,那是查詢與審核時的標示,不是第七種狀態。一張圖切成多個 chunk 時,聚合
+後三種合稱 **flagged**,那是查詢時的 filter,不是第七種狀態。一張圖切成多個 chunk 時,聚合
 一律取**最差**的成員狀態(不會被第一個成員蓋掉)。
 
 ### 查詢端會怎麼表現
 
-- `query_knowledge`:會回未驗證內容,但 REF 文字與 metadata 都帶狀態、原因與實際的 row/line 範圍;
-  因預算截斷時會明說「未完整顯示」,不讓你以為整張 log 都在。flagged 的圖面與未確認的 OCR
-  不算權威來源(不撐起 spec 類的信心),來源排序也降權。
-- [回答審核](#answer-audit):只靠 flagged 證據支持的陳述最多是 ⚠「只有待覆核的圖表／OCR 支持」,
-  不會是 ✔。這是程式依 refs 的狀態判定,不靠審核模型自己判斷。
+- `query_knowledge_strict`:flagged 的圖片內容在 **code 層**就被擋掉,不進 REF、也不參與門檻
+  計算。被擋下的會出現在回傳的 `excluded_figures`(source / page / figure_id / figure_index /
+  kind / 狀態 / 原因)與 `review_hint`,而且**四條回傳路徑都有**(KB 未載入、證據太弱拒答、
+  不走嚴格模式、正常回答)。所以就算全部候選都被擋,你仍看得到「哪一頁、哪一張圖可用但待覆核」,
+  不會變成「查不到」的假象。
+- `query_knowledge`:會回未驗證內容,但 REF 與 metadata 都帶狀態、原因與實際的 row/line 範圍;
+  因預算截斷時會明說「未完整顯示」,不讓你以為整張 log 都在。
 
 ### 圖多的 PDF:先跑 preflight(零寫入)
 
@@ -714,8 +633,8 @@ capability probe:端點真的吃 image content part、
 `[CODETRAIL_ACTION_REQUIRED]` 那一段最多分五類,每類最多列 5 筆(超出會註明還有幾筆),
 而且每類都直接給下一步:
 
-- **待覆核**(原圖可讀) → 用 `/kb review` 看原因、對照原圖後確認或修改(結果文字裡的
-  `review_figures(action="list", document_id=...)` 與 `action="fix"` 是給模型的等價呼叫)。
+- **待覆核**(原圖可讀) → `review_figures(action="list", document_id=...)` 看原因,對照原圖後
+  `action="fix"`。
 - **需修復／品質排除**（缺字、衝突、缺行、結構錯誤）→ 修復內容或重新 ingest；不能只確認為正確。
 - **無法覆核**(payload / 原圖讀不到,例如 review artifact 被清掉) → 就地修不了,
   `remove_document(...)` 後重新 ingest。
@@ -730,44 +649,7 @@ capability probe:端點真的吃 image content part、
 罐頭提示等於沒有提示:你會學會跳過它,真的有待覆核時也一起跳過。同理,這一段只算**這一次**
 的 run——artifacts 裡上一次 run 留下的失敗不會被重報一次。
 
-### 人工覆核：`/kb review`
-
-```text
-/kb review
-```
-
-清單依類別列出要人處理的項目（`/kb` 的狀態也會算出各類數量）：
-
-| 類別 | 哪些會列出 |
-|---|---|
-| 圖表待覆核 | 已入庫、狀態屬 flagged（`needs_review`／`unverified`／`legacy_unverified`）或處置為 `manual_review` 的圖表 |
-| 需修復 | 處置為 `repair_required`（缺字、衝突、缺行） |
-| 抽取失敗 | 每份文件最新一次入庫裡抽取失敗的圖，包含整份零寫入、文件目前不在知識庫的情況 |
-| OCR 待確認 | MinerU 正文中還沒有有效人工確認的段落 |
-| 品質排除 | 結構錯誤或全不可讀而沒有入庫的圖（只顯示原因） |
-| 讀取錯誤 | review artifacts 讀不到或被改動 |
-
-已被較新一次入庫取代的舊紀錄不列出。清單在背景讀取，不跳核准框、不寫入任何檔案。
-
-選一項按 Enter 看明細：來源檔與頁碼、bbox、類型、狀態與原因、**原圖的完整路徑**（標出是實際送給模型的
-圖，還是只為覆核 render 的圖），以及抽出的內容（表格逐列、終端畫面逐行，其餘顯示 canonical JSON）。
-終端機不能顯示圖片：請打開原圖或原 PDF 的那一頁對照；用 SSH 連線時可先把圖片 `scp` 回本機再看。
-
-| 按鍵 | 動作 |
-|---|---|
-| `y` 對照原圖無誤，確認 | 送出 `review_figures(action="fix", …, confirm_against_image=True)`，`payload_json` 就是畫面上那份內容、`expected_revision` 是畫面上的版本；先跳核准框顯示完整參數 |
-| `e` 修改 | 開編輯畫面（Ctrl+S 送出、Esc 取消）；送出前先檢查 JSON 格式、不得有重複 key、類型不能改，之後同樣經核准框以 `confirm_against_image=True` 送出 |
-| `r` 重試失敗的圖 | 對抽取失敗的項目呼叫 `ingest_document(path=…, retry_failed=True)`；沒有可續跑的紀錄時照原文顯示錯誤，可改用 `/kb add` 重新匯入 |
-| Esc | 回到清單 |
-
-- 內容還有看不清的字（`▯`）時不能直接確認，要先按 `e` 把它們換成原圖上的字。
-- 已知來源不完整（`fixable=False`）或沒有進知識庫的圖不能就地確認；照畫面說明重試或重新匯入。
-- OCR 段落：`y` 送出 `review_text(action="confirm", …, confirm_against_source=True)`（綁定畫面上的版本與雜湊）；
-  `e` 送出 `review_text(action="correct", …)` 校字，校字不等於確認，完成後再按 `y`。
-- 寫入完成後清單自動重讀；revision 已被別人改過會回 conflict、零寫入，重新整理後再確認。
-- 寫入進行中 Ctrl+C 中斷該動作；核准框按 Esc 只拒絕那一次寫入。
-
-### 請模型代為覆核（進階）
+### 人工覆核:list → 改 → fix
 
 ```text
 請用工具 review_figures,action 設 "list",列出目前待覆核的圖,說明每一張的原因。
@@ -872,11 +754,11 @@ review_text(action="revoke", text_id="text_<24-hex>", expected_revision=3,
 
 寫入會在鎖外準備必要的 chunk／gate／section 向量，核對實際 embedding 模型身分，再於 KB exclusive lock 內比對整份快照和 revision。競態會回 `conflict`，不覆蓋他人更新。JSON／NPZ 仍使用現有原子 store，校字不沿用舊文字的向量。
 
-### 重灌、續跑與 OCR 確認狀態
+### 重灌、續跑與嚴格查詢
 
 同一來源 re-ingest／resume／局部 redo 僅在 PDF SHA256、content_list SHA256、穩定段落位置及原始 OCR SHA256 全部一致時，沿用目前 KB 的校字 overlay 與確認。checkpoint 的舊覆核不是權威來源；提交前還會比對 ingest 開始時的文字 revision 基線，拒絕覆蓋稍後的校字、確認或撤銷。同一 `text_id` 的來源變更會增加版本並列待覆核。
 
-OCR 段落算不算已確認（REF 標 `text_verification_status=human_verified`）共用同一 eligibility 判斷：正文內容、確認版本、目前來源及品質都有效才算；section 展開中的每個成員仍各自判斷，未確認鄰段不會隨已確認段落一起變成已確認。OCR 段落保留獨立單位，標題前綴只影響召回，不提升 gate 分數。REF 帶 `text_id`、`text_revision`、`text_content_sha256`，可直接定位覆核；只靠未確認 OCR 支持的陳述在[審核卡](#answer-audit)上是 ⚠。
+嚴格查詢共用同一 eligibility 判斷：正文內容、確認版本、目前來源及品質都有效才可入選；section 展開中的每個成員仍各自通過，未確認鄰段不會隨已確認段落合併入選。OCR 段落保留獨立單位，標題前綴只影響召回，不提升 gate 分數。回傳 REF 與 `excluded_text` 帶 `text_id`、`text_revision`、`text_content_sha256`，可直接定位覆核。
 
 此功能只覆核已有 MinerU 正文，沒有宣稱整份 PDF 已完成 OCR。缺頁及 figure 品質仍由原本 ingest／figure 報告列出。校字上限 128 KiB；KB metadata 讀取上限 128 MiB，來源 hash 上限 1 GiB。路徑須在專案根內；根目錄與檔案須由目前使用者擁有，metadata／來源仍拒絕 symlink、hardlink 與非普通檔。既有專案 0775、來源／knowledge.json／store lock 0664 是合法模式，唯讀工具不修改其權限。新建 store lock 與原子發布的 knowledge.json 為 0600；其他 CodeTrail 私有 state 仍依各自的 0600／0700 防線，不因來源讀取相容性而放寬。寫入依賴 POSIX flock／dir-fd／nofollow 與 Linux `/proc/self/fd`，安全能力不足直接拒絕。
 <a id="ingest-resume"></a>
@@ -919,19 +801,18 @@ figure retention 不清這個目錄，`fresh` 也不刪它。未引用的舊產�
 
 ## 知識庫更新、備份與清除
 
-文件改版時把舊版刪掉再加新的（同一個檔改過內容，直接再 `/kb add` 一次就是更新）：
-
-```text
-/kb remove old_spec.pdf
-/kb add @docs/new_spec.pdf
-```
-
-想看目前知識庫有多少內容，輸入 `/kb`。也可以請模型呼叫工具：
+文件改版時把舊版刪掉再加新的：
 
 ```text
 請用工具 remove_document 移除 old_spec.pdf，
 完成後 ingest_document docs/new_spec.pdf，
-最後 reload_knowledge_base，回報目前載入幾個 chunks。
+最後 reload_knowledge_base。
+```
+
+想看目前知識庫有多少內容：
+
+```text
+請用工具 reload_knowledge_base，回報目前載入幾個 chunks。
 ```
 
 想「整個重來，只留這一份」不用先 remove 再 ingest，一步就好：

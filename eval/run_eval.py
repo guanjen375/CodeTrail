@@ -46,7 +46,7 @@ from config import KNOWLEDGE_FILE
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent import run_agent
-from utils import call_llm, extract_evidence_mapping
+from utils import call_llm, answer_with_self_check, extract_evidence_mapping
 from scripts.check_eval_consistency import find_symbol_line
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -313,7 +313,7 @@ def load_eval_cases(eval_dir: Path, include_sets: list = None) -> dict[str, list
     return cases
 
 
-def eval_spec_question(case: EvalCase, kb: KnowledgeBase) -> EvalResult:
+def eval_spec_question(case: EvalCase, kb: KnowledgeBase, use_strict_mode: bool = True) -> EvalResult:
     """評測 Spec 類問題
 
     三層化評測指標（P0-Eval 改進）：
@@ -325,14 +325,18 @@ def eval_spec_question(case: EvalCase, kb: KnowledgeBase) -> EvalResult:
     - has_ref: 回答中是否有 REF 引用
     - ref_correct: 引用的 REF 是否與期望相符
     - keywords_found: 是否包含期望關鍵字
+    - strict_mode_used: 是否使用嚴格模式（兩階段自我檢查）
 
-    回答由主模型依 KB 證據直接生成（與 query_knowledge 回給聊天模型的同一份 REF）；
-    已移除的 strict 兩階段自我檢查不再參與評測。
+    改進說明：
+        現在使用與實際 CLI 相同的嚴格模式 pipeline，
+        包含兩階段自我檢查，確保評測結果與實際使用一致。
     """
     start_time = time.time()
 
     # 查詢知識庫
-    knowledge_ctx, _, kb_metadata = kb.query(case.question)
+    knowledge_ctx, _, kb_metadata = kb.query(
+        case.question, is_strict_mode=use_strict_mode
+    )
 
     # 取得檢索到的 chunk 內容（用於 Layer 1）
     retrieved_chunks = kb_metadata.get('retrieved_chunks', [])
@@ -340,15 +344,27 @@ def eval_spec_question(case: EvalCase, kb: KnowledgeBase) -> EvalResult:
         # 向後相容：若沒有 retrieved_chunks，將整個 context 作為單一 chunk
         retrieved_chunks = [knowledge_ctx]
 
-    prompt = f"""請根據以下參考資料回答問題。每個論述都必須標註 REF 編號。
+    # 使用嚴格模式 pipeline（與實際 CLI 相同）
+    if use_strict_mode and knowledge_ctx:
+        # 使用 answer_with_self_check 進行兩階段回答
+        base_ctx = ""  # spec 題不需要 code context
+        answer = answer_with_self_check(case.question, base_ctx, knowledge_ctx)
+        details = {
+            'strict_mode_used': True,
+        }
+    else:
+        # 備援：簡單 LLM 呼叫
+        prompt = f"""請根據以下參考資料回答問題。每個論述都必須標註 REF 編號。
 
 {knowledge_ctx}
 
 問題：{case.question}
 
 請直接回答，若資料不足請說明。"""
-    answer = call_llm(prompt, temperature=0.0)
-    details = {}
+        answer = call_llm(prompt, temperature=0.0)
+        details = {
+            'strict_mode_used': False,
+        }
 
     time_taken = time.time() - start_time
 
@@ -905,7 +921,7 @@ def run_evaluation(
 
                 try:
                     if case_type == 'spec' and kb:
-                        result = eval_spec_question(case, kb)
+                        result = eval_spec_question(case, kb, use_strict_mode=True)
                     elif case_type == 'code' and code_rag:
                         result = eval_code_question(case, code_rag, project_folder)
                     elif case_type == 'bug' and project_folder:

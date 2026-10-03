@@ -247,8 +247,6 @@ def test_the_transcript_keeps_stderr_warnings(monkeypatch, tmp_path):
 
     monkeypatch.setattr(client_preflight, "check_tool_health", fake_tool_health)
     monkeypatch.setattr(client_preflight, "check_required_servers", lambda result: None)
-    # 審核模型的檢查由 tests/test_client_audit.py 守;這裡只驗 transcript 的交接。
-    monkeypatch.setattr(client_preflight, "check_auditor", lambda result, profile: None)
     monkeypatch.setattr(client_preflight, "check_ctx_safety", lambda *a: None)
     monkeypatch.setattr(client_preflight, "observe_n_ctx", lambda result, profile: 4096)
 
@@ -274,7 +272,6 @@ def test_the_transcript_carries_the_compaction_status(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(client_preflight, "check_required_servers", lambda result: None)
-    monkeypatch.setattr(client_preflight, "check_auditor", lambda result, profile: None)
     monkeypatch.setattr(client_preflight, "check_ctx_safety", lambda *a: None)
     monkeypatch.setattr(client_preflight, "observe_n_ctx", lambda result, profile: 4096)
 
@@ -354,7 +351,6 @@ def test_the_banner_keeps_stderr_warnings_and_compaction_status_but_drops_the_pr
         print("[tool-health] WARNING — 快取寫入失敗", file=sys.stderr, flush=True)
 
     monkeypatch.setattr(client_preflight, "check_required_servers", fake_required)
-    monkeypatch.setattr(client_preflight, "check_auditor", lambda result, profile: None)
     monkeypatch.setattr(client_preflight, "check_tool_health", fake_tool_health)
 
     result = client_preflight.run(root)

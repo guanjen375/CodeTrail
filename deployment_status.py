@@ -11,14 +11,7 @@ from urllib.error import URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
 import process_env
-from deployment_profile import (
-    DeploymentProfile,
-    ProfileError,
-    ServiceProfile,
-    auditor_unconfigured_reason,
-    resolve_model_reference,
-    service_unconfigured,
-)
+from deployment_profile import DeploymentProfile, ProfileError, ServiceProfile, resolve_model_reference
 
 
 @dataclass(frozen=True)
@@ -311,13 +304,6 @@ def inspect_deployment(
         warnings = []
         from model_identity import capture_model_identity, ModelIdentityError
         for role, service in profile.services.items():
-            if service_unconfigured(service):
-                # 沒有端點:不探測(空字串 URL 連 policy 都過不了),直接列修法。
-                observations[role] = ServiceObservation(
-                    role=role, pid=None, gpu_uuids=(), model="", mmproj="", n_ctx=None,
-                    health="not-configured", port=service.port, cmdline=())
-                issues.append(f"{role}: {auditor_unconfigured_reason(profile)}")
-                continue
             health, props = server_reader(service) if server_reader else (None, None)
             status = str((health or {}).get("status", "unreachable")) if server_reader else "not-checked"
             observations[role] = ServiceObservation(
@@ -361,12 +347,6 @@ def inspect_deployment(
     issues: list[str] = []
     warnings: list[str] = []
     for role, service in profile.services.items():
-        if service_unconfigured(service):
-            observations[role] = ServiceObservation(
-                role=role, pid=None, gpu_uuids=(), model="", mmproj="", n_ctx=None,
-                health="not-configured", port=service.port, cmdline=())
-            issues.append(f"{role}: {auditor_unconfigured_reason(profile)}")
-            continue
         role_candidates = candidates.get(role, [])
         if len(role_candidates) > 1:
             issues.append(f"{role}: multiple llama-server PIDs match port {service.port}")
@@ -424,7 +404,7 @@ def inspect_deployment(
                 )
         try:
             expected_model = resolve_model_reference(
-                service.model, registry_file=profile.registry_file, role=role
+                service.model, registry_file=profile.registry_file
             )
         except ProfileError as exc:
             issues.append(f"{role}: expected model cannot be resolved: {exc}")

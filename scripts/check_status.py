@@ -14,14 +14,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from deployment_profile import (  # noqa: E402
-    ROLES,
     ProfileError,
     ServiceProfile,
     add_loader_arguments,
-    auditor_unconfigured_reason,
     load_effective_profile,
     loader_kwargs,
-    service_unconfigured,
 )
 from deployment_status import (  # noqa: E402
     Inspection,
@@ -47,8 +44,8 @@ def _snapshot_readers(path: Path) -> tuple[
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ProfileError(f"invalid --snapshot {path}: {exc}") from exc
-    if not isinstance(data, dict) or set(data) - set(ROLES):
-        raise ProfileError("--snapshot must contain only main/embedding/reranker/vl/auditor objects")
+    if not isinstance(data, dict) or set(data) - {"main", "embedding", "reranker", "vl"}:
+        raise ProfileError("--snapshot must contain only main/embedding/reranker/vl objects")
 
     def item_for(service: ServiceProfile):
         item = data.get(service.role) or {}
@@ -92,10 +89,8 @@ def _render(inspection: Inspection, expected_count: int) -> None:
         )
 
     recognized = sum(1 for observation in inspection.observations.values() if observation.pid is not None)
-    for role in ROLES:
-        observation = inspection.observations.get(role)
-        if observation is None:
-            continue
+    for role in ("main", "embedding", "reranker", "vl"):
+        observation = inspection.observations[role]
         gpu = ",".join(observation.gpu_uuids) or "unknown"
         model = Path(observation.model).name if observation.model else "unknown"
         print(
@@ -122,13 +117,13 @@ def _render(inspection: Inspection, expected_count: int) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Identify and verify main/embedding/reranker/VL/auditor llama-server processes"
+        description="Identify and verify main/embedding/reranker/VL llama-server processes"
     )
     parser.add_argument("--strict", action="store_true", help="fail on missing, unhealthy, wrong-GPU, or wrong-model roles")
     parser.add_argument("--no-network", action="store_true", help="skip /health, /props and /slots requests")
     parser.add_argument(
-        "--expected", type=_positive_int, default=len(ROLES),
-        help=f"預期至少有幾個不同的 llama-server PID(預設 {len(ROLES)} = 每個 role 一個)",
+        "--expected", type=_positive_int, default=4,
+        help="預期至少有幾個不同的 llama-server PID(預設 4 = 四個 role)",
     )
     # 隱藏旗標:契約測試用來把 /proc 與 /health 換成 fixture,不碰真實機器。
     parser.add_argument("--proc-root", help=argparse.SUPPRESS)
@@ -144,8 +139,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             from deployment_status import query_server, query_slots
             client_config.apply_to_config(client_config.load_client_settings(), readonly=True)
             for role, service in profile.services.items():
-                if service_unconfigured(service):
-                    continue  # 沒有端點可授權;inspect_deployment 會列成 issue
                 endpoint_policy.ensure_allowed(service.base_url, role, split=True)
             snapshots = {}
             source, slots_reader = (_snapshot_readers(Path(args.snapshot)) if args.snapshot

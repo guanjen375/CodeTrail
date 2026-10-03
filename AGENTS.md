@@ -116,7 +116,7 @@
   不得終止原聊天 MCP 或在取消後發下一個模型請求。
 - `client_policy` 的兩個 policy——readonly 的判準是 `tools/list` 的 `readOnlyHint`
   (**只有 JSON true 才算唯讀**;`bool("false")` 是 True),不是寫死名單,所以漏加名單的
-  新工具一樣被 deny;互動模式的八個 ask 工具沒核准就不得執行,核准框**完整顯示參數**
+  新工具一樣被 deny;互動模式的六個 ask 工具沒核准就不得執行,核准框**完整顯示參數**
   (含整份 patch),重問有上限。readonly session 另有第二層:MCP server 以
   **argv** 的 `--readonly` 起(以前是四個環境變數),寫入 / 執行 / build 命令與
   context metrics 一次全關,而且 `client.json` 把 `build_commands` 開起來也翻不回來
@@ -199,21 +199,6 @@
   `prime_in_background` 不取回合鎖、不動 `_turn_done` / `_cancelled`,取消對預熱是 no-op;
   每一次預熱的 outcome 經 `on_prime(reason, outcome)` 回到 TUI,不分誰排的(含壓縮後協調器
   自己排的那一次),先 `on_prime` 再 `on_done`
-- `client_audit` 的回答審核——只在互動 TUI、`finish=stop` 的完成回答、且本回合有 completed 的
-  `query_knowledge`／`query_table` 結果時執行；headless／readonly／eval／replay／`/review` 不審核。
-  證據只取模型看過的 tool text lane，且每段以 refs 的 `content_sha256`／`content_chars` 對位，
-  對不上不當證據；flagged 只由程式依 `verification_status`／`text_verification_status` 判定（集合與
-  `knowledge.FLAGGED_VERIFICATION` 同一份），structured 不送審核模型。審核模型有自己的 endpoint、
-  live n_ctx 與鎖（不得用主模型鎖），精確計數＋gate，送出 max_tokens 與保留額同一個數字
-  （`config.AUDITOR_MAX_OUTPUT_TOKENS`），thinking 兩鍵 false，不寫 context metrics；不可用時不得跳過
-  審核或改由主模型代審。supported／contradicted 必須有逐字（只做空白正規化）落在所引證據內容區的引用；
-  只靠 flagged 證據支持的陳述是待覆核；格式錯誤、截斷、證據未送審或未能核對都不得顯示為通過。
-  審核記錄 `answer_audit` 只 append 到 session 檔，不進 `engine.messages`、payload、預熱 prefix、
-  壓縮錨點與節錄；`load_session` 只放進 transcript 並照原順序重播，壞記錄顯示無法讀取。
-  主回答寫定後到決定是否壓縮之前的 Ctrl-C 由協調器接受並阻止後續審核與壓縮（尾段在決定壓縮的
-  同一個臨界區關上，之後回到壓縮既有的取消規則，不得接受卻擋不住），答案保留、notice 先於
-  `step_finish(cancelled)`、佇列暫停、之後零審核請求；審核失敗不改回合結果。審核是核對過引用的
-  提示，不是證明。
 - `client_app`(TUI)的畫面契約——核准框**完整且可捲動**顯示 `ApprovalRequest.render()`
   (含整份 patch),截斷過的核准等於沒有核准;框內 Esc / 拒絕只拒絕**這一個工具**(回合
   繼續),Ctrl-C 中斷**整輪**(核准框開著時也一樣);沒有 tty 一律拒絕並指向 headless
@@ -268,15 +253,6 @@
   貼上由 `PromptInput._on_paste` 一律 `prevent_default` 後自己插入一次：整段只有路徑（最多 5 段）時
   以純字串改寫成 `@` 語法，插入點前全空白且第一個 token 是已註冊斜線指令就原樣貼上。
   headless `run` 用同一套解析，session replay 的客戶端身分含 `client_attachments.py`。
-- `/kb` 的讀取與寫入——只在閒置時可用（回合、核准、審查、另一個 /kb 動作進行中拒絕），不建立
-  session、不寫聊天歷史與 session 檔。清單與明細只用 `evidence_store`／`figure_review`／`text_review`
-  的唯讀核心在背景 worker 讀取（零寫入、UI 執行緒零 FS、錯誤原樣顯示，包含首次整份零寫入的失敗項與
-  掃描錯誤）。所有寫入一律經 `Engine.run_tool_once` → `_run_one_tool`：allowlist、readonly 只認 JSON
-  true、policy 與 permission 覆寫、ASK 核准框完整參數、`NEVER_AUTO_ALLOWED`、begin_call 取消；
-  `confirm_against_image`／`confirm_against_source` 只在使用者於明細按確認時為 True，送出的內容就是
-  畫面確認的那一份。`/kb add` 沿用 `client_attachments.resolve` 的零 FS 字串層拒絕與 nofollow 驗證，
-  專案外檔案只在 import 完成並取得 `.aicode_uploads/` 落點後才 ingest；`client_kb.INGEST_EXTENSIONS`
-  與 server 的 ingest 支援集合由 smoke 契約釘成一致。
 - `/theme`——只接受 `client_config.THEME_VALUES` 明列的主題，`client_theme.THEMES` 必須與它
   同一份名單（模組載入時 fail-loud）。呼叫時重讀 owner-only client.json，只更新 theme，
   不覆蓋其他剛保存的鍵；保存成功才套用，失敗 UI 與舊主題不變；選單預覽不寫檔，
@@ -296,10 +272,7 @@
   剝除;GPU 只由 `build_server_command` 那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 前綴
   重新輸出)。pane 環境 = tmux server 全域環境 + session 環境,launcher 管不到既有 daemon,
   所以邊界只能放在 pane 內真正 exec 的那一步;放寬它就是「使用者以為在跑 A、實際在跑 B」
-  而且完全無聲。審核模型（auditor）屬 aux、在 `codetrail-rag`，`--scope aux|all` 一律在 VL
-  之前啟動（VL 的 `--fit` 依已啟動服務的占用決定層數）；本機 `auditor.model` 為 null 或 B 的
-  舊四角色檔都必須能載入，使用前（launcher 在啟動任何服務前、aicode preflight、doctor）以
-  `auditor_unconfigured_reason` 的單一訊息 fail-loud
+  而且完全無聲
 - DSpark 推測解碼——本機 `set_config` 主模型精靈同交易設定，附加入口保留獨立調整，
   都只管理 main；最後明示答案是唯一權威，舊配對只作相同 resolved 主模型的 keep 候選；
   非互動未指定為 off，主模型最終配對定案後才算 host alias。省略／null 為 off，啟用時
@@ -326,7 +299,7 @@
   不重解析舊 PDF；title + 全文分窗涵蓋長節尾巴，同 NPZ 的 schema／model／generation／
   逐節身分／全文與成員 hash 全驗，缺失或重建失敗不得沿用。figure 只當展開成員，
   修圖不改節點文字向量；新向量在 store lock 外準備。`knowledge` 展開全節後去重，
-  每個 chunk 的 section RRF 項只加一次，node 分數只能召回，不能進 gate／
+  每個 chunk 的 section RRF 項只加一次，node 分數只能召回，不能進 gate／strict／
   決策門檻；所有通過各自 gate 的成員都進本地 reranker，不在評分前截掉長節尾巴。
 - `mineru_lane` 的來源與 owner——成對的本地 content_list + 生成時 PDF SHA-256，
   兩檔 sandbox／dir-fd／O_NOFOLLOW／有界普通檔讀，解析與提交前重驗；明示壞產物
@@ -334,8 +307,7 @@
   以 page+bbox 配對，不能套 native raw offset。文字／code／terminal 只收一份；
   表格只用唯一已收錄的 structured owner，缺失／歧義不得靜默吞內容。code 與樹狀
   文字逐字保留，原始 JSON／頁文與缺席／品質證據保留，不讀 img_path、不啟動 MinerU。
-  OCR 文字在 REF 標示 lane 與未確認狀態（`text_verification_status`），審核卡把只靠未確認 OCR
-  支持的陳述列為待覆核；OCR figure 標題／caption
+  OCR 文字標示 lane，strict 排除且列 excluded_text；OCR figure 標題／caption
   只進召回向量與 BM25，不進 gate，人工修圖後仍保留來源與獨立 gate。
 - `knowledge_store` 的文件身分驗證（`metadata["document_sources"]`）與
   `DocumentIdentityConflict`——KB 用 basename 當文件識別，所以 `a/spec.pdf` 與
@@ -389,7 +361,7 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 - 不要為了讓 lint 漂亮，刪未檢查影響的 unused import — 有些是 side-effect import。
 - 不要把 ALLOWED_COMMANDS 加 `rm` / `sudo` / `curl` / `bash`。
 - 不要把 `RUN_COMMAND_ENABLED` / `PATCH_ENABLED` 在 `config.py` 的預設改成 `True`。runtime 若要開，必須維持在 `mcp_server.py` 這類明確啟動點。
-- 不要在 `mcp_server.py` 加新 tool 卻沒同步更新 `README.md` / `docs/mcp-tools.md` 工具清單 — 模型會誤用，使用者也會困惑（`aicode` 健檢會要求工具集合與文件精確一致）。新的**寫入**工具要不要人工核准是另一件事:互動 policy 的預設是 allow,要核准就得加進 `client_policy.ASK_TOOLS`(`apply_patch`、`run_lint`、`run_command`、`remove_document`、`record_lesson`、`review_figures`、`review_text`、`import_external_file`)；`/kb` 的寫入也走同一份 policy。
+- 不要在 `mcp_server.py` 加新 tool 卻沒同步更新 `README.md` / `docs/mcp-tools.md` 工具清單 — 模型會誤用，使用者也會困惑（`aicode` 健檢會要求工具集合與文件精確一致）。新的**寫入**工具要不要人工核准是另一件事:互動 policy 的預設是 allow,要核准就得加進 `client_policy.ASK_TOOLS`(`apply_patch`、`run_lint`、`run_command`、`remove_document`、`record_lesson`、`review_figures`、`import_external_file`)。
 - **不要新增 `os.environ` 讀取。** 客戶端與 MCP 的設定只有三個來源,全部是檔案:
   repo 常數 `config.py`、`~/.config/codetrail/{deployment,models}.json`、
   `~/.config/codetrail/client.json`;行程之間用 **argv** 交接。新設定要嘛是

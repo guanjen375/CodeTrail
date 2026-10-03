@@ -12,17 +12,14 @@ nvidia-smi 稍微監控)。
      (--reranking / --mmproj / --fit / --cache-ram),缺什麼就給可直接複製的修復指令。
   2. 偵測:GPU 種類/VRAM、~/models 的 GGUF 自動分類(main / embedding /
      reranker / VL+mmproj);多 shard 聚合並驗證齊全性(缺片直接列出)。
-  3. 背景初步判定:GPU 數與四類模型檔是否齊全,缺什麼通知什麼(審核模型與
-     主模型共用聊天模型候選,不另成一類)。
+  3. 背景初步判定:GPU 數與四類模型是否齊全,缺什麼通知什麼。
   4. 互動問答,一個角色問完才進下一個(下列為內部完整精靈;
-     ./set_config.sh 日常入口只問五組模型——兩個聊天模型＋三個附屬模型,
-     沿用既有壓縮模式):
-       [1/6] 主聊天模型 → 模型、GPU、ctx、CPU-MoE 層數、DSpark
-       [2/6] 審核模型   → 模型(小模型,可沿用 VL 的 GGUF)、GPU、ctx、CPU-MoE 層數
-       [3/6] embedding  → 模型、GPU
-       [4/6] reranker   → 模型、GPU、internal buffer(ctx)
-       [5/6] VL         → 模型、GPU、mmproj、CPU-MoE 層數
-       [6/6] 壓縮模式   → codetrail / manual / off(見 docs/compaction-rules.md;
+     ./set_config.sh 日常入口只問四組模型,沿用既有壓縮模式):
+       [1/5] 主聊天模型 → 模型、GPU、ctx、CPU-MoE 層數、DSpark
+       [2/5] embedding  → 模型、GPU
+       [3/5] reranker   → 模型、GPU、internal buffer(ctx)
+       [4/5] VL         → 模型、GPU、mmproj、CPU-MoE 層數
+       [5/5] 壓縮模式   → codetrail / manual / off(見 docs/compaction-rules.md;
                           codetrail / manual 仍是實驗功能,off = 完全不壓縮)
      CPU-MoE 沒有 y/n 分流:直接問層數,0 = 不 offload(一般模式)、
      N = 前 N 層 experts 留 RAM、≥ 層數上限 = 全部留 RAM(等同 --cpu-moe);
@@ -34,8 +31,7 @@ nvidia-smi 稍微監控)。
      (llama.cpp 只取實體核心或 P-core);看不到(VM 常見)就寫 CPU 數的一半。
      最後顯示摘要一頁(Enter 寫入 / q 離開)。
   5. 非互動:`--yes` 跳過提問與確認,但所有使用者選擇題的值必須由旗標提供
-     (--main-model / --ctx / --auditor-model / --auditor-ctx / --rerank-ctx / ...),
-     缺哪個就明確報錯;
+     (--main-model / --ctx / --rerank-ctx / ...),缺哪個就明確報錯;
      DSpark 省略為 off,沿用配對需明示 --dspark keep。
   6. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
      - ~/.config/codetrail/models.json     主模型 registry(合併既有)
@@ -79,7 +75,6 @@ from deployment_profile import (  # noqa: E402
     DSparkConfig,
     TMUX_SESSIONS,
     ProfileError,
-    auditor_unconfigured_reason,
     load_effective_profile,
     resolve_model_reference,
 )
@@ -101,11 +96,6 @@ MIN_RERANKER_CTX = 128
 MAX_RERANKER_CTX = 1_048_576
 # 維護者驗證過的 reranker buffer;只當提示顯示,不是預設值(這題必答)。
 VERIFIED_RERANKER_CTX = 8192
-# 審核模型 n_ctx:要放得下問題＋回答＋本回合的知識庫證據。下限對齊
-# config.AUDITOR_MIN_N_CTX(aicode 啟動時對 live n_ctx 的要求);建議值只當提示。
-MIN_AUDITOR_CTX = 8192
-MAX_AUDITOR_CTX = 1_048_576
-RECOMMENDED_AUDITOR_CTX = 32768
 MAX_THREADS = 1024
 MAX_N_CPU_MOE = 1024
 #: 決定 main `-t` 用的 CPU 拓撲來源(與 llama.cpp 讀同一處);測試換成假的目錄樹。
@@ -135,11 +125,9 @@ _AUX_MODEL_HINTS = {
     "embedding": ("bge-m3",),
     "reranker": ("bge-reranker-v2-m3", "qwen3-reranker"),
     "vl": ("qwen3.5-9b", "qwen3-vl"),
-    # 審核模型:可直接沿用 VL 的 Qwen3.5-9B 同一個 GGUF(不另外下載、不載 mmproj)。
-    "auditor": ("qwen3.5-9b",),
 }
 
-AUX_PARALLEL = 1                        # 本地單使用者服務不預留多個同時 request slot
+AUX_PARALLEL = 1                        # 本地單使用者服務不預留四個同時 request slot
 VL_FIT_TARGET_MIB = 3 * 1024            # VL 最後啟動後仍保留給 mmproj / inference transient
 
 # llama.cpp --cpu-moe 使用的 expert tensor 命名規則。這裡刻意對齊
@@ -295,14 +283,6 @@ class Plan:
     allow_remote: bool = False
     parameters: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
-    # 審核模型(小聊天模型)。互動精靈一定會選;None 只出現在直接建 Plan 的程式/測試,
-    # 那時 deployment.json 不寫 auditor(= 未設定,aicode 與 launcher 會 fail-loud)。
-    auditor: Selection | None = None
-    auditor_ctx: int = 0
-    auditor_cpu_moe: bool = False
-    auditor_n_cpu_moe: int | None = None
-    auditor_layout: ModelLayout | None = None
-    auditor_parameters: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,7 +1085,7 @@ def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]],
         warnings.append(f"模型不完整已剔除:{report}(重新執行原本的 hf download 即可補齊)")
     if len(gpus) < 2:
         warnings.append(
-            "只偵測到 1 顆 GPU:主模型、審核模型與三顆附屬模型將共用同一顆卡(可以跑,"
+            "只偵測到 1 顆 GPU:主模型與三顆附屬模型將共用同一顆卡(可以跑,"
             "但雙卡分工更穩;啟動後請用 nvidia-smi 監控 VRAM 餘量)。"
         )
     return warnings
@@ -1558,47 +1538,6 @@ def resolve_vl_mmproj(
 # 主模型啟動參數(依使用者選定的模式組裝;不改寫使用者選的數值)
 # ---------------------------------------------------------------------------
 
-def auditor_candidates(candidates: dict[str, list[ModelCandidate]]) -> list[ModelCandidate]:
-    """審核模型的候選:所有聊天 GGUF(含 VL 主檔),維護者驗證過的在前,其餘**由小到大**。
-
-    審核模型是小模型;主模型清單「由大到小、VL 排最後」的排序在這裡正好相反 ——
-    最常見的選擇就是沿用 VL 用的 Qwen3.5-9B 同一個檔。
-    """
-    hints = _AUX_MODEL_HINTS["auditor"]
-
-    def sort_key(cand: ModelCandidate) -> tuple:
-        path_text = str(cand.path).lower()
-        hint_rank = next(
-            (rank for rank, hint in enumerate(hints) if hint in path_text), len(hints)
-        )
-        return (hint_rank, cand.total_bytes, str(cand.path))
-
-    return sorted(candidates["main"], key=sort_key)
-
-
-def build_auditor_parameters(plan: "Plan", fit_supported: bool) -> dict:
-    """審核模型服務參數:跟 main 一樣 -ngl 99、q8_0 KV、單 slot,固定 placement。
-
-    它在 VL 之前啟動;VL 的 --fit 會依它實際占用的 VRAM 決定自己的層數。--fit 在這裡
-    明確關閉(build 支援時),否則新版 llama.cpp 預設 on 會改寫 -ngl 99。
-    """
-    parameters: dict = {
-        "parallel": AUX_PARALLEL,
-        "jinja": True,
-        "flash_attention": "on",
-        "cache_type_k": "q8_0",
-        "cache_type_v": "q8_0",
-        "gpu_layers": 99,
-    }
-    if fit_supported:
-        parameters["fit"] = "off"
-    if plan.auditor_n_cpu_moe is not None:
-        parameters["n_cpu_moe"] = plan.auditor_n_cpu_moe
-    elif plan.auditor_cpu_moe:
-        parameters["cpu_moe"] = True
-    return parameters
-
-
 def build_main_parameters(candidate: ModelCandidate, ctx: int, threads: int | None,
                           fit_supported: bool, cpu_moe: bool, notes: list[str], *,
                           n_cpu_moe: int | None = None) -> tuple[dict, int, int]:
@@ -1663,14 +1602,12 @@ def sanitize_registry_key(path: Path) -> str:
 
 
 def _warn_unverified_aux(plan: Plan) -> None:
-    for selection in (plan.embedding, plan.reranker, plan.vl, plan.auditor):
-        if selection is None:
-            continue
+    for selection in (plan.embedding, plan.reranker, plan.vl):
         hints = _AUX_MODEL_HINTS[selection.role]
         if hints and not any(h in str(selection.candidate.path).lower() for h in hints):
             plan.notes.append(
                 f"⚠ {selection.role} 選了未經維護者驗證的模型 {selection.candidate.path.name}:"
-                "server 可能正常啟動,但 pooling / reranking / 圖片分析 / 回答審核行為不保證正確"
+                "server 可能正常啟動,但 pooling / reranking / 圖片分析行為不保證正確"
                 "(維護者驗證組合見 README.md#models)。"
             )
 
@@ -1824,14 +1761,6 @@ def build_deployment_config(plan: Plan) -> dict:
             "parameters": build_vl_parameters(plan),
         },
     }
-    if plan.auditor is not None:
-        # port / base_url / gpu_role / batch 沿用 deployment_profile 的內建預設(8084、aux)。
-        services["auditor"] = {
-            "model": str(plan.auditor.candidate.path),
-            "gpu": plan.auditor.gpu.selector,
-            "ctx": plan.auditor_ctx,
-            "parameters": dict(plan.auditor_parameters),
-        }
     if plan.allow_remote:
         for role in services:
             services[role]["bind"] = "all-interfaces"
@@ -1861,7 +1790,6 @@ _PRESERVED_MAIN_SAMPLING_KEYS = (
 _PRESERVED_KEYS_BY_ROLE = {
     "main": _PRESERVED_MAIN_SAMPLING_KEYS,
     "vl": ("no_mmap",),
-    "auditor": ("no_mmap",),
 }
 
 
@@ -2173,7 +2101,7 @@ def render_start_wrapper(repo_root: Path = REPO_ROOT) -> str:
 # checkout: {json.dumps(str(root), ensure_ascii=False)}
 # generated: {generated_at}
 # version: {version}
-# 無參數啟動全部模型（主模型、審核模型與三個附屬模型）；唯一子命令 stop 停止它們。
+# 無參數啟動四個模型；唯一子命令 stop 停止四個模型。
 # 設定由 deployment.json 與 repo 常數決定。
 set -euo pipefail
 if [ "$#" -gt 1 ] || {{ [ "$#" -eq 1 ] && [ "$1" != "stop" ]; }}; then
@@ -2193,13 +2121,6 @@ exit "$rc"
 """
 
 
-def _auditor_start_line(plan: Plan) -> str:
-    if plan.auditor is None:
-        return "# auditor=(未設定)"
-    return (f"# auditor={plan.auditor.candidate.path.name} @ GPU {plan.auditor.gpu.choice}; "
-            f"ctx={plan.auditor_ctx}（在 VL 之前啟動）")
-
-
 def build_start_sh(plan: Plan) -> str:
     gpu_lines = "\n".join(f"#   {gpu.describe()}" for gpu in plan.gpus)
     bind_note = "0.0.0.0（已明確授權 LAN）" if plan.allow_remote else "127.0.0.1（僅本機）"
@@ -2209,7 +2130,6 @@ def build_start_sh(plan: Plan) -> str:
 # embedding={plan.embedding.candidate.path.name} @ GPU {plan.embedding.gpu.choice}
 # reranker={plan.reranker.candidate.path.name} @ GPU {plan.reranker.gpu.choice}; buffer={plan.reranker_ctx}
 # vl={plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.choice}
-{_auditor_start_line(plan)}
 # threads={_threads_description(plan)}; {_offload_description(plan)}
 # VL: {_vl_offload_description(plan)}; 綁定: {bind_note}
 """
@@ -3010,7 +2930,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint-manifest", type=Path, help="client mode: A export-client JSON; review before authorizing")
     parser.add_argument("--kb-context-remote-ok", action="store_true", default=None,
                         help="client mode: independently authorize sending document windows to main")
-    for role in ("main", "embed", "rerank", "vl", "auditor"):
+    for role in ("main", "embed", "rerank", "vl"):
         parser.add_argument(f"--{role}-url", help=f"client mode: literal private IP URL for {role}")
     parser.add_argument("--models-dir", help="模型目錄(未指定時用 ~/models)")
     parser.add_argument(
@@ -3050,26 +2970,11 @@ def _parser() -> argparse.ArgumentParser:
         help="VL 模型留在 RAM 的 MoE expert 層數:0=不 offload、N=前 N 層、"
              f"≥ 層數上限=全部({_range(0, MAX_N_CPU_MOE)})",
     )
-    auditor_mode = parser.add_mutually_exclusive_group()
-    auditor_mode.add_argument(
-        "--auditor-cpu-moe", dest="auditor_cpu_moe", action="store_true",
-        help="審核模型:全部 MoE experts 留 RAM(只對 MoE 審核模型有效)",
-    )
-    auditor_mode.add_argument(
-        "--no-auditor-cpu-moe", dest="auditor_cpu_moe", action="store_false",
-        help="審核模型不套用 CPU-MoE(等同互動答 0)",
-    )
-    auditor_mode.add_argument(
-        "--auditor-n-cpu-moe", dest="auditor_n_cpu_moe", type=_n_cpu_moe_arg, metavar="N",
-        help="審核模型留在 RAM 的 MoE expert 層數:0=不 offload、N=前 N 層、"
-             f"≥ 層數上限=全部({_range(0, MAX_N_CPU_MOE)})",
-    )
-    parser.set_defaults(cpu_moe=None, n_cpu_moe=None, vl_cpu_moe=None, vl_n_cpu_moe=None,
-                        auditor_cpu_moe=None, auditor_n_cpu_moe=None)
+    parser.set_defaults(cpu_moe=None, n_cpu_moe=None, vl_cpu_moe=None, vl_n_cpu_moe=None)
     parser.add_argument(
         "--compaction-mode", choices=list(client_compaction.MODES),
         help=(
-            "壓縮模式(見 docs/compaction-rules.md)。互動模式是最後一題(第 6 題);"
+            "壓縮模式(見 docs/compaction-rules.md)。互動模式是第 5 題;"
             "codetrail/manual 仍是實驗功能(開發中),off 完全不壓縮。"
             "--yes 沒給這個旗標時沿用既有選擇,還沒選過就完全不碰壓縮設定。"
         ),
@@ -3087,16 +2992,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-deps-check", action="store_true", help="跳過 Python 依賴檢查")
     parser.add_argument("--skip-binary-check", action="store_true",
                         help="跳過 llama-server / tmux 檢查(自動化測試用)")
-    for role in ("main", "embed", "rerank", "vl", "auditor"):
+    for role in ("main", "embed", "rerank", "vl"):
         parser.add_argument(f"--{role}-model", help=f"{role} 模型:候選編號(從 1 起)或 .gguf 絕對路徑")
         parser.add_argument(f"--{role}-gpu",
                             help=f"{role} 要綁的 GPU 編號(從 1 起,= nvidia-smi index + 1)")
     parser.add_argument("--vl-mmproj", help="VL mmproj .gguf 絕對路徑(同目錄唯一 mmproj 時自動配對)")
     parser.add_argument("--ctx", "--n-ctx", dest="ctx", type=int,
                         help=f"主模型 n_ctx(-c),{_range(MIN_MAIN_CTX, MAX_MAIN_CTX)}")
-    parser.add_argument("--auditor-ctx", dest="auditor_ctx", type=int,
-                        help=f"審核模型 n_ctx(-c),{_range(MIN_AUDITOR_CTX, MAX_AUDITOR_CTX)};"
-                             f"建議 {RECOMMENDED_AUDITOR_CTX}")
     parser.add_argument(
         "--rerank-ctx",
         "--reranker-ctx",
@@ -3127,9 +3029,6 @@ def _print_summary_page(plan: Plan, python_bin: str,
     print("\n=== 設定摘要(全部來自你的作答;確認一次即可)===")
     print(f"  主聊天    : {plan.main.candidate.describe()}")
     print(f"              → GPU {plan.main.gpu.choice}({plan.main.gpu.name})")
-    if plan.auditor is not None:
-        print(f"  審核模型  : {plan.auditor.candidate.path.name} → GPU {plan.auditor.gpu.choice}"
-              f"（ctx={plan.auditor_ctx}；在 VL 之前啟動）")
     print(f"  embedding : {plan.embedding.candidate.path.name} → GPU {plan.embedding.gpu.choice}")
     print(
         f"  reranker  : {plan.reranker.candidate.path.name} → GPU {plan.reranker.gpu.choice}"
@@ -3307,7 +3206,7 @@ def configure_dspark(home: Path) -> int:
     print(f"DSpark 已設定為 {choice}；尚未重啟。")
     if profile.mode == "model-host":
         print("請在 A 執行 ./scripts/configure-advanced.sh 選項 6 重新匯出 endpoint manifest，並在 B 重新匯入。")
-    answer = _input_optional("[R] 現在套用並重啟全部模型 / [S] 稍後（Enter=S）: ", "s").strip().lower()
+    answer = _input_optional("[R] 現在套用並重啟四個模型 / [S] 稍後（Enter=S）: ", "s").strip().lower()
     if answer == "r":
         # Use this checkout's fixed cores; an older installation's start.sh is
         # not part of this single-file transaction.
@@ -3324,15 +3223,12 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
     """B setup: no GPU, model files, tmux, server binary, or network probes."""
     import endpoint_policy
     launcher_fields = ("llama_bin", "models_dir", "main_gpu", "embed_gpu", "rerank_gpu", "vl_gpu",
-                       "auditor_gpu", "ctx", "reranker_ctx", "auditor_ctx", "threads", "vl_mmproj",
-                       "cpu_moe", "n_cpu_moe", "vl_cpu_moe", "vl_n_cpu_moe",
-                       "auditor_cpu_moe", "auditor_n_cpu_moe",
-                       "dspark", "dspark_draft", "dspark_draft_n_max")
+                       "ctx", "reranker_ctx", "threads", "vl_mmproj", "cpu_moe", "n_cpu_moe",
+                       "vl_cpu_moe", "vl_n_cpu_moe", "dspark", "dspark_draft", "dspark_draft_n_max")
     incompatible = [key for key in launcher_fields if getattr(args, key, None) is not None]
     if incompatible or args.allow_remote:
         raise SetupError("client mode does not accept local launcher options: " + ", ".join(incompatible or ["allow_remote"]))
-    roles = {"main": "main", "embedding": "embed", "reranker": "rerank", "vl": "vl",
-             "auditor": "auditor"}
+    roles = {"main": "main", "embedding": "embed", "reranker": "rerank", "vl": "vl"}
     supplied_roles = any(getattr(args, f"{flag}_{field}", None)
                          for flag in roles.values() for field in ("url", "model"))
     if not args.yes and not args.endpoint_manifest and not supplied_roles:
@@ -3354,12 +3250,6 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
             raise SetupError(str(exc)) from exc
         if manifest.mode != "client":
             raise SetupError("endpoint manifest must have mode=client")
-        if auditor_unconfigured_reason(manifest):
-            # 舊 A 匯出的四角色 manifest:載入相容,但 B 不能據此完成設定。
-            raise SetupError(
-                "這份 endpoint manifest 沒有審核模型（auditor）：請先在 A 更新 CodeTrail、"
-                "重跑設定（scripts/configure-advanced.sh 選項 3）並重新匯出 manifest，再回到 B 匯入。"
-            )
         services = {role: {"base_url": service.base_url, "model": service.model,
                            "identity_alias": service.identity_alias}
                     for role, service in manifest.services.items()}
@@ -3384,7 +3274,7 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
     validate_payloads(deployment_json, "{}\n")
     previous = client_config.load_client_settings({"HOME": str(home)})
     print("Client deployment B: aicode / MCP / repository / build stay on B")
-    print("模型呼叫會將問題、程式碼與工具內容送到以下五個精確目的地及版本 alias（含審核模型）：")
+    print("模型呼叫會將問題、程式碼與工具內容送到以下四個精確目的地及版本 alias：")
     print(deployment_json, end="")
     kb_authorized = (previous.kb_context_remote_ok if args.kb_context_remote_ok is None
                      else args.kb_context_remote_ok)
@@ -3410,7 +3300,7 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
     ], notes, args.dry_run, home=home, private=(settings.path,))
     for note in notes:
         print(note)
-    print("設定已驗證；尚未驗證 live 服務。啟動 aicode 時會核對每個模型身分與 live n_ctx。")
+    print("設定已驗證；尚未驗證 live 服務。啟動 aicode 時會核對四個模型身分與 live n_ctx。")
     return 0
 
 
@@ -3425,7 +3315,7 @@ def run(args: argparse.Namespace) -> int:
     if getattr(args, "deployment_mode", "local") == "client":
         return configure_client(args, home)
     if (getattr(args, "endpoint_manifest", None) or getattr(args, "kb_context_remote_ok", None) is not None
-            or any(getattr(args, f"{r}_url", None) for r in ("main", "embed", "rerank", "vl", "auditor"))):
+            or any(getattr(args, f"{r}_url", None) for r in ("main", "embed", "rerank", "vl"))):
         raise SetupError("endpoint URL/manifest flags require --mode client")
     if (args.dspark_draft is not None or args.dspark_draft_n_max is not None) and args.dspark != "on":
         raise SetupError("--dspark-draft / --dspark-draft-n-max 只能搭配 --dspark on。")
@@ -3444,12 +3334,6 @@ def run(args: argparse.Namespace) -> int:
             not MIN_RERANKER_CTX <= args.reranker_ctx <= MAX_RERANKER_CTX:
         raise SetupError(
             f"--rerank-ctx 請設在 {_range(MIN_RERANKER_CTX, MAX_RERANKER_CTX)}。"
-        )
-    if args.auditor_ctx is not None and \
-            not MIN_AUDITOR_CTX <= args.auditor_ctx <= MAX_AUDITOR_CTX:
-        raise SetupError(
-            f"--auditor-ctx 請設在 {_range(MIN_AUDITOR_CTX, MAX_AUDITOR_CTX)}"
-            f"(建議 {RECOMMENDED_AUDITOR_CTX})。"
         )
 
     # 相對路徑立刻轉絕對(不解 symlink):候選/registry 全存絕對路徑,
@@ -3476,13 +3360,13 @@ def run(args: argparse.Namespace) -> int:
     candidates, broken = scan_models(models_dir, notes=base_notes)
     print(f"[4/5] [PASS] 掃描 {models_dir}:main={len(candidates['main'])}、"
           f"embedding={len(candidates['embedding'])}、reranker={len(candidates['reranker'])}、"
-          f"vl={len(candidates['vl'])} 個候選(審核模型與 main 共用聊天模型候選)")
+          f"vl={len(candidates['vl'])} 個候選")
 
     overrides = {"main": args.main_model, "embedding": args.embed_model,
                  "reranker": args.rerank_model, "vl": args.vl_model}
 
     warnings = precheck(gpus, candidates, broken, overrides)
-    print("[5/5] [PASS] 初步判定 OK:GPU 與四類模型檔(main/審核共用聊天模型 / embedding / reranker / vl+mmproj)齊全")
+    print("[5/5] [PASS] 初步判定 OK:GPU 與四類模型(main / embedding / reranker / vl+mmproj)齊全")
     for warning in warnings:
         print(f"      ⚠ {warning}")
 
@@ -3516,7 +3400,7 @@ def run(args: argparse.Namespace) -> int:
     def _section(step: int, title: str) -> None:
         """一個角色一組:先印標題,再問這個角色的所有題目(--yes 不需要分組。)"""
         if not args.yes:
-            total = 6 if getattr(args, "prompt_compaction", True) else 5
+            total = 5 if getattr(args, "prompt_compaction", True) else 4
             print(f"\n=== [{step}/{total}] {title} ===")
 
     def _layout_of(candidate: ModelCandidate, role_label: str,
@@ -3618,55 +3502,16 @@ def run(args: argparse.Namespace) -> int:
         elif cores and threads > cores:
             notes.append(f"⚠ --threads {threads} 超過偵測到的核心數({cores}),通常反而較慢。")
 
-        # ---- [2/6] 審核模型(小模型):模型 → GPU → ctx → CPU-MoE 層數 ----
-        # 主模型答完、用過知識庫時,由它逐條核對回答的引用(見 docs/usage.md 回答審核)。
-        _section(2, "審核模型（小模型）")
-        auditor_entries = auditor_candidates(candidates)
-        if not args.yes and args.auditor_model is None and len(auditor_entries) > 1:
-            print("  審核模型只核對主模型的回答，建議 4B–14B 指令模型；可直接選 VL 用的 Qwen3.5-9B"
-                  "（同一個 GGUF，不需另外下載；審核模型不載入 mmproj）。")
-        auditor_cand = choose_candidate("【審核模型（小模型）】", auditor_entries, args.auditor_model,
-                                        assume_yes=args.yes, flag_name="--auditor-model")
-        if auditor_cand.path == main_cand.path:
-            notes.append(
-                f"⚠ 審核模型與主模型是同一個檔({main_cand.path.name}):會再載入一份,VRAM 加倍。"
-                "建議改選 4B–14B 的小模型(例如 VL 用的 Qwen3.5-9B)。"
-            )
-        if not args.yes and args.auditor_gpu is None and len(gpus) > 1:
-            print("  審核模型在 VL 之前啟動；與 VL 同卡時，VL 的 --fit 會依剩餘 VRAM 自動避開。")
-        auditor_gpu = choose_gpu("【審核模型（小模型）】", gpus, args.auditor_gpu,
-                                 assume_yes=args.yes, flag_name="--auditor-gpu")
-        auditor_ctx = choose_int(
-            "審核模型 n_ctx(-c)", args.auditor_ctx, assume_yes=args.yes,
-            minimum=MIN_AUDITOR_CTX, maximum=MAX_AUDITOR_CTX, flag_name="--auditor-ctx",
-            hints=(
-                f"建議 {RECOMMENDED_AUDITOR_CTX}:要放得下問題＋回答＋本回合的知識庫證據;"
-                "數值越大越吃顯存。",
-            ),
-        )
-        auditor_layout = _layout_of(auditor_cand, "審核模型", notes)
-        auditor_cpu_moe, auditor_n_cpu_moe = choose_cpu_moe_layers(
-            "審核模型",
-            auditor_layout,
-            cpu_moe_override=args.auditor_cpu_moe,
-            n_cpu_moe_override=args.auditor_n_cpu_moe,
-            assume_yes=args.yes,
-            caps=llama_caps,
-            flag_names=("--auditor-cpu-moe", "--no-auditor-cpu-moe", "--auditor-n-cpu-moe"),
-            notes=notes,
-            gpu=auditor_gpu,
-        )
-
-        # ---- [3/6] embedding:模型 → GPU ----
-        _section(3, "embedding 模型")
+        # ---- [2/5] embedding:模型 → GPU ----
+        _section(2, "embedding 模型")
         embed_cand = choose_candidate("【embedding 模型】", candidates["embedding"],
                                       args.embed_model, assume_yes=args.yes,
                                       flag_name="--embed-model")
         embed_gpu = choose_gpu("【embedding 模型】", gpus, args.embed_gpu,
                                assume_yes=args.yes, flag_name="--embed-gpu")
 
-        # ---- [4/6] reranker:模型 → GPU → internal buffer(ctx)----
-        _section(4, "reranker 模型")
+        # ---- [3/5] reranker:模型 → GPU → internal buffer(ctx)----
+        _section(3, "reranker 模型")
         rerank_cand = choose_candidate("【reranker 模型】", candidates["reranker"],
                                        args.rerank_model, assume_yes=args.yes,
                                        flag_name="--rerank-model")
@@ -3674,8 +3519,8 @@ def run(args: argparse.Namespace) -> int:
                                 assume_yes=args.yes, flag_name="--rerank-gpu")
         reranker_ctx = choose_reranker_ctx(rerank_cand, args.reranker_ctx, assume_yes=args.yes)
 
-        # ---- [5/6] VL:模型 → GPU → mmproj → CPU-MoE 層數 ----
-        _section(5, "VL 模型")
+        # ---- [4/5] VL:模型 → GPU → mmproj → CPU-MoE 層數 ----
+        _section(4, "VL 模型")
         vl_cand = choose_candidate("【VL 模型】", candidates["vl"], args.vl_model,
                                    assume_yes=args.yes, flag_name="--vl-model")
         vl_gpu = choose_gpu("【VL 模型】", gpus, args.vl_gpu,
@@ -3727,11 +3572,6 @@ def run(args: argparse.Namespace) -> int:
             allow_remote=allow_remote,
             parameters={},
             notes=notes,
-            auditor=Selection("auditor", auditor_cand, auditor_gpu),
-            auditor_ctx=auditor_ctx,
-            auditor_cpu_moe=auditor_cpu_moe,
-            auditor_n_cpu_moe=auditor_n_cpu_moe,
-            auditor_layout=auditor_layout,
         )
         notes.append(reranker_ctx_effect(reranker_ctx))
         _warn_unverified_aux(plan)
@@ -3743,10 +3583,9 @@ def run(args: argparse.Namespace) -> int:
         plan.parameters = parameters
         plan.batch = batch
         plan.ubatch = ubatch
-        plan.auditor_parameters = build_auditor_parameters(plan, llama_caps.get("fit", True))
         notes.append(
-            f"附屬服務與審核模型固定配置:各 -np {AUX_PARALLEL};啟動順序 main → embedding → reranker"
-            f" → 審核模型 → VL;VL 最後啟動並用 {_vl_offload_description(plan)}。"
+            f"附屬服務固定配置:三個服務 -np {AUX_PARALLEL};VL 最後啟動並用"
+            f" {_vl_offload_description(plan)}。"
         )
         if vl_uses_cpu_moe(plan):
             notes.append(
@@ -3766,7 +3605,7 @@ def run(args: argparse.Namespace) -> int:
             "以 ~/start.sh 啟動後 nvidia-smi 實測為準(啟動結尾會提醒)。"
         )
         if allow_remote:
-            notes.append("⚠ --allow-remote:所有 llama-server(含審核模型)會綁 0.0.0.0,同網段任何人都能呼叫模型 API"
+            notes.append("⚠ --allow-remote:四個 llama-server 會綁 0.0.0.0,同網段任何人都能呼叫模型 API"
                          "(llama-server 無認證)。只在可信內網使用,必要時加防火牆規則。")
 
         registry = build_models_registry(plan, codetrail_dir / "models.json", notes)
@@ -3781,8 +3620,7 @@ def run(args: argparse.Namespace) -> int:
             print("正在計算 A 的模型權重 SHA-256 identity aliases；大模型可能需要幾分鐘…")
             try:
                 for role, selection in (("main", plan.main), ("embedding", plan.embedding),
-                                        ("reranker", plan.reranker), ("vl", plan.vl),
-                                        ("auditor", plan.auditor)):
+                                        ("reranker", plan.reranker), ("vl", plan.vl)):
                     deployment_config["services"][role]["identity_alias"] = versioned_alias(
                         role, selection.candidate.path, selection.mmproj,
                         dspark=DSparkConfig(**main_dspark) if role == "main" and main_dspark else None,
@@ -3801,14 +3639,10 @@ def run(args: argparse.Namespace) -> int:
             "VL 模型", "vl", vl_cpu_moe or vl_n_cpu_moe is not None,
             deployment_config["services"]["vl"]["parameters"], notes,
         )
-        warn_cpu_moe_without_no_mmap(
-            "審核模型", "auditor", auditor_cpu_moe or auditor_n_cpu_moe is not None,
-            deployment_config["services"]["auditor"]["parameters"], notes,
-        )
         deployment_json = json.dumps(deployment_config, ensure_ascii=False, indent=2) + "\n"
-        # ---- [6/6] 壓縮模式 ----
+        # ---- [5/5] 壓縮模式 ----
         if getattr(args, "prompt_compaction", True):
-            _section(6, "壓縮模式")
+            _section(5, "壓縮模式")
         prior_mode = (
             prior_client_settings.compaction_mode
             if prior_client_settings.present
@@ -3942,7 +3776,7 @@ def run(args: argparse.Namespace) -> int:
                         return rc
 
     print("\n下一步:")
-    print("  ~/start.sh                        # 啟動全部 llama-server(主模型、審核模型、附屬模型;tmux)")
+    print("  ~/start.sh                        # 啟動四個 llama-server(tmux)")
     print("  cd <你要分析的專案> && aicode      # 進 TUI;/status 應顯示 codetrail Connected")
     print("  ~/start.sh stop                   # 收工:關掉全部 tmux server 視窗")
     return 1 if preview_rc != 0 else 0

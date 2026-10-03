@@ -61,7 +61,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -388,27 +387,6 @@ def test_startup_banner_reports_the_build_commands_opt_in(project: Path):
 
 
 @pytest.mark.smoke
-def test_public_catalog_has_twenty_tools_and_no_strict_query():
-    """strict 檢索已移除:公開目錄 20 個工具、沒有 query_knowledge_strict,各處清單同步。
-
-    任一份清單殘留,模型或客戶端就會引用一個不存在的工具,busy／唯讀判定也會對不上。
-    """
-    import ingest_runtime
-    from mcp_contract import EVIDENCE_TOOL_NAMES, MODEL_TOOL_DESCRIPTIONS
-
-    assert len(PUBLIC_TOOL_ORDER) == 20
-    for listing in (PUBLIC_TOOL_ORDER, EVIDENCE_TOOL_NAMES, MODEL_TOOL_DESCRIPTIONS,
-                    ingest_runtime.BUSY_TOOLS, ingest_runtime.EVIDENCE_BUSY_TOOLS):
-        assert "query_knowledge_strict" not in listing
-    assert "query_knowledge_strict" not in MCP_INSTRUCTIONS
-    for name in ("ingest_document", "review_text", "query_knowledge"):
-        # 單字邊界:query_knowledge 的描述合法地含有 "restrict"(限定來源)。
-        assert re.search(r"\bstrict\b", MODEL_TOOL_DESCRIPTIONS[name].lower()) is None, name
-    for relative in ("mcp_server.py", "scripts/tool_call_canary.py", "tool_result_adapter.py"):
-        assert "query_knowledge_strict" not in (REPO_ROOT / relative).read_text(encoding="utf-8"), relative
-
-
-@pytest.mark.smoke
 def test_live_catalog_is_bounded_typed_and_ordered(monkeypatch, tmp_path: Path):
     mcp_module = import_mcp_module(monkeypatch, tmp_path)
     tools = asyncio.run(mcp_module.mcp.list_tools())
@@ -445,7 +423,7 @@ def test_live_catalog_is_bounded_typed_and_ordered(monkeypatch, tmp_path: Path):
     timeout = by_name["run_command"].inputSchema["properties"]["timeout"]
     assert (timeout["minimum"], timeout["maximum"]) == (1, 600)
 
-    evidence = {"code_rag_search", "query_knowledge", "query_table"}
+    evidence = {"code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table"}
     for tool in tools:
         if tool.name not in evidence:
             assert tool.outputSchema is None, tool.name
@@ -557,7 +535,7 @@ def test_mcp_protocol_roundtrip(tmp_path: Path):
     )
 
     assert names == set(PUBLIC_TOOL_ORDER)
-    assert len(names) == 20
+    assert len(names) == 21
     for expected in ("query_knowledge", "list_dir", "read_file", "grep_code"):
         assert expected in names, f"工具 {expected} 沒註冊成功；實得 {sorted(names)}"
     max_chars_schema = code_search_schema["properties"]["max_chars"]
@@ -1004,14 +982,19 @@ def test_budgeted_evidence_keeps_metadata_before_bulk_text():
     query_payload = {
         "text": "\n".join(f"evidence line {line}" for line in range(500)),
         "display": "duplicate display",
-        "refs": [{"source": "spec.pdf", "page": 7},
-                 {"source": "spec.pdf", "page": 8, "verification_status": "needs_review"}],
+        "refs": [{"source": "spec.pdf", "page": 7}],
         "has_ref": True,
+        "excluded_figures": [{
+            "source": "spec.pdf",
+            "page": 8,
+            "verification_status": "needs_review",
+        }],
+        "review_hint": "inspect figure 8 before asserting the value",
     }
     query_text = _text(adapt_tool_result("query_knowledge", query_payload, budget=budget))
     assert "spec.pdf p.7" in query_text
-    # 待覆核狀態排在大量 REF 文字之前:預算截斷從尾端砍,砍不到它。
-    assert "spec.pdf p.8 (verification_status=needs_review)" in query_text
+    assert "excluded_figures: spec.pdf p.8" in query_text
+    assert "review: inspect figure 8" in query_text
 
 
 def test_review_figure_budget_never_keeps_a_partial_canonical_line():

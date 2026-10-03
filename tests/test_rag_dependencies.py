@@ -97,7 +97,7 @@ def test_unavailable_reranker_never_uses_a_legacy_policy(monkeypatch):
     for policy in ("embedding", "main_model", "error"):
         monkeypatch.setattr(config, "RERANK_FALLBACK_POLICY", policy)
         with pytest.raises(DependencyError, match="RAG reranker unavailable"):
-            kb._rerank_with_model("question", _candidates(), 2)
+            kb._rerank_with_model("question", _candidates(), 2, is_strict_mode=True)
     assert main_calls == []
 
 
@@ -120,7 +120,7 @@ def test_failed_reranker_batch_never_returns_partial_or_original_ranks(monkeypat
 
     monkeypatch.setattr(knowledge.llama_client, "rerank", rerank)
     with pytest.raises(DependencyError, match="RAG reranker unavailable.*disconnected"):
-        kb._rerank_with_model("question", candidates, 2)
+        kb._rerank_with_model("question", candidates, 2, is_strict_mode=True)
     assert batches == [15, 3]
 
 
@@ -132,7 +132,7 @@ def test_reranker_nonfinite_scores_are_a_protocol_error(monkeypatch):
     monkeypatch.setattr(knowledge.llama_client, "rerank",
                         lambda **_kwargs: [float("nan"), 0.2, 0.3])
     with pytest.raises(DependencyError, match="reranker.*finite"):
-        kb._rerank_with_model("question", _candidates(), 2)
+        kb._rerank_with_model("question", _candidates(), 2, is_strict_mode=True)
 
 
 def test_enabled_expansion_propagates_service_and_configuration_failures(monkeypatch):

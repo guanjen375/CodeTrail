@@ -1354,8 +1354,8 @@ def _require_trusted_evidence(evidence: dict, view: dict, *, where: str) -> None
     """可信狀態不得配空 evidence（契約 §19.4）。
 
     `native_verified` / `corroborated` 的定義就是「與另一個通道逐格或逐行一致」。
-    evidence 是空的卻宣稱這兩個狀態，等於把「沒查過」寫成「查過了」——查詢與回答審核
-    之後會把它當成可信的暫存器數值。
+    evidence 是空的卻宣稱這兩個狀態，等於把「沒查過」寫成「查過了」——strict query
+    之後會直接拿它回答暫存器數值。
     """
     fx = _fx()
     if view["verification_status"] not in _EVIDENCE_BACKED_STATUSES:

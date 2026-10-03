@@ -10,6 +10,7 @@ PUBLIC_TOOL_ORDER: tuple[str, ...] = (
     "code_rag_search",
     "file_info",
     "query_knowledge",
+    "query_knowledge_strict",
     "query_table",
     "git_status",
     "git_diff",
@@ -34,14 +35,14 @@ if len(PUBLIC_TOOL_NAMES) != len(PUBLIC_TOOL_ORDER):  # pragma: no cover - impor
 
 # The client injects this text into the model-visible system prompt. Keep it a
 # routing map, not a second copy of every tool description.
-MCP_INSTRUCTIONS = """Use CodeTrail for project facts. Locate code with code_rag_search (build_target scopes compilation), text with grep_code, files with read_file, directories with list_dir. Query specs with query_knowledge, exact table cells with query_table. In git repos inspect git_status/git_diff before apply_patch; non-git skip notices need no retry. Use analyze_file for images, PDF, ELF, or memory consistency. Query independent evidence in parallel and cite source/file:line. Missing or unverified evidence remains unknown. Plain text, XML, or promises are not tool calls; rely on completed structured results."""
+MCP_INSTRUCTIONS = """Use CodeTrail for project facts. Locate code with code_rag_search (build_target scopes compilation), text with grep_code, files with read_file, directories with list_dir. Query specs with query_knowledge, high-risk constraints with query_knowledge_strict, exact table cells with query_table. In git repos inspect git_status/git_diff before apply_patch; non-git skip notices need no retry. Use analyze_file for images, PDF, ELF, or memory consistency. Query independent evidence in parallel and cite source/file:line. Missing or unverified evidence remains unknown. Plain text, XML, or promises are not tool calls; rely on completed structured results."""
 
 if len(MCP_INSTRUCTIONS) > 700:  # pragma: no cover - import guard
     raise RuntimeError("MCP_INSTRUCTIONS exceeds the 700-character contract")
 
 
 EVIDENCE_TOOL_NAMES: frozenset[str] = frozenset(
-    {"code_rag_search", "query_knowledge", "query_table"}
+    {"code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table"}
 )
 
 
@@ -68,6 +69,10 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     "query_knowledge": (
         "Retrieve indexed PDF/spec/manual evidence. Use for document facts, not repository code; optionally restrict source to a "
         "basename. Cite returned sources and say evidence is unavailable when has_ref is false."
+    ),
+    "query_knowledge_strict": (
+        "Answer high-risk numeric/spec constraints through the server-side grounding and refusal gate. Use query_knowledge for normal "
+        "document lookup. Respect refused=true and review excluded_figures/excluded_text before asserting a value."
     ),
     "query_table": (
         "Read exact verified canonical table cells by register, address, or one-based row/column. "
@@ -99,7 +104,7 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "ingest_document": (
         "Ingest a sandboxed file into knowledge.json. PDF preflight_only estimates cost without writes; fresh rebuilds the KB. "
-        "MinerU needs mineru_content_list plus its generation-time PDF SHA-256; its OCR stays labeled unverified until review_text confirms it. "
+        "MinerU needs mineru_content_list plus its generation-time PDF SHA-256; strict excludes unverified OCR. "
         "Queries auto-reload after success. Ingest can take minutes: KB tools report busy until completion; wait, do not retry. "
         "Report [CODETRAIL_ACTION_REQUIRED] items and next steps. resume reuses validated checkpoints. "
         "redo_pages/redo_figures/retry_failed are mutually exclusive PDF selectors, require resume, and cannot combine with "
@@ -113,7 +118,7 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "review_text": (
         "List/show OCR or correct/confirm/revoke a revision. Changes require expected_revision and expected_sha256. "
-        "Correction does not confirm; set confirm_against_source only after source inspection. Only current confirmed, undamaged text counts as verified."
+        "Correction does not confirm; set confirm_against_source only after source inspection. Strict accepts current verified, undamaged text."
     ),
     "import_external_file": "Copy an explicitly allowed external file into the sandbox, then use the returned relative path with analyze_file or ingest_document.",
     "record_lesson": (

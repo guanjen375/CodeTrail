@@ -730,20 +730,6 @@ class TurnResult:
     notices: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
-class DirectToolResult:
-    """:meth:`Engine.run_tool_once` 的結果:``status`` 是 client_events 的 STATUS_*。
-
-    ``text`` 是工具文字(與模型會看到的那份相同);``dispatched`` = 真的送到了 MCP
-    (拒絕／不在 allowlist 時為 False)。
-    """
-
-    status: str
-    text: str
-    notice: str = ""
-    dispatched: bool = False
-
-
 class Engine:
     """一個對話。多個 Engine 可以共用同一個 ``McpClient``。"""
 
@@ -794,10 +780,6 @@ class Engine:
         self._active_request: llama_client.RequestCancellation | None = None
         self._in_turn = 0                      # 進行中的 send() / complete() / turn_scope 數(可巢狀)
         self._turn_completed = False           # 這一輪的答案 / 摘要已經**決定寫定**(之後的取消一律拒絕)
-        #: 這一輪寫定的是一則**完成的回答**(不是錯誤／收斂停止訊息)。協調器用它分辨
-        #: 「答案已寫定、後面還有審核／壓縮」與「send() 因錯誤退出」:前者的取消由協調器
-        #: 接受(只中斷後續工作),後者照舊拒絕。_begin_turn(0→1)與 clear_cancel() 清掉。
-        self._answer_committed = False
         self._turn_seen_since_clear = False    # 自上次 clear_cancel() 起 engine 開始過 turn(不管是寫定、失敗或中斷):
                                                # 閒置期的取消一律拒絕——「閒置且沒開始過」才是 worker 還沒進 send()
         self._armed = False                    # 協調器在 worker 進 send() 之前就取消:下一個 turn 一開始就中斷
@@ -1047,30 +1029,8 @@ class Engine:
             working = strip_historical_reasoning(working)
         return working
 
-    def completion_extra(self, *, response_format: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """:meth:`complete` 實送的 extra:``_chat_extra()`` 加上驗證過的 ``response_format``。
-
-        計數與生成必須是**同一份**(審核模型打包證據時先用它精確計數,再交給 complete)。
-        ``max_tokens``／``return_progress``／``chat_template_kwargs`` 一律由 ``_chat_extra()``
-        決定:max_tokens 就是 gate 的保留額,thinking 兩個鍵都是 false,不得被覆寫。
-        """
-        extra = self._chat_extra()
-        if response_format is not None:
-            extra["response_format"] = llama_client.validate_response_format(response_format)
-        return extra
-
-    def complete(
-        self,
-        messages: Sequence[Mapping[str, Any]],
-        *,
-        source: str,
-        response_format: Mapping[str, Any] | None = None,
-    ):
-        """一次非工具的模型呼叫(壓縮摘要、審核模型)。走同一個 gate 與這個 engine 的鎖。
-
-        ``response_format``(nested json_schema 外殼)只有審核模型會給;給了才放進 extra,
-        計數與生成用同一份。壓縮摘要不傳,送出的內容與以前逐字相同。
-        """
+    def complete(self, messages: Sequence[Mapping[str, Any]], *, source: str):
+        """一次非工具的模型呼叫(壓縮摘要用)。走同一個 gate 與同一把鎖。"""
         operation = "compact" if source == "compaction" else "response"
         content: list[str] = []
         reasoning: list[str] = []
@@ -1079,7 +1039,7 @@ class Engine:
             self._begin_turn()
             self._report_activity(operation, "preparing")
             payload = [dict(message) for message in messages]
-            extra = self.completion_extra(response_format=response_format)
+            extra = self._chat_extra()
             measured = self.count_input_tokens(payload, extra=extra)
             usage = self._check_context(
                 source=source,
@@ -1203,7 +1163,6 @@ class Engine:
             self._cancel.clear()
             self._armed = False
             self._turn_seen_since_clear = False
-            self._answer_committed = False
 
     def load_session(self, session_id: str) -> SessionSnapshot:
         """讀一段既有對話,**同時**產出模型歷史與畫面歷史。零狀態改動。
@@ -1254,17 +1213,6 @@ class Engine:
                 history = client_store.apply_turn_cancellation(history, record)
                 transcript = client_store.apply_turn_cancellation(transcript, record)
                 transcript.append({"type": "turn_cancelled", "time": record.get("time")})
-            elif kind == client_events.TYPE_AUDIT:
-                # 審核卡只給人看:**不進模型歷史**(payload、預熱 prefix、壓縮錨點與節錄都
-                # 看不到它),畫面照原順序重播。壞掉的記錄顯示「無法讀取」,不得讓整段
-                # 對話讀不出來,也不安靜丟掉。局部 import:client_audit 本身依賴這個模組。
-                import client_audit
-
-                checked = client_audit.validate_record(record)
-                transcript.append(
-                    checked if checked is not None
-                    else {"type": client_events.TYPE_AUDIT, "invalid": True}
-                )
         return SessionSnapshot(
             session_id=session_id,
             messages=tuple(history),
@@ -1350,25 +1298,6 @@ class Engine:
             # 在記憶體裡,使用者照常問下去,重開之後整段消失而且從來沒有警告。
             if self.store_error is None:
                 self.store_error = f"{type(exc).__name__}: {exc}"
-        return True
-
-    def record_audit(self, record: Mapping[str, Any]) -> bool:
-        """把一筆 ``answer_audit`` 記錄 append 進 session 檔。**不進** ``self.messages``。
-
-        審核結果只給人看:不送主模型、不改 payload／預熱 prefix／壓縮錨點與節錄。
-        落檔失敗設 ``store_error`` 並回 False(呼叫端發 notice);不 raise —— 審核
-        沒落檔不得帶走一則已經寫定的答案。
-        """
-        self._require_bound_session()
-        payload = dict(record)
-        if payload.get("type") != client_events.TYPE_AUDIT:
-            raise EngineError("record_audit 只收 answer_audit 記錄")
-        try:
-            self.store.append(self.session_id, payload)
-        except Exception as exc:  # noqa: BLE001 - 與 _record 同一條:要講,不中斷
-            if self.store_error is None:
-                self.store_error = f"{type(exc).__name__}: {exc}"
-            return False
         return True
 
     def _record_turn_cancellation(self, start: int) -> None:
@@ -1942,11 +1871,6 @@ class Engine:
                 _abandon()
             raise
         if "error" in box:
-            if self._cancel.is_set():
-                # 可取消的 transport(審查／審核／預熱)在取消時先關 socket:那個請求會以
-                # 連線錯誤結束,而且往往搶在上面的輪詢之前 —— 那是取消本身,不是服務壞掉
-                # (同 _guarded:被 cancel() 關掉的 I/O 例外一律翻成中斷)。
-                raise TurnCancelled("這一輪已被使用者中斷") from box["error"]
             raise box["error"]
         stream = box["stream"]
         with self._active_lock:
@@ -1963,7 +1887,6 @@ class Engine:
             self._in_turn += 1
             if self._in_turn == 1:
                 self._turn_completed = False
-                self._answer_committed = False
                 self._turn_seen_since_clear = True
                 if self._armed:
                     # 協調器在 worker 進來之前就取消了:這一輪一開始就是中斷。
@@ -1977,36 +1900,23 @@ class Engine:
                 self._cancel.clear()
                 self._turn_completed = False
 
-    def _decide_commit(self, *, answer: bool = False) -> None:
+    def _decide_commit(self) -> None:
         """線性化點:決定「這一輪的答案 / 摘要寫定」。
 
         跟 ``request_cancel()`` 在同一把 ``_turn_state`` 鎖裡:取消先到 → 這裡看到旗標,
         以 ``TurnCancelled`` 結束、**什麼都不寫**;這裡先到 → 之後的取消一律拒絕。
         鎖裡只做決定,不做 I/O:真正的 ``_record()``(store append + fsync)在鎖外——
-        不然協調器的鎖會跟著等 fsync。``answer`` 在同一個臨界區標出「寫定的是完成的回答」
-        (見 :attr:`answer_committed`),協調器才不會在兩步之間看到不一致的狀態。
+        不然協調器的鎖會跟著等 fsync。
         """
         with self._turn_state:
             if self._cancel.is_set():
                 raise TurnCancelled("這一輪已被使用者中斷")
             self._turn_completed = True
-            if answer:
-                self._answer_committed = True
 
     def _commit_final(self, message: dict[str, Any]) -> None:
         """寫入這一輪的最後一則 assistant:先在鎖內決定,再在鎖外落檔。"""
-        answer = (
-            message.get("tool_status") != client_events.STATUS_ERROR
-            and not message.get("tool_calls")
-        )
-        self._decide_commit(answer=answer)
+        self._decide_commit()
         self._record(message)
-
-    @property
-    def answer_committed(self) -> bool:
-        """這一輪是否已寫定一則完成的回答(協調器的「答後尾段」取消用;唯讀)。"""
-        with self._turn_state:
-            return self._answer_committed
 
     @contextlib.contextmanager
     def turn_scope(self):
@@ -2571,61 +2481,6 @@ class Engine:
             outcomes.append(outcome)
         return outcomes
 
-    def run_tool_once(
-        self,
-        name: str,
-        arguments: Mapping[str, Any],
-        *,
-        approve: Callable[[ApprovalRequest], bool] | None,
-        on_progress: Callable[[float, float | None, str | None], None] | None = None,
-    ) -> DirectToolResult:
-        """不經模型、只跑一次工具(``/kb``):與模型自己呼叫時走**同一條** ``_run_one_tool``。
-
-        allowlist、readonly 只認 JSON true、policy／permission 覆寫、ASK 核准(核准框完整
-        參數)、``NEVER_AUTO_ALLOWED``、重問上限、``begin_call`` 取消與 MCP 錯誤處理一處都不少。
-        只給 ephemeral engine 用(``client_kb.KbJob`` 每個動作一個):這裡會照工具路徑把一則
-        宣告它的 synthetic assistant tool_calls 與結果記進**這個** engine 的歷史,真的聊天
-        engine 不得呼叫它。
-
-        整段在 ``turn_scope`` 內:結果回來之前的取消 → ``TurnCancelled``(懸空呼叫先補上);
-        結果一回來就決定寫定,之後的取消一律拒絕 —— 工具已經發生的效果照實回報,不冒稱中斷。
-        """
-        call_id = f"kb_{secrets.token_hex(6)}"
-        payload = dict(arguments)
-        call = {
-            "id": call_id,
-            "name": name,
-            "arguments": payload,
-            "arguments_error": False,
-            "wire": {
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": json.dumps(payload, ensure_ascii=False)},
-            },
-        }
-        with self.turn_scope():
-            try:
-                with self._turn_state:
-                    if self._cancel.is_set():
-                        raise TurnCancelled("這個動作已被使用者中斷")
-                self._record({
-                    "role": "assistant", "content": None,
-                    "tool_calls": [call["wire"]], "synthetic": True,
-                })
-                outcome = self._run_one_tool(
-                    call, specs=self.tool_specs, approve=approve, denied_counts={},
-                    on_progress=on_progress,
-                )
-            except BaseException:
-                self.heal_pending_tool_calls()
-                raise
-            with self._turn_state:
-                self._turn_completed = True
-        return DirectToolResult(
-            status=outcome["status"], text=outcome["text"],
-            notice=outcome.get("notice", ""), dispatched=bool(outcome.get("dispatched")),
-        )
-
     def _run_one_tool(
         self,
         call: Mapping[str, Any],
@@ -2633,7 +2488,6 @@ class Engine:
         specs: Mapping[str, client_mcp.ToolSpec],
         approve: Callable[[ApprovalRequest], bool] | None,
         denied_counts: dict[str, int],
-        on_progress: Callable[[float, float | None, str | None], None] | None = None,
     ) -> dict[str, Any]:
         name = call["name"]
         arguments = call["arguments"]
@@ -2712,7 +2566,7 @@ class Engine:
             raise TurnCancelled("這一輪已被使用者中斷")
         self._report_activity("response", "tool", tool=name)
         try:
-            result = self._call_tool(name, arguments, on_progress=on_progress)
+            result = self._call_tool(name, arguments)
         except client_mcp.McpCallCancelledError:
             if self._cancel.is_set():
                 raise TurnCancelled("這一輪已被使用者中斷") from None
@@ -2735,26 +2589,17 @@ class Engine:
             dispatched=True,
         )
 
-    def _call_tool(
-        self,
-        name: str,
-        arguments: Mapping[str, Any],
-        *,
-        on_progress: Callable[[float, float | None, str | None], None] | None = None,
-    ) -> client_mcp.ToolCallResult:
+    def _call_tool(self, name: str, arguments: Mapping[str, Any]) -> client_mcp.ToolCallResult:
         """呼叫 MCP,並把進行中的呼叫登記給 ``cancel()``。
 
         ``begin_call`` + ``result()`` 而不是一步的 ``call()``:後者只有
         KeyboardInterrupt 一條取消路徑,TUI 的 worker 執行緒沒有 signal 可以送。
         替身 MCP(測試)沒有 ``begin_call`` 時退回 ``call()``。
-        ``on_progress``(``/kb add`` 的 ingest 秒數／行數)只有給值時才交給 ``begin_call``:
-        既有替身的 ``begin_call(name, arguments)`` 不收這個 kwarg。
         """
         begin = getattr(self.mcp, "begin_call", None)
         if not callable(begin):
             return self.mcp.call(name, arguments)
-        pending = (begin(name, arguments) if on_progress is None
-                   else begin(name, arguments, on_progress=on_progress))
+        pending = begin(name, arguments)
         with self._active_lock:
             self._active_call = pending
         try:

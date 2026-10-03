@@ -1878,7 +1878,7 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
        等於部分成功，違反 workflow §8-10。
     2. **狀態機不變式**：payload 裡有 `▯` / `unreadable` / `conflict` / uncertain span /
        index 缺口（漏 row/line）時，`verification_status` 必須**恰為** `needs_review`
-       （契約 §3 的定義）。trusted 會被當成可信證據；`unverified` 則讓漏列與猜過的
+       （契約 §3 的定義）。trusted 會直接進 strict query；`unverified` 則讓漏列與猜過的
        字元沒有覆核入口。另外 table 必須帶 `row_total`、terminal 必須帶 `line_total`，
        與 payload 推導值不符或缺漏一律拒絕——那是 REF 揭露截斷用的完整性宣告。
     3. **失敗原子**：`next_chunk_index` 先在 shadow copy 上推進，整批全部成功才一次
@@ -1989,7 +1989,7 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
             raise FigureValidationError(
                 f"{where}: payload 有不確定內容（{'; '.join(uncertainty)}），"
                 f"verification_status 必須恰為 {VERIF_NEEDS_REVIEW!r}，收到 {status!r}。"
-                "trusted 會被當成可信證據（REF 與回答審核都不再標待覆核）；unverified 則讓漏列/猜測沒有覆核入口"
+                "trusted 會直接進 strict query；unverified 則讓漏列/猜測沒有覆核入口"
             )
 
         evidence_ref = evidence_ref_by_figure.get(figure_id)

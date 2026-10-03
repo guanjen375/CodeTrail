@@ -433,7 +433,7 @@ def test_pixel_only_region_becomes_supervised_raster_candidate(tmp_path: Path):
     """只有像素的區域升格成 `KIND_RASTER`，**不得**直接被當成 table / terminal。
 
     `image_info` 仍然不是結構性證據：它換到的是「先用 image-bound schema 分類、再走
-    同一套 canonical payload / `▯` / review artifact / 驗證狀態標示」，而不是一個宣稱
+    同一套 canonical payload / `▯` / review artifact / strict gate」，而不是一個宣稱
     自己是表的候選。`page_boxes:table` 的 `pos` 非法時也一樣不得讓它變成 table。
 
     `KIND_RASTER` 是**候選階段**的 kind：`figure_extract` 不接受它入庫（見
@@ -2304,7 +2304,7 @@ def test_legacy_contract_pdf_promotes_pictures_as_raster_only(tmp_path: Path):
     """完整重建 `tests/test_rag_ingest.py::test_real_pymupdf4llm_contract` 的 PDF。
 
     79ef673 起這些純圖片頁**會**產生候選，但只能是 `KIND_RASTER`：先用 image-bound
-    schema 分類，再走同一套 canonical payload / 驗證狀態標示。這條守兩件事：
+    schema 分類，再走同一套 canonical payload / strict gate。這條守兩件事：
 
     1. 沒有任何候選頂著 table / terminal 的身分（那會直接進 dual pass 抽逐格內容）。
     2. 太小的 picture（12x12pt 的角落圖示）不得升格——它同時也是既有尺寸門檻的

@@ -281,6 +281,15 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_approval_message_editor_never_answers_the_tool_and_preserves_unsent_draft",
         ),
     ),
+    "test_strict_query_language.py": (
+        "顯式 strict 不因語言降級；英文數值略過擴寫但仍守 content-only/verification 閘與依賴失敗",
+        (
+            "test_english_numeric_query_skips_expansion_without_hiding_dependency_failure",
+            "test_explicit_strict_answers_verified_evidence_when_automatic_grounding_is_off",
+            "test_explicit_strict_refuses_unverified_weak_or_missing_evidence",
+            "test_english_numeric_lexical_recall_still_requires_verification_and_grounding",
+        ),
+    ),
     "test_pdf_real_regressions.py": (
         "圖面候選缺席不可冒稱正文缺席；表格空白列須有幾何及無墨跡證據、未知與真漏列仍拒絕",
         (
@@ -295,7 +304,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_text_table_review.py": (
-        "可信表格literal與OCR覆核版本、來源、CAS、狀態標示/section合併邊界不可失真",
+        "可信表格literal與OCR覆核版本、來源、CAS、strict/section合併邊界不可失真",
         (
             "test_exact_table_lookup_never_loads_models_and_preserves_literal_provenance",
             "test_table_document_alias_resolves_current_source_without_widening",
@@ -303,14 +312,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_evidence_reader_rejects_unsafe_metadata",
             "test_text_confirmation_is_bound_to_content_source_and_quality",
             "test_reingest_preserves_only_exact_review_binding_and_advances_invalidated_revision",
-            "test_text_eligibility_checks_every_section_and_merge_member",
+            "test_strict_text_eligibility_checks_every_section_and_merge_member",
             "test_ocr_heading_prefix_cannot_raise_gate_evidence",
             "test_text_correction_confirmation_and_revocation_publish_new_revisions",
             "test_text_review_cas_rejects_a_concurrent_writer",
             "test_text_review_readonly_paths_have_zero_model_calls_or_writes",
             "test_ocr_review_rejects_source_replacement_by_symlink",
             "test_existing_group_writable_project_and_sources_keep_review_safety",
-            "test_ocr_ref_label_discloses_unverified_status_and_revision_locator",
+            "test_strict_ocr_notice_discloses_unverified_status_and_revision_locator",
         ),
     ),
     "test_build_context.py": (
@@ -374,7 +383,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_exact_table_budget_never_exposes_a_shortened_cell_value",
             "test_table_scope_and_recovery_reach_model_text_without_widening",
             "test_text_review_json_error_is_not_reported_as_success",
-            "test_ocr_status_and_build_unknown_reach_the_model_text_lane",
+            "test_ocr_exclusion_and_build_unknown_reach_the_model_text_lane",
             "test_every_public_code_mode_uses_the_selected_build_context",
             "test_new_table_and_review_tools_have_distinct_authority",
             "test_ingest_selector_schema_avoids_unsupported_grammar_repetition_and_keeps_limits",
@@ -520,7 +529,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_section_retrieval.py": (
-        "章節展開去重、chunk/node 分數隔離、全候選rerank與MinerU 狀態標示邊界",
+        "章節展開去重、chunk/node 分數隔離、全候選rerank與MinerU strict邊界",
         (
             "test_section_members_expand_completely_without_duplicates_or_filter_leaks",
             "test_section_rank_never_substitutes_for_a_members_own_dense_or_lexical_gate",
@@ -529,11 +538,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_query_sends_all_sixty_gate_qualified_members_to_batched_reranker",
             "test_section_rank_cannot_change_expansion_rerank_or_threshold_decisions",
             "test_inline_vectors_explicitly_disable_sections_without_embedding_calls",
-            "test_mineru_text_refs_disclose_lane_and_unverified_status",
-            "test_mineru_text_status_does_not_taint_a_figures_own_verified_evidence",
-            "test_neighbor_and_merge_paths_keep_mineru_text_labeled_unverified",
+            "test_mineru_text_is_excluded_with_page_reasons_and_normal_refs_disclose_lane",
+            "test_strict_mineru_text_exclusion_preserves_a_figures_own_verified_evidence",
+            "test_strict_neighbor_and_merge_paths_cannot_reintroduce_mineru_text",
             "test_mineru_figure_headings_cannot_alias_gate_when_no_generated_ctx_exists",
-            "test_mineru_heading_only_numeric_literal_cannot_pass_the_lexical_gate",
+            "test_mineru_heading_only_numeric_literal_cannot_pass_strict_lexical_gate",
             "test_section_lexical_corpus_counts_its_persisted_title_once",
         ),
     ),
@@ -572,7 +581,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_mineru_cli_preserves_source_options_and_rejects_other_modes",
             "test_mineru_mcp_keeps_source_names_and_checks_both_sandbox_paths",
             "test_mineru_replaced_text_owner_keeps_known_quality_repairs",
-            "test_mineru_ocr_status_survives_the_mcp_query_return",
+            "test_mineru_exclusion_survives_every_mcp_query_return",
             "test_mineru_preloaded_artifact_cannot_bind_another_same_named_pdf",
             "test_mineru_missing_pages_survive_summary_normalization_and_log_truncation",
         ),
@@ -655,7 +664,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_failure_sources_and_detected_region_limits_survive_notification_boundary",
             "test_review_header_retains_manual_count_without_counting_repairs",
             "test_non_table_candidate_still_replaces_its_native_table_span",
-            "test_flagged_ref_retains_review_label_and_repair_routing",
+            "test_strict_exclusion_hint_retains_review_label_and_repair_routing",
         ),
     ),
     "test_aicode.py": (
@@ -789,7 +798,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_mcp_server.py": (
-        "live MCP 20-tool 固定順序(strict 已移除)、typed schema 與 catalog budget；"
+        "live MCP 19-tool 固定順序、typed schema 與 catalog budget；"
         "省略 max_chars 時結果預算依 call-time n_ctx 的 12% 動態配置；"
         "mcp_server 啟動時的 AICODE_ROOT 驗證與 set_sandbox_root；"
         "PATCH_ENABLED / RUN_COMMAND_ENABLED / build 命令預設；"
@@ -802,7 +811,6 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_graph_dependency_failure_is_an_mcp_error",
             "test_elf_tool_failures_are_mcp_errors",
             "test_live_catalog_is_bounded_typed_and_ordered",
-            "test_public_catalog_has_twenty_tools_and_no_strict_query",
             "test_default_budget_tracks_n_ctx",
             "test_rejects_empty_root",
             "test_rejects_root_slash",
@@ -837,7 +845,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_mcp_ingest.py": (
         "ingest 通知的零誤報/零漏報:舊 run 不得重報、身分逐字保留、檔名不得偽造 marker、寫端不得改寫呼叫端交來的 payload；"
-        "ingest 的 stdout 不得污染 JSON-RPC 通道、失敗不得回報成功、ingest 期間 KB 工具必須讓路、子行程(含後代)必須收乾淨、工具目錄與 ingest schema 不變",
+        "ingest 的 stdout 不得污染 JSON-RPC 通道、失敗不得回報成功、ingest 期間 KB 工具必須讓路、子行程(含後代)必須收乾淨、19 工具 schema 不變",
         (
             "test_old_run_failures_never_reach_the_payload",
             "test_review_block_points_at_review_figures",
@@ -1652,16 +1660,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_rag_retrieval.py": (
-        "data flywheel 記的檢索路徑(metadata.trace)必須與實際回傳的 refs 逐筆對齊;"
-        "strict 檢索已移除,檢索 API 不得再接受 is_strict_mode,trace schema 2 沒有 strict 欄位"
-        "但 flagged 圖面仍帶狀態;英文數值題略過擴寫但不得隱藏依賴失敗",
+        "strict KB 拒答閘不得把同文件的強檢索誤當成使用者點名欄位的存在證據;"
+        "data flywheel 記的檢索路徑(metadata.trace)必須與實際回傳的 refs 逐筆對齊",
         (
+            "test_refuse_answer_rejects_explicitly_missing_identifier",
             "test_query_metadata_carries_the_retrieval_path_aligned_with_refs",
             "test_query_trace_keeps_every_candidate_and_every_reranker_score",
             "test_query_exposes_the_partial_trace_when_retrieval_raises",
-            "test_trace_schema_2_has_no_strict_fields_and_labels_the_flagged_figure",
-            "test_kb_query_and_rerank_reject_the_removed_strict_parameter",
-            "test_english_numeric_query_skips_expansion_without_hiding_dependency_failure",
+            "test_strict_all_excluded_records_the_stop_reason_and_the_excluded_figures",
             "test_the_kb_hands_its_loaded_bytes_to_the_snapshot_hook",
         ),
     ),
@@ -1677,104 +1683,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_figure_retrieval.py": (
-        "review_figures 的文件身分逐位元組比對(通知給的建議命令用的是同一個身分);"
-        "strict 移除後,未驗證圖面在一般查詢的 REF 文字與 refs 都必須帶狀態與原因,"
-        "refs 的內容身分(content_sha256/content_chars)與實際印出的內容一致且不進模型可見文字",
+        "review_figures 的文件身分逐位元組比對(通知給的建議命令用的是同一個身分)",
         (
             "test_document_identity_is_matched_byte_for_byte",
             "test_extraction_failure_is_stated_affirmatively",
             "test_docs_never_claim_a_single_bad_figure_blocks_the_whole_document",
-            "test_ref_content_identity_matches_the_printed_content",
-            "test_flagged_figure_is_returned_with_its_status_in_text_and_refs",
-            "test_query_transport_keeps_status_labels_and_hides_content_identity",
-        ),
-    ),
-    "test_auditor_deployment.py": (
-        "審核模型角色 auditor:加在角色尾端、在 VL 之前啟停;舊四角色本機／A/B 設定可載入(含 config import 與"
-        "重跑精靈),使用前才以唯一修法訊息 fail-loud;launcher 在啟動任何服務前拒絕未設定;授權只接受空／舊四／五角色,"
-        "auditor 只放行自己的 chat 與計數路徑,舊 grants 永不授權 auditor;B 只接受五角色 manifest;--yes 不替使用者選",
-        (
-            "test_auditor_is_appended_and_both_role_lists_agree",
-            "test_the_session_fixture_points_the_auditor_at_a_dead_port",
-            "test_auditor_starts_and_stops_before_vl",
-            "test_only_main_and_auditor_models_may_be_null",
-            "test_legacy_local_deployment_loads_and_config_imports",
-            "test_daily_setup_reaches_the_wizard_from_a_legacy_local_deployment",
-            "test_launcher_refuses_an_unconfigured_auditor_before_starting_anything",
-            "test_main_only_launch_is_not_blocked_by_the_auditor",
-            "test_exec_refuses_an_unconfigured_auditor_without_exec",
-            "test_stop_skips_the_unconfigured_auditor_and_still_succeeds",
-            "test_status_and_doctor_name_the_local_fix",
-            "test_client_mode_accepts_exactly_five_or_the_legacy_four_roles",
-            "test_model_endpoint_grants_accept_empty_legacy_four_or_all_five",
-            "test_model_endpoint_grants_reject_other_shapes",
-            "test_partial_grants_name_the_missing_roles_and_the_fix",
-            "test_the_auditor_grant_authorizes_only_its_own_chat_and_count_paths",
-            "test_legacy_split_client_loads_but_never_authorizes_the_auditor",
-            "test_status_doctor_and_device_name_the_split_fix",
-            "test_split_client_setup_requires_a_five_role_manifest",
-            "test_model_host_without_auditor_cannot_export_or_skip_setup",
-            "test_yes_requires_explicit_auditor_answers_and_writes_them",
-        ),
-    ),
-    "test_client_audit.py": (
-        "回答審核:證據只用模型看過的 text lane 並以內容雜湊對位(偽造／截斷不得借到可信 metadata)、"
-        "引用只做空白正規化、只靠待覆核證據或證據不完整不得通過、格式錯誤不是通過、"
-        "審核記錄不進模型歷史與預熱、獨立鎖與同一個輸出數字、答後尾段取消零請求",
-        (
-            "test_real_kb_refs_align_with_the_text_the_model_saw",
-            "test_budget_truncation_leaves_the_tail_ref_unmatched_without_mispairing",
-            "test_a_forged_ref_inside_document_text_cannot_borrow_trusted_metadata",
-            "test_overlapping_ref_regions_reject_the_whole_call",
-            "test_missing_refs_or_hashes_never_become_evidence",
-            "test_flagged_set_is_the_knowledge_set",
-            "test_unconfirmed_ocr_is_flagged_and_only_flagged_support_is_not_a_pass",
-            "test_quotes_match_only_modulo_whitespace",
-            "test_a_supported_claim_needs_a_real_quote_from_the_cited_evidence",
-            "test_omitted_or_unmatched_evidence_never_yields_an_overall_pass",
-            "test_malformed_auditor_output_is_an_error_not_a_pass",
-            "test_a_truncated_auditor_response_is_an_error",
-            "test_only_completed_interactive_turns_with_kb_evidence_are_audited",
-            "test_a_supplement_is_not_mistaken_for_the_turn_question",
-            "test_the_audit_record_never_enters_model_history",
-            "test_a_broken_audit_record_is_shown_as_unreadable",
-            "test_replay_shows_the_card_without_changing_tool_group_pairing",
-            "test_the_audit_request_uses_its_own_lock_and_one_output_number",
-            "test_evidence_that_does_not_fit_is_omitted_and_reported",
-            "test_an_answer_too_long_for_the_auditor_is_an_error",
-            "test_ctrl_c_after_the_answer_but_before_the_audit_is_accepted",
-            "test_an_accepted_tail_cancel_is_never_ignored_by_compaction",
-            "test_a_queued_turn_opens_the_answer_tail_like_a_typed_one",
-            "test_a_cancel_while_the_audit_waits_for_the_server_is_a_cancel_not_an_error",
-            "test_the_card_title_keeps_every_category_and_the_review_hint",
-            "test_a_cancel_after_send_failed_is_still_refused",
-            "test_cancel_during_a_registered_audit_sends_no_request",
-            "test_an_audit_failure_does_not_change_the_turn_or_pause_the_queue",
-            "test_no_auditor_means_no_audit_phase",
-            "test_the_tui_shows_the_card_live_on_status_and_on_replay",
-            "test_preflight_refuses_an_unusable_auditor_and_reports_the_live_target",
-        ),
-    ),
-    "test_client_kb.py": (
-        "/kb:讀取零寫入且在背景執行、清單保留整份零寫入的失敗與掃描錯誤、寫入一律經同一條工具路徑"
-        "(policy／permission 覆寫／核准框完整參數／readonly)、字串層拒絕先於任何 FS、專案外只入庫落點副本、"
-        "確認送出的就是畫面上那一份、取消導向 KB 動作、不寫聊天歷史也不建立 session",
-        (
-            "test_reads_are_zero_write_and_list_the_flagged_figure",
-            "test_review_list_keeps_failed_zero_write_runs_and_scan_errors",
-            "test_a_payload_with_unreadable_glyphs_cannot_be_confirmed_as_is",
-            "test_ocr_units_are_listed_and_confirmation_binds_the_shown_revision",
-            "test_flagged_statuses_match_the_retrieval_side",
-            "test_ingest_extensions_match_the_server",
-            "test_writes_go_through_policy_and_the_approval_box",
-            "test_kb_add_rejects_at_the_string_layer_before_any_filesystem_access",
-            "test_external_add_imports_then_ingests_only_the_landed_copy",
-            "test_figure_fix_sends_the_confirmed_payload_and_its_revision",
-            "test_cancel_routes_to_the_kb_job_and_cancels_the_mcp_call",
-            "test_kb_commands_are_refused_while_anything_else_is_running",
-            "test_kb_actions_never_write_chat_history_or_create_a_session",
-            "test_kb_reads_run_off_the_ui_thread",
-            "test_choosing_confirm_in_the_detail_screen_maps_to_the_shown_payload",
         ),
     ),
     "test_rag_ingest.py": (

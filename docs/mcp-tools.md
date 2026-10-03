@@ -6,10 +6,10 @@
 
 ---
 
-## CodeTrail 暴露的 20 個 MCP 工具
+## CodeTrail 暴露的 21 個 MCP 工具
 
 live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_code`、
-`code_rag_search`、`file_info`、`query_knowledge`、`query_table`、
+`code_rag_search`、`file_info`、`query_knowledge`、`query_knowledge_strict`、`query_table`、
 `git_status`、`git_diff`、`apply_patch`、`run_lint`、`run_command`、`analyze_file`、
 `ingest_document`、`remove_document`、`reload_knowledge_base`、`review_figures`、`review_text`、
 `import_external_file`、`record_lesson`。名稱與順序的唯一來源是
@@ -30,12 +30,12 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 找某個字串或錯誤訊息 | 請用工具 `grep_code` 搜尋錯誤訊息「panic: xxx」，範圍限 C/C++ 檔，並顯示上下文。 | `grep_code(...)` |
 | 讀一個已知檔案 | 請用工具 `file_info` 看 `src/main.py` 大小，再用工具 `read_file` 讀前 120 行。 | `file_info(...)`、`read_file(...)` |
 | 查已匯入的 spec | 請用工具 `query_knowledge` 查 reset timing 限制，回答要附 REF。 | `query_knowledge(...)` |
-| 規格數字要能核對 | 請用工具 `query_knowledge` 查 reset assert 最小時間，每個數字附 REF。回答下方的審核卡會逐條核對引用，見[回答審核](usage.md#answer-audit)。 | `query_knowledge(...)` |
+| 查不能答錯的規格數字 | 請用工具 `query_knowledge_strict` 查 reset assert 最小時間，證據不夠就拒答。 | `query_knowledge_strict(...)` |
 | 看專案外的截圖/PDF/log | 先 `/import on` 並重開 `aicode`，再在訊息裡寫 `@~/Downloads/error.png 這是什麼錯誤？`；核准匯入後客戶端自動分析 `.aicode_uploads/` 裡的副本，詳見[檔案在專案目錄外](usage.md#external-attachments)。也可以請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)`、`analyze_file(...)` |
 | 看圖片、PDF、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`（或 `docs/spec.pdf`），做通用 VL 圖片分析、PDF 一次性抽文字或 binary 分析。 | `analyze_file(...)` |
 | 夾帶專案內的檔案 | 在訊息裡寫 `@shots/error.png 這是什麼錯誤？`（路徑含空白用 `@"路徑"`；`@` 後面打檔名可搜尋整個專案，拖放或貼上路徑也會自動改寫）；送出前客戶端自動呼叫 `analyze_file`（圖片、PDF、ELF、binary）或 `read_file`（其他檔案），結果以工具卡顯示，詳見[夾帶附件](usage.md#attachments)。 | `analyze_file(...)`、`read_file(...)` |
 | 深入看一個 ELF | 請用工具 `analyze_file` 分析 `build/app.elf`，`view` 設 "symbols"、`target` 設 "uart"（或 `view` 設 "disasm"、`target` 設 "Reset_Handler"；`view` 設 "dwarf"、`target` 設 "0x08001234"）。 | `analyze_file(path, view="symbols", target="uart")` |
-| 把文件/圖片/binary 加進 KB | 在 TUI 輸入 `/kb add @docs/spec.pdf`（或 `arch.png`、`firmware.bin`），見[知識庫指令 /kb](usage.md#kb)；也可以請模型用工具 `ingest_document` 匯入。之後查詢會自動載入；想立即確認 chunk 數再補 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
+| 把文件/圖片/binary 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`（或 `arch.png`、`firmware.bin`）。之後查詢會自動載入；想立即確認 chunk 數再補 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
 | 圖很多的 PDF，先估成本 | 請用工具 `ingest_document` 對 `docs/datasheet.pdf` 設 `preflight_only=True`，回報候選數、VL 呼叫次數與是否超過上限。 | `ingest_document(path, preflight_only=True)` |
 | 把 KB 重建成只有這一份文件 | 請用工具 `ingest_document` 匯入 `docs/spec_v2.pdf`，`fresh` 設 True，回報清掉幾個 chunk、保留幾筆 human_verified。 | `ingest_document(path, fresh=True)` |
 | 覆核 PDF 抽出來的表格 / log | 請用工具 `review_figures` 列出待覆核的圖，說明每一張的原因；我看過原圖再決定要不要修。 | `review_figures(action="list")`、`review_figures(action="fix", ...)` |
@@ -63,6 +63,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
 | 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
+| 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 選用即強制嚴格證據檢查，不因語言分類降級；弱證據拒答，可限定文件 |
 | 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動；非 git 專案回固定的跳過通知（`status: ok`，不是錯誤、不用重試） |
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git；非 git 專案同樣回跳過通知 |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
@@ -163,7 +164,7 @@ TUI 顯示 error。成功輸出的正文即使含有錯誤字樣，也不會因�
 （`read_file` 50,000、`list_dir` 20,000、`code_rag_search` 30,000 字元）；高於 12% 預設
 預算時文字結果會標 `context_risk`。
 
-`code_rag_search`、`query_knowledge`、`query_table` 另外保留 core payload
+`code_rag_search`、`query_knowledge`、`query_knowledge_strict`、`query_table` 另外保留 core payload
 於 `structuredContent`，供會採用它的 MCP client 使用；文字 renderer 不重複輸出
 `text`／`display`／`refs` 三份同義內容。其他文字工具不宣告 `{"result": string}`
 outputSchema，避免同一 payload 被 SDK 重複序列化。
@@ -182,15 +183,14 @@ outputSchema，避免同一 payload 被 SDK 重複序列化。
 程式碼與檔案樹優先保存逐行符號與縮排；章節／圖表目錄的確定導覽範圍不進檢索或脈絡生成，
 混合頁正文與有資訊價值的檔案樹保留。舊 KB 需重新 ingest 才套用新判斷。
 
-| 情況 | 收哪些候選 | 產出 | 有沒有 `▯` / 逐格證據 / 驗證狀態 |
+| 情況 | 收哪些候選 | 產出 | 有沒有 `▯` / 逐格證據 / strict gate |
 |---|---|---|---|
 | 結構化 lane 收錄 | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON + 衍生文字 chunk | 有 |
 | 判定不是圖面 | 封面、logo、商標、裝飾線條、產品照片、單純的 GUI 圖示 | 零抽取、零 chunk（只留在 review artifact 與缺席清單） | 不適用 |
 | lane 沒收 | 沒有結構性證據的區域、超出上限的候選、整頁 abstain 的頁 | **不入庫**，ingest 列出頁碼 / bbox / 原因 | 不適用 |
 
 被拍成圖或掃描進來的表格與終端機會出現在 `review_figures`，但沒有獨立原生證據時通常是
-`unverified` / `needs_review`：REF 標為待覆核，回答審核也不把它當可信證據，直到人工對原圖確認
-（`/kb review`）。整頁散文走
+`unverified` / `needs_review`，strict 查詢仍會擋下，直到人工對原圖確認。整頁散文走
 `prose`（逐行轉錄），`diagram` 也有自動分類與 structured producer。2026-08-30 移除了舊的
 自由文字 VL 相容 lane（既有 KB 的 `origin="diagram"` chunk 仍照原語意保留）。
 
@@ -205,12 +205,12 @@ structure_error / unusable / unknown`，`review_state` 為 `unreviewed / confirm
 `fix` 必須先修掉內容損壞，再明示對照原圖確認；不得把仍有缺字的 payload 標成可信。
 若目前 revision 已由可靠來源證明轉錄缺漏（`transcription_source_incomplete`），清單會標
 `fixable=False` 並說明須重新 ingest 核對來源；現有 fix 不具完整來源，不能確認補字是否完整。
-品質不替代驗證狀態；`usable` 也不代表完整 OCR 或已經人工確認。
+品質不替代原有 strict gate；`usable` 也不代表完整 OCR 或已經人工確認。
 
 **六種 `verification_status`**(structured chunk 的驗證來源／信任狀態；抽取是否完成另看
 `extraction_status ∈ {complete, failed, skipped}`)
 
-| 狀態 | 意思 | 審核時算不算可信證據 |
+| 狀態 | 意思 | strict 查詢用不用 |
 |---|---|---|
 | `native_verified` | 原生表格 geometry 與**至少另一個原生** evidence channel 在 row/cell 結構與 critical token 上一致（單次 `find_tables().extract()` 不算） | ✔ |
 | `corroborated` | 視覺抽取與獨立 PDF 文字/幾何證據**逐格或逐行**一致。terminal 的比對走空白正規化,所以**不等於**逐位元組一致（PDF 文字層證明不了 tab vs 多個 space） | ✔ |
@@ -219,20 +219,19 @@ structure_error / unusable / unknown`，`review_state` 為 `unreviewed / confirm
 | `unverified` | 結構合法、未發現衝突,但沒有獨立證據（無 anchor 的同模型多次取樣即使全等也只到這級） | ✘ |
 | `legacy_unverified` | 舊 KB 缺欄位的 figure chunk,含所有既有的 VL diagram / 圖片 chunk | ✘ |
 
-後三種合稱 **flagged** —— 那是查詢與審核時的標示,**不是第七種狀態**。一張圖切成多個 chunk 時,
+後三種合稱 **flagged** —— 那是查詢時的 filter,**不是第七種狀態**。一張圖切成多個 chunk 時,
 聚合一律取**最差**的成員狀態。
 
 **查詢端的差別**
 
+- `query_knowledge_strict`:flagged 的圖片內容在 **code 層**就被排除,不進 REF、也不影響門檻
+  計算,所以嚴格模式不會用未驗證的圖片數值回答 register / bit range / 規格數字。被排除的那些
+  會出現在回傳的 `excluded_figures`（帶 source / page / figure_id / figure_index / kind /
+  狀態 / 原因）與 `review_hint`,**四條回傳路徑都有**。全部候選都被擋下時你仍看得到「哪一頁、
+  哪一張圖可用但待覆核」,不會變成「查不到」的假象。
 - `query_knowledge`:可以回未驗證內容,但 REF 與 machine-readable metadata 都帶 status /
   reasons / row 或 line range / truncation,不是只靠 prompt 提醒模型。REF 因預算截斷時會顯示
-  實際的 row/line 範圍與總數,不會讓你以為整張 log 都在。flagged 的圖面與未確認的 OCR 不算
-  權威來源,來源排序也降權。
-- `query_knowledge` 回傳 `{text, display, refs, top_score, has_ref}`（KB 未載入時另有 `error`）。
-  `refs` 每一筆另帶 `content_sha256`／`content_chars`：REF 區塊 `content:` 之後實際印出那段內容的
-  身分，只放在 `structuredContent`、不進模型可見文字；客戶端的回答審核用它把模型看過的文字對回
-  這一筆的驗證狀態，對不上（截斷、偽造或格式漂移）就不當證據。
-- [回答審核](usage.md#answer-audit):只靠 flagged 證據支持的陳述最多是 ⚠,不會是 ✔。
+  實際的 row/line 範圍與總數,不會讓你以為整張 log 都在。
 - 與文字抽取的 REF 衝突時**不宣稱哪一邊必勝**:兩邊的數值與出處都會列出,並標明衝突未解。
 
 **preflight(圖多的 PDF 先跑這個)**
@@ -330,15 +329,15 @@ python3 RAG.py docs/spec.pdf knowledge.json \
 找不到唯一且已收錄的表格 owner、或正文與圖表無法安全分開時整份失敗，可省略 MinerU
 參數改用 native lane。
 
-MinerU 文字預設未獨立驗證。`query_knowledge` 的 REF 顯示 `text_lane=mineru` 與
-`text_verification_status`（未確認時為 `unverified`）。經 `review_text`（或 `/kb review`）對照來源確認後，
-只有目前內容、來源版本與品質均有效的段落才標 `human_verified`；校字本身不等於確認。
-只靠未確認 OCR 支持的陳述在回答審核是 ⚠。詳見 [正文覆核](usage.md#text-table-review)。
+MinerU 文字預設未獨立驗證。`query_knowledge` 的 REF 顯示 `text_lane=mineru`；
+`query_knowledge_strict` 排除未符合驗證條件的段落，以 `metadata.excluded_text` 列來源、
+頁碼與原因。經 `review_text` 對照來源確認後，只有目前內容、來源版本與品質均有效的
+段落可進 strict；校字本身不等於確認。詳見 [正文覆核](usage.md#text-table-review)。
 這不提高任何 figure 的驗證／品質，也不代表全 PDF OCR 完成。
 
 章節召回與 chunk 召回以 RRF 合併。命中節點會把整節 chunk 加入候選並去重，
 通過各自證據門檻的成員全數送進本地 reranker；最後仍受 top-k 與 REF 預算限制。
-節點分數只用於召回，不作證據門檻，且不替代 chunk 層。舊 KB 的節點從現有 chunk metadata／正文
+節點分數不作 strict 證據，且不替代 chunk 層。舊 KB 的節點從現有 chunk metadata／正文
 重建，無須重解析 PDF；新 schema 的 cache 重算需本地 embedding server，失敗就停止。
 
 ### `analyze_file` 的 ELF 視角
@@ -409,14 +408,14 @@ void led_toggle(void) {
 - 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次建置要在終端跑一次建立命令——沒建就查 graph 模式會明確報錯,**錯誤訊息就含完整可執行的那條命令**(實際 interpreter 與絕對路徑,直接複製貼上;semantic 不受影響);建好之後查詢自動偵測檔案變更做增量更新,安裝 tree-sitter grammar 或改 `config.H_LANG` 後會自動整體重建。graph 可用時先查 `neighbors`;`graph_status` 為 unavailable 時改用 `mode="context"` / `grep_code`,並把 caller coverage 標為不完整——不能因為沒看到呼叫者就推論沒有呼叫者。
 - 檔案變更偵測有一個 30 秒的快照窗(`config.CODE_RAG_REFRESH_TTL_SECONDS`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
-- 查 spec 先用工具 `query_knowledge`；數字、限制、預設值要逐項附 REF，互動 TUI 會在回答下方用審核卡核對引用。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
+- 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
 - 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。
 - 新增或刪除文件後查詢會自動載入變更；要立即確認 chunk 數可用工具 `reload_knowledge_base`。
 - git 專案改檔前先看工具 `git_status` / `git_diff`（非 git 專案會回跳過通知，直接改檔）；改檔用工具 `apply_patch`（SEARCH/REPLACE 或 unified diff 二擇一，先 `dry_run` 預覽）。
 - `apply_patch`（寫檔）、`run_lint(fix=True)`（格式化）、`run_command`（執行命令）是三個不同的 ask，各自需要你核准。apply_patch 不會自動執行 lint / typecheck / test；需要改檔或執行專案腳本時才允許。
 - 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [使用指南](usage.md#lessons)。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。
-- REF 標「待覆核」的圖片內容不得當成規格數值的定論，引用時照實轉述頁碼、狀態與原因。**structured figure（REF 帶 `figure_id`）能用 `/kb review` 或工具 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。被分類器判定「不是
+- REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。被分類器判定「不是
 圖面」的（封面、logo）不會收為 figure，也不進覆核清單；此紀錄不能推論同區域的原生正文缺席。
 
 ---

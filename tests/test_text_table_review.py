@@ -242,7 +242,7 @@ def test_reingest_preserves_only_exact_review_binding_and_advances_invalidated_r
     assert changed["text_id"] in document._codetrail_text_review_summary["invalidated"]
 
 
-def test_text_eligibility_checks_every_section_and_merge_member(tmp_path, monkeypatch):
+def test_strict_text_eligibility_checks_every_section_and_merge_member(tmp_path, monkeypatch):
     import knowledge
     from knowledge import KnowledgeBase
     verified = _confirmed(_text(tmp_path, index=0))
@@ -367,28 +367,14 @@ def test_ocr_review_rejects_source_replacement_by_symlink(tmp_path, monkeypatch)
     assert not verdict["eligible"] and verdict["reason"] == "source_unavailable"
 
 
-def test_ocr_ref_label_discloses_unverified_status_and_revision_locator(tmp_path):
-    """未確認的 OCR 在 REF 文字與 refs metadata 都標出狀態與定位(text_id／text_revision)。
-
-    strict 檢索移除後,這是使用者與客戶端回答審核看得到「這段 OCR 待覆核」的管道;
-    少了定位就無從用 review_text 覆核。
-    """
+def test_strict_ocr_notice_discloses_unverified_status_and_revision_locator():
     from knowledge import KnowledgeBase
-    pending = _text(tmp_path, index=0)
-    pending["chunk_idx"] = 0
-    kb = KnowledgeBase.__new__(KnowledgeBase)
-    kb.path, kb.chunks = tmp_path / "knowledge.json", [pending]
-    kb._text_source_cache = {}
-
-    label = kb._text_ref_label(pending)
-    metadata = kb._text_ref_metadata(pending)
-
-    assert "OCR 未經獨立驗證" in label
-    assert f"text_id={pending['text_id']}" in label
-    assert f"text_revision={pending['text_revision']}" in label
-    assert metadata["text_verification_status"] == "unverified"
-    assert metadata["text_id"] == pending["text_id"]
-    assert metadata["text_revision"] == pending["text_revision"]
+    rendered = KnowledgeBase._excluded_text_line([
+        {"source": "synthetic.pdf", "page": 3, "text_id": "text_" + "a" * 24,
+         "text_revision": 7, "reason": "mineru_text_not_independently_verified"}])
+    assert "未經獨立驗證" in rendered
+    assert "synthetic.pdf p.3" in rendered and "text_" + "a" * 24 in rendered
+    assert "rev=7" in rendered and "review_text" in rendered
 
 
 def test_existing_group_writable_project_and_sources_keep_review_safety(tmp_path, monkeypatch):
