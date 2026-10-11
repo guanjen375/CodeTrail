@@ -355,6 +355,25 @@ def render_lessons(result: Preflight, *, skip: bool = False) -> None:
         )
 
 
+def check_prompt_sources(result: Preflight) -> None:
+    """system prompt 的來源檔在 canary **之前**先組一次。
+
+    AGENTS.md / lessons / instructions.md 超限,或流程指示(playbook)的檔名、格式、
+    權限不合格時,客戶端本來就拒絕啟動 —— 但第一個撞到它的是 headless canary,而那裡
+    只會回「headless run exit 1(輸出已避免顯示)」,看起來像模型或模板壞了。這裡先把
+    真正的原因講出來。只讀不寫;通過時只在有安裝流程指示的情況多印一行。
+    """
+    import client_prompt
+
+    try:
+        prompt = client_prompt.build_system_prompt(result.root)
+    except client_prompt.PromptError as exc:
+        raise PreflightError(f"system prompt 的來源檔不合格,拒絕啟動:{exc}") from exc
+    names = tuple(getattr(prompt, "playbooks", ()) or ())
+    if names:
+        result.note(f"流程指示:{len(names)} 份已進索引({', '.join(names)})")
+
+
 def _drop_rendered(result: Preflight) -> None:
     """把先前 render 的 `.codetrail/lessons.md` 清掉(best-effort)。"""
     import lessons
@@ -490,6 +509,7 @@ def run(root: Path, *, skip_tool_health: bool = False) -> Preflight:
             requested = observe_n_ctx(result, profile)
             check_ctx_safety(result, profile, requested)
             render_lessons(result)
+            check_prompt_sources(result)
             check_required_servers(result)
             hint = "" if profile.mode == "client" else legacy_web_backend_hint()
             if hint:

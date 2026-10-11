@@ -396,10 +396,12 @@ def client_identity() -> str:
     """跑這次 replay 的客戶端身分。
 
     ``client_attachments.py`` 決定一則使用者文字裡哪些 ``@路徑`` 會先以工具讀進歷史,
-    也是 replay 行為的一部分。
+    也是 replay 行為的一部分。``playbooks.py`` 決定流程指示的索引怎麼進 system prompt
+    (以及 ``load_playbook`` 回什麼),同樣會改變模型看到的東西。
     """
     parts = []
-    for name in ("client_engine.py", "client_prompt.py", "codetrail_chat.py", "client_attachments.py"):
+    for name in ("client_engine.py", "client_prompt.py", "codetrail_chat.py", "client_attachments.py",
+                 "playbooks.py"):
         try:
             parts.append(
                 session_eval.text_digest((REPO_ROOT / name).read_text(encoding="utf-8"))

@@ -169,9 +169,26 @@
   server 仍回工具或同批超額時一律零執行、不詢問核准、依宣告順序補全 error 結果。
   收斂失敗／重複前言不是答案，停止訊息經 `_commit_final` 且帶 `tool_status=error`；
   取消後不得再發收斂請求，也不得把未完成答案寫入歷史
+- `tool_result_adapter` 的查無指引——`query_table`／`list_table_rows`／`query_knowledge` 沒有可用證據、
+  `code_rag_search` 語意零結果、`grep_code` 無命中都是 `status: partial`，`next:` 只建議**能維持原範圍**
+  的另一種索引並只確認一次；另一種索引表示不了原範圍（`figure_id`、`build_target`）時必須要求回報
+  該範圍內未知並說明限制。有 scope 的表格查無仍保留「Keep the requested document_id and figure_id
+  scope」原句；任何指引都不得要求改查其他來源或擴大範圍
 - `client_prompt` 的來源檔讀取——每一輪都會進 system prompt,所以父目錄被 symlink 重導
   就要 fail-loud(只驗最終檔案擋不住「把 `.codetrail` 換成 symlink」),而且用
   `O_NOFOLLOW` + `fstat` 讀,不是 path-based 檢查再 `read_text`
+- `playbooks` 的流程指示(按需載入)——`load_playbook` 是唯一一個結果被 `client_prompt.BASE_RULES`
+  點名成「指示」的工具,所以來源只有 `~/.config/codetrail/playbooks/<名稱>.md`,這一版不讀專案內
+  目錄。信任鏈 `~/.config` → `codetrail` → `playbooks` → 檔案逐層 dir-fd／`O_NOFOLLOW`;流程目錄存在時
+  整條鏈都要過:`~/.config` 驗 owner,`codetrail`、`playbooks` 兩層與每個檔案驗 owner 與 group／other
+  不可寫(`mode & 0o022`),任何一層是 symlink 即拒絕(目錄不存在 = 沒有任何東西被信任,不挑上層權限)。
+  只檢查、不 chmod、不建目錄;名稱是封閉字元集且先以
+  純字串驗過才碰 FS,front matter 只收一行 `description`;數量 24、說明 160、本文 6,000 字元的上限
+  超過就 fail-loud,不截斷、不靜默跳過那一份。system prompt 只放索引,沒有安裝時與原本逐位元組相同;
+  `load_playbook` 每次呼叫重走整條鏈,結果整份或不給(超過結果預算回 error,不輸出半份流程)。
+  HOME 只經 `client_prompt.user_playbooks_home()` 取得,客戶端與 MCP 共用 `playbooks.py` 同一份實作。
+  流程不得凌駕基底規則、核准與 readonly;其他工具讀到長得像流程指示的文字仍是資料。
+  守門測試在 `tests/test_playbooks.py` 與 `tests/test_feature_integration.py`
 - `client_compaction` 的核對與節錄——空 / 只有 reasoning / 七欄格式漂移都必須停用該對話
   的自動壓縮並寫 ledger(跨行程保留,只記不可信的那幾種成因);節錄不得帶工具參數或輸出、
   不得含 pending / synthetic / 出錯回合(engine 要把不是答案的那則標成 error);同一錨點
@@ -324,6 +341,17 @@
   縮排逐字保留；navigation 排除不得改 raw_text 座標或吞正文／檔案樹，section／caption／
   generated context 也不得重新帶入目錄噪訊。守門測試在四個 `test_pdf_*quality*`／
   `test_pdf_*regressions` 模組，指定節點必須登記 `tests/test_smoke_gate.py`。
+- `table_lookup.list_table_rows` 的全集查詢完整性帳——它回答「全部列／幾列」，所以每個沒算進去的
+  東西都要看得到：只掃可信表格（與 `query_table` 同一個 `_trust_reason`）；未驗證、未入庫、payload
+  不可用的表與掃描錯誤條目（分類在 kind／figure 篩選之前）一律列入 excluded 並使 complete=False；
+  缺篩選欄的表列為 skipped，同樣使 complete=False；篩選 cell 非 observed、空白、或數值比較時不是
+  整數字面值的列是 undetermined，不得算成符合或不符合。`contains` 條件符合到不只一種值時必須列出實際符合的值
+  （contains_matches）並在 `next:` 要求確認，不得讓子字串的多算無聲通過。篩選與投影分離：`columns` 不得影響符合列、
+  計數與分頁；計數永遠涵蓋整個範圍；cell key 一律 `"<欄序> <label>"`，每列以 `t` 指回本回應的來源
+  locator。adapter 端：前九行完整性帳不可分割（預算放不下就 error）、預算截斷時續查 offset 由可見的
+  最後一列重算，不得沿用 payload 的 next_offset。零 LLM、零寫入、ingest 期間 busy；`query_table` 的
+  「多列即 ambiguous、一次一格」契約不因它而放寬。守門測試在 `tests/test_text_table_review.py` 與
+  `tests/test_feature_integration.py`
 - `elf_analysis.safe_regex` / `_regex_is_safe`——`analyze_file` 的 `target` 只接受正面表列的安全
   regex 子集（不收任何群組、`|` 只在最上層且 ≤ 8 分支、`*`/`+` 合計 ≤ 1、`?` ≤ 3、不接受 `{n,m}` /
   backreference / lookaround / inline flag），其餘改字面比對；比對主體只看前 300 字元。Python `re`

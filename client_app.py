@@ -126,6 +126,8 @@ HELP_TAIL = (
     f"單則最多 {client_attachments.MAX_ATTACHMENTS} 個附件，補充訊息不處理附件。\n"
     "專案外檔案（@~/Downloads/…、@/tmp/…）：先 /import on 並重開 aicode，每次匯入仍需核准；"
     "SSH 連線時先把檔案傳到這台主機（例如 ~/Downloads）。\n"
+    "流程指示：把 <名稱>.md 放進 ~/.config/codetrail/playbooks/（重開 aicode 後進索引），"
+    "任務符合時模型會自行載入完整步驟；/status 可看已安裝的流程。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
     "滑鼠左鍵拖曳選取，放開即複製；雙擊／三擊完成文字選取也會複製，並保留反白。\n"
@@ -2102,6 +2104,13 @@ class CodeTrailApp(App[int]):
             return self._describe_import(True, tuple(scope.roots))
         return "關（/import on 開啟）"
 
+    def _playbooks_status(self) -> str:
+        """`/status` 的流程指示那一格:啟動時進了 system prompt 索引的名稱,不重讀目錄。"""
+        names = tuple(getattr(self.engine.system_prompt, "playbooks", ()) or ())
+        if not names:
+            return "未安裝"
+        return f"{len(names)} 份({', '.join(names)})"
+
     def _cmd_import(self, argument: str) -> None:
         """`/import` 看專案外匯入狀態;`/import on|off` 只改 client.json 的外部匯入鍵。
 
@@ -2357,6 +2366,7 @@ class CodeTrailApp(App[int]):
             f"待送訊息={len(self.coordinator.queue_snapshot(pending_only=True))}"
             f"({'暫停, /queue resume' if self.coordinator.queue_paused else '依序等待'})",
             f"外部匯入={self._external_import_status()}",
+            f"流程指示={self._playbooks_status()}",
         ]
         if self.engine.store_error:
             lines.append(

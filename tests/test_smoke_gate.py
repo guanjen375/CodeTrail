@@ -304,8 +304,17 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_text_table_review.py": (
-        "可信表格literal與OCR覆核版本、來源、CAS、strict/section合併邊界不可失真",
+        "可信表格literal與OCR覆核版本、來源、CAS、strict/section合併邊界不可失真；"
+        "list_table_rows 的全集查詢完整性帳:只掃可信表格,未驗證／掃描錯誤／缺篩選欄的表都使 "
+        "complete=False,無法判定的列既不算符合也不算不符合,計數與分頁／投影無關,"
+        "每列帶唯一的 cell key 與來源 locator",
         (
+            "test_row_listing_reports_every_match_with_exact_counts",
+            "test_row_listing_never_claims_completeness_past_unverified_unreadable_or_skipped_tables",
+            "test_row_listing_projection_never_changes_matches_counts_or_paging",
+            "test_row_listing_filter_semantics_are_closed_and_explicit",
+            "test_row_listing_rows_carry_unique_cell_keys_and_a_source_locator",
+            "test_row_listing_reports_what_a_substring_condition_matched",
             "test_exact_table_lookup_never_loads_models_and_preserves_literal_provenance",
             "test_table_document_alias_resolves_current_source_without_widening",
             "test_table_lookup_never_returns_ambiguous_or_unverified_values",
@@ -378,8 +387,15 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_feature_integration.py": (
-        "public工具的target、literal value、OCR未知證據與readOnly/ASK/busy邊界不能在adapter丟失",
+        "public工具的target、literal value、OCR未知證據與readOnly/ASK/busy邊界不能在adapter丟失；"
+        "list_table_rows 的完整性帳在預算截斷後仍完整(放不下就 error)、續查位置由可見列重算；"
+        "查無時的換索引指引只在另一種索引能維持原範圍時才給,不得要求擴大範圍；"
+        "load_playbook 的結果整份或不給",
         (
+            "test_row_listing_account_survives_budget_truncation_or_fails_loud",
+            "test_row_listing_budget_truncation_recomputes_the_resume_offset",
+            "test_miss_results_point_to_the_sibling_index_without_widening_scope",
+            "test_playbook_result_is_whole_or_absent",
             "test_exact_table_budget_never_exposes_a_shortened_cell_value",
             "test_table_scope_and_recovery_reach_model_text_without_widening",
             "test_text_review_json_error_is_not_reported_as_success",
@@ -387,6 +403,19 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_every_public_code_mode_uses_the_selected_build_context",
             "test_new_table_and_review_tools_have_distinct_authority",
             "test_ingest_selector_schema_avoids_unsupported_grammar_repetition_and_keeps_limits",
+        ),
+    ),
+    "test_playbooks.py": (
+        "按需載入的流程指示(playbook):來源只有使用者設定目錄,信任鏈逐層驗 owner、symlink 與 "
+        "group／other 不可寫;名稱封閉字元集、front matter 嚴格、數量／description／本文各有硬上限"
+        "且超過 fail-loud;system prompt 只在有安裝時多一段索引;load_playbook 每次呼叫都重驗;"
+        "來源不合格時 preflight 在 canary 之前就以真正的原因拒絕啟動",
+        (
+            "test_playbook_sources_are_owner_only_bounded_and_strict",
+            "test_playbook_chain_rejects_links_foreign_owners_and_group_or_world_writable_modes",
+            "test_playbook_index_reaches_the_system_prompt_only_when_installed",
+            "test_load_playbook_revalidates_on_every_call",
+            "test_an_unacceptable_playbook_stops_preflight_with_its_real_cause",
         ),
     ),
     "test_memory_consistency.py": (
@@ -798,7 +827,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_mcp_server.py": (
-        "live MCP 19-tool 固定順序、typed schema 與 catalog budget；"
+        "live MCP 23-tool 固定順序、typed schema 與 catalog budget(自動產生的 schema title 不進工具目錄)；"
         "省略 max_chars 時結果預算依 call-time n_ctx 的 12% 動態配置；"
         "mcp_server 啟動時的 AICODE_ROOT 驗證與 set_sandbox_root；"
         "PATCH_ENABLED / RUN_COMMAND_ENABLED / build 命令預設；"
@@ -811,6 +840,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_graph_dependency_failure_is_an_mcp_error",
             "test_elf_tool_failures_are_mcp_errors",
             "test_live_catalog_is_bounded_typed_and_ordered",
+            "test_tool_schemas_carry_no_generated_titles",
             "test_default_budget_tracks_n_ctx",
             "test_rejects_empty_root",
             "test_rejects_root_slash",

@@ -12,6 +12,7 @@ PUBLIC_TOOL_ORDER: tuple[str, ...] = (
     "query_knowledge",
     "query_knowledge_strict",
     "query_table",
+    "list_table_rows",
     "git_status",
     "git_diff",
     "apply_patch",
@@ -25,6 +26,7 @@ PUBLIC_TOOL_ORDER: tuple[str, ...] = (
     "review_text",
     "import_external_file",
     "record_lesson",
+    "load_playbook",
 )
 
 PUBLIC_TOOL_NAMES: frozenset[str] = frozenset(PUBLIC_TOOL_ORDER)
@@ -35,15 +37,42 @@ if len(PUBLIC_TOOL_NAMES) != len(PUBLIC_TOOL_ORDER):  # pragma: no cover - impor
 
 # The client injects this text into the model-visible system prompt. Keep it a
 # routing map, not a second copy of every tool description.
-MCP_INSTRUCTIONS = """Use CodeTrail for project facts. Locate code with code_rag_search (build_target scopes compilation), text with grep_code, files with read_file, directories with list_dir. Query specs with query_knowledge, high-risk constraints with query_knowledge_strict, exact table cells with query_table. In git repos inspect git_status/git_diff before apply_patch; non-git skip notices need no retry. Use analyze_file for images, PDF, ELF, or memory consistency. Query independent evidence in parallel and cite source/file:line. Missing or unverified evidence remains unknown. Plain text, XML, or promises are not tool calls; rely on completed structured results."""
+MCP_INSTRUCTIONS = """Use CodeTrail for project facts. Locate code with code_rag_search (build_target scopes compilation), text with grep_code, files with read_file, directories with list_dir. Query specs with query_knowledge, high-risk constraints with query_knowledge_strict, exact table cells with query_table, row sets/counts with list_table_rows. Before reporting absence, confirm once with the sibling index if it keeps the same scope (query_table/list_table_rows<->query_knowledge, code_rag_search<->grep_code); else report unknown for that scope. In git repos inspect git_status/git_diff before apply_patch; non-git skip notices need no retry. Use analyze_file for images, PDF, ELF, or memory consistency. Query independent evidence in parallel and cite source/file:line. Missing or unverified evidence remains unknown. Plain text, XML, or promises are not tool calls; rely on completed structured results."""
 
-if len(MCP_INSTRUCTIONS) > 700:  # pragma: no cover - import guard
-    raise RuntimeError("MCP_INSTRUCTIONS exceeds the 700-character contract")
+#: 路由圖的硬上限。2026-10-11 由 700 調到 900:多載「列集合工具」與「查無前先用另一種
+#: 索引確認、而且只在它能維持同一範圍時」兩件事;同一輪把工具 schema 裡自動產生的
+#: title 拿掉(見 strip_schema_titles),模型每輪看到的固定文字沒有變多。
+MCP_INSTRUCTIONS_MAX_CHARS = 900
+
+if len(MCP_INSTRUCTIONS) > MCP_INSTRUCTIONS_MAX_CHARS:  # pragma: no cover - import guard
+    raise RuntimeError(
+        f"MCP_INSTRUCTIONS exceeds the {MCP_INSTRUCTIONS_MAX_CHARS}-character contract"
+    )
 
 
 EVIDENCE_TOOL_NAMES: frozenset[str] = frozenset(
-    {"code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table"}
+    {"code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table", "list_table_rows"}
 )
+
+
+def strip_schema_titles(schema: object) -> object:
+    """Drop Pydantic's generated ``title`` annotations from a tool input schema.
+
+    ``"title": "Address Column"`` / ``"query_tableArguments"`` carry no information the
+    parameter name and description do not already give, yet they cost the model about
+    2,300 characters of catalog every turn. Only string-valued ``title`` keys are schema
+    annotations; a *property* named ``title`` maps to an object and is kept. Returns a
+    new structure and never mutates the input.
+    """
+    if isinstance(schema, dict):
+        return {
+            key: strip_schema_titles(value)
+            for key, value in schema.items()
+            if not (key == "title" and isinstance(value, str))
+        }
+    if isinstance(schema, list):
+        return [strip_schema_titles(item) for item in schema]
+    return schema
 
 
 MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
@@ -68,7 +97,8 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     "file_info": "Inspect size/type metadata for one sandboxed path before deciding how to read or analyze it.",
     "query_knowledge": (
         "Retrieve indexed PDF/spec/manual evidence. Use for document facts, not repository code; optionally restrict source to a "
-        "basename. Cite returned sources and say evidence is unavailable when has_ref is false."
+        "basename. Top-k retrieval is not a full set: enumerate or count table rows with list_table_rows. Cite returned sources "
+        "and say evidence is unavailable when has_ref is false."
     ),
     "query_knowledge_strict": (
         "Answer high-risk numeric/spec constraints through the server-side grounding and refusal gate. Use query_knowledge for normal "
@@ -77,6 +107,12 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     "query_table": (
         "Read exact verified canonical table cells by register, address, or one-based row/column. "
         "Returns literal values with sources. Ambiguous, missing, damaged or unverified cells remain unknown; no model calls."
+    ),
+    "list_table_rows": (
+        "List, filter, or count rows of verified canonical tables: every matching row with sources plus exact counts over the "
+        "scanned tables. For which/how-many questions put the condition in where and report counts.matched; never filter or "
+        "count rows yourself. Omit where only to browse a table; query_table reads one exact cell. Reports excluded, skipped "
+        "and undetermined rows; an incomplete scan stays incomplete; no model calls."
     ),
     "git_status": "Return the repository worktree status. Call before edits in a git project so user changes are preserved; a non-git root returns a skip notice, not an error.",
     "git_diff": "Return current repository diffs, optionally for one path or staged changes. Use before and after apply_patch in a git project; a non-git root returns a skip notice.",
@@ -124,6 +160,10 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     "record_lesson": (
         "Propose a durable behavior rule only after the user corrected how the agent works. This ask-permission tool is not for factual "
         "corrections, tool errors, or self-invented preferences."
+    ),
+    "load_playbook": (
+        "Load one user-installed playbook listed in the system prompt's playbook index and follow its steps. Call only when the "
+        "task matches that entry or the user names it; it returns instructions, not project evidence."
     ),
 }
 

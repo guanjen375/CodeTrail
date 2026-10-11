@@ -393,7 +393,10 @@ def test_live_catalog_is_bounded_typed_and_ordered(monkeypatch, tmp_path: Path):
 
     assert tuple(tool.name for tool in tools) == PUBLIC_TOOL_ORDER
     assert mcp_module.mcp.instructions == MCP_INSTRUCTIONS
-    assert len(mcp_module.mcp.instructions) <= 700
+    # 2026-10-11:700 → 900。路由圖多載「列集合工具 list_table_rows」與「查無前先用能維持
+    # 同一範圍的另一種索引確認一次」兩件事(使用者點名的缺口);同一輪把 schema 裡自動
+    # 產生的 title 拿掉,工具目錄的 20,000 上限沒有動。
+    assert len(mcp_module.mcp.instructions) <= 900
 
     descriptions = {tool.name: tool.description or "" for tool in tools}
     assert sum(map(len, descriptions.values())) <= 12_000
@@ -423,10 +426,83 @@ def test_live_catalog_is_bounded_typed_and_ordered(monkeypatch, tmp_path: Path):
     timeout = by_name["run_command"].inputSchema["properties"]["timeout"]
     assert (timeout["minimum"], timeout["maximum"]) == (1, 600)
 
-    evidence = {"code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table"}
+    evidence = {
+        "code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table",
+        "list_table_rows",
+    }
     for tool in tools:
         if tool.name not in evidence:
             assert tool.outputSchema is None, tool.name
+
+
+@pytest.mark.smoke
+def test_tool_schemas_carry_no_generated_titles(monkeypatch, tmp_path: Path):
+    """Pydantic 自動產生的 `title` 不得回到模型看得到的工具目錄。
+
+    `"title": "Address Column"`、`"query_tableArguments"` 這類註記對模型沒有資訊量,
+    卻佔了約 2,300 字元(2026-10-11 實測:21 個工具的有效字元 19,978,其中 title 2,347),
+    而目錄的 20,000 字元上限只剩 22 字餘裕 —— 多一個工具就撞破。
+    `mcp_server._register_public_tools()` 在註冊後用 `mcp_contract.strip_schema_titles`
+    把它們拿掉。這條守兩件無聲的事:
+
+    1. title 又回到 tools/list(SDK 升級換了產生方式、或有人把那段註冊後處理拿掉):
+       目錄靜默多出兩千多字元,先壞的是上限那條,但原因不在那條的訊息裡。
+    2. 「拿掉註記」變成「拿掉內容」:名為 `title` 的 **property** 其值是物件,不是
+       註記,不得被誤刪;參數說明必須都還在;輸入物件不得被就地改動(FastMCP 另有
+       自己持有的那一份)。
+    """
+    from mcp_contract import strip_schema_titles
+
+    mcp_module = import_mcp_module(monkeypatch, tmp_path)
+    tools = asyncio.run(mcp_module.mcp.list_tools())
+    assert tools
+
+    def generated_titles(node, where):
+        found = []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "title" and isinstance(value, str):
+                    found.append(f"{where}.title={value!r}")
+                found.extend(generated_titles(value, f"{where}.{key}"))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                found.extend(generated_titles(value, f"{where}[{index}]"))
+        return found
+
+    leaked = [hit for tool in tools for hit in generated_titles(tool.inputSchema, tool.name)]
+    assert not leaked, leaked
+    for tool in tools:
+        assert tool.inputSchema.get("type") == "object", tool.name
+        for name, schema in tool.inputSchema.get("properties", {}).items():
+            assert schema.get("description"), f"{tool.name}.{name} lacks description"
+
+    schema = {
+        "title": "demoArguments",
+        "type": "object",
+        "properties": {
+            "title": {
+                "title": "Title", "type": "string",
+                "description": "A property literally named title.",
+            },
+            "rows": {
+                "title": "Rows",
+                "anyOf": [{"title": "Inner", "type": "integer"}, {"type": "null"}],
+            },
+        },
+        "required": ["title"],
+    }
+    before = json.loads(json.dumps(schema))
+    stripped = strip_schema_titles(schema)
+    assert schema == before, "strip_schema_titles must not mutate its input"
+    assert stripped is not schema
+    assert stripped == {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "A property literally named title."},
+            "rows": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        },
+        "required": ["title"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -535,7 +611,9 @@ def test_mcp_protocol_roundtrip(tmp_path: Path):
     )
 
     assert names == set(PUBLIC_TOOL_ORDER)
-    assert len(names) == 21
+    # 2026-10-11:21 → 23,新增唯讀的 list_table_rows(表格列集合／計數)與 load_playbook
+    # (按需載入的流程指示)。
+    assert len(names) == 23
     for expected in ("query_knowledge", "list_dir", "read_file", "grep_code"):
         assert expected in names, f"工具 {expected} 沒註冊成功；實得 {sorted(names)}"
     max_chars_schema = code_search_schema["properties"]["max_chars"]

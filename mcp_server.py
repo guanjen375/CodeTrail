@@ -25,7 +25,7 @@ import sys
 import threading
 import io
 from pathlib import Path
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import Field
 from runtime_dependencies import DependencyError
@@ -260,6 +260,7 @@ from mcp_contract import (
     MCP_INSTRUCTIONS,
     MODEL_TOOL_DESCRIPTIONS,
     PUBLIC_TOOL_ORDER,
+    strip_schema_titles,
 )
 from tool_result_adapter import adapt_tool_error, adapt_tool_result, resolve_result_budget
 
@@ -544,8 +545,8 @@ _RESULT_SAFETY_MAX_CHARS = {
 _DEFAULT_RESULT_SAFETY_MAX_CHARS = 200_000
 _READ_ONLY_TOOLS = frozenset({
     "list_dir", "read_file", "grep_code", "code_rag_search", "file_info",
-    "query_knowledge", "query_knowledge_strict", "query_table", "git_status", "git_diff",
-    "analyze_file",
+    "query_knowledge", "query_knowledge_strict", "query_table", "list_table_rows",
+    "git_status", "git_diff", "analyze_file", "load_playbook",
 })
 
 # ---- 重複呼叫偵測(鬼打牆打斷)-------------------------------------------
@@ -816,6 +817,15 @@ def _register_public_tools() -> None:
         # 讓「模型說它呼叫了工具但其實沒有」這件事可以歸因(見 mcp_lease.py)。
         # 它自己吞掉所有例外:lease 壞掉不得讓工具失敗。
         _real_mcp_tool(*args, **kwargs)(mcp_lease.record_tool_calls(name, wrapper))
+        # Pydantic 自動產生的 `title`("Address Column"、"query_tableArguments")對模型
+        # 沒有資訊量,卻每一輪都佔工具目錄的字數。註冊完就從 tools/list 會送出去的那份
+        # schema 拿掉;參數驗證走的是 arg model,不看這份 dict。拿不到工具物件就是 SDK
+        # 的形狀變了:寧可在 import 期講明,也不要靜默把 title 送回目錄、撞破字數上限。
+        manager = getattr(mcp, "_tool_manager", None)
+        registered = manager.get_tool(name) if hasattr(manager, "get_tool") else None
+        if registered is None or not isinstance(getattr(registered, "parameters", None), dict):
+            raise RuntimeError(f"cannot reach the registered MCP tool schema for {name}")
+        registered.parameters = strip_schema_titles(registered.parameters)
 
 
 def _figure_review_hint(excluded) -> str:
@@ -1140,6 +1150,23 @@ def query_table(
         AICODE_ROOT, document_id=document_id, figure_id=figure_id,
         register=register, address=address, row=row, column=column,
         register_column=register_column, address_column=address_column,
+    )
+
+
+@_tool()
+def list_table_rows(
+    document_id: Annotated[str, Field(description="Document ID or source basename; empty scans all eligible tables.")] = "",
+    figure_id: Annotated[str, Field(description="Exact figure ID (fig_ + 16 hex) from an earlier result, never a caption; empty scans every table in the document filter.")] = "",
+    where: Annotated[Optional[list[dict[str, Any]]], Field(max_length=4, description='AND conditions, each {"column": exact label or one-based index, "op": one of = != < <= > >= contains, "value": text or integer}; = matches the whole cell, contains any substring. E.g. [{"column":"Reset","op":"!=","value":0}].')] = None,
+    columns: Annotated[Optional[list[str]], Field(max_length=16, description="Output column labels or one-based indexes; omitted returns every column.")] = None,
+    offset: Annotated[int, Field(ge=0, description="Zero-based position in the matched rows to continue from.")] = 0,
+    limit: Annotated[int, Field(ge=0, le=200, description="Maximum rows returned; 0 returns counts only.")] = 50,
+) -> dict:
+    """List, filter or count rows of current verified canonical tables with a completeness account."""
+    import table_lookup
+    return table_lookup.list_table_rows(
+        AICODE_ROOT, document_id=document_id, figure_id=figure_id, where=where,
+        columns=columns, offset=offset, limit=limit,
     )
 
 
@@ -3491,6 +3518,33 @@ def record_lesson(
     # store 損壞 / 超過上限會 raise LessonsError(fail-loud,需人工處理);
     # rule/scope 格式問題回「錯誤: ...」讓模型修正。
     return lessons.propose_lesson(AICODE_ROOT, rule, scope=scope)
+
+
+@_tool()
+def load_playbook(
+    name: Annotated[str, Field(description="Exact playbook name from the system prompt's playbook index.")],
+) -> str:
+    """Return one user-installed playbook; every call revalidates the owner-only source chain.
+
+    這是唯一一個結果被基底規則當成「指示」的工具(`client_prompt.BASE_RULES` 點名它)。
+    所以來源只有使用者自己的設定目錄,而且每次呼叫都重走整條信任鏈(見 playbooks.py);
+    被分析的 repo 寫不進去,索引裡沒有的名字也不會因為猜中而載到別的檔。
+    """
+    import client_prompt
+    import playbooks
+
+    home = client_prompt.user_playbooks_home()
+    try:
+        return playbooks.render_body(playbooks.load(home, name))
+    except playbooks.PlaybookError as exc:
+        available = ""
+        try:
+            names = [item.name for item in playbooks.discover(home)]
+        except playbooks.PlaybookError:
+            names = None
+        if names is not None:
+            available = ";目前可用: " + (", ".join(names) if names else "(沒有安裝任何流程指示)")
+        return f"錯誤: {exc}{available}"
 
 
 @_tool()

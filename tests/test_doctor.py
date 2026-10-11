@@ -900,7 +900,8 @@ def test_expected_tool_contract_matches_mcp_server():
     source = (canary.REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8")
     registered = set(check_readme_consistency._mcp_tool_names(source))
     assert registered == canary.EXPECTED_MCP_TOOLS
-    assert len(registered) == 21
+    # 2026-10-11:21 → 23(新增 list_table_rows 與 load_playbook)。
+    assert len(registered) == 23
 
 
 

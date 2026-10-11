@@ -663,13 +663,17 @@ def test_busy_gate_covers_exactly_the_kb_tools(monkeypatch, mcp_root):
     mcp = import_mcp_module(monkeypatch, mcp_root)
     assert ingest_runtime.BUSY_TOOLS == frozenset({
         "query_knowledge", "query_knowledge_strict", "reload_knowledge_base",
-        "query_table", "remove_document", "review_figures", "review_text", "ingest_document",
+        "query_table", "list_table_rows", "remove_document", "review_figures", "review_text",
+        "ingest_document",
     })
     assert "code_rag_search" not in ingest_runtime.BUSY_TOOLS
 
     with ingest_runtime.begin("ingest_document (test)"):
         # evidence tool:raise,讓 adapter 產生符合 outputSchema 的 structured error
-        for name in ("query_knowledge", "query_knowledge_strict", "query_table"):
+        # list_table_rows 與 query_table 讀同一份 knowledge.json:ingest 正在原子替換時
+        # 列出來的「全部列」會是剛好抓到的那一版,所以同樣要讓路。
+        for name in ("query_knowledge", "query_knowledge_strict", "query_table",
+                     "list_table_rows"):
             with pytest.raises(ingest_runtime.IngestBusyError):
                 tool_fn(mcp, name)("問題")
         # 其餘四個回字串,而且讀起來是「稍後重試」不是「失敗」

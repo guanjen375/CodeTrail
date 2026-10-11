@@ -8,7 +8,7 @@
 - [歷史對話](#sessions)、[排隊與補充](#queue)、[工作區審查](#review)、[執行專案內工具](#project-tools)
 - [附件](#attachments)、[知識入庫與查詢](#rag)、[PDF 圖面覆核](#pdf-review)
 - [表格與 OCR](#text-table-review)、[入庫續跑](#ingest-resume)、[KB 維護](#knowledge-maintenance)
-- [行為 lessons](#lessons)、[build target](#build-context)、[記憶體配置核對](#memory-consistency)
+- [行為 lessons](#lessons)、[流程指示](#playbooks)、[build target](#build-context)、[記憶體配置核對](#memory-consistency)
 
 <a id="chat"></a>
 
@@ -20,7 +20,7 @@ aicode
 ```
 
 正常啟動對話區空白，啟動摘要、壓縮模式與全部 WARN 在 `/status`。
-健康檢查失敗會在終端報錯並拒絕進入 TUI。`/tools` 查看 21 個 MCP 工具，
+健康檢查失敗會在終端報錯並拒絕進入 TUI。`/tools` 查看 23 個 MCP 工具，
 `/help` 查看互動指令。首次直接送出問題或 `/new` 才建立 session。
 訊息裡用 `@` 夾帶檔案：`@` 後面打檔名的一部分即可搜尋整個專案，Tab 補全路徑；把檔案拖進終端機
 或貼上路徑也會自動改寫成 `@`。專案外的截圖與下載檔用 `@~/Downloads/…`（先 `/import on`），
@@ -174,6 +174,11 @@ prompt processing(42%) · 8,400/20,000 tok · cache 2,000 · 213.3 tok/s · pref
 `partial`／`error` 或因 context budget 截斷時，第二行才有可直接照做的 `next:`；例如
 `read_file` 會給不漏行的下一個 `start_line`，`grep_code` 會要求縮小
 path/include/pattern。不要把 `partial` 當完整證據，也不要略過 `next:` 直接重送同一呼叫。
+
+查不到東西時結果同樣是 `partial`，不是「確定沒有」：`next:` 會指出該用哪一種另一個索引在**同一範圍**
+確認一次（`query_table`／`list_table_rows` ↔ `query_knowledge`，`code_rag_search` ↔ `grep_code`），
+兩種都查無才算查無，回答要說明查過哪些索引。另一個索引無法維持你限定的範圍時（例如指定了 figure
+或 build target），`next:` 會要求回報「該範圍內未知」，不會改查更大的範圍。
 
 未明示 `max_chars` 時，結果預算在**每次呼叫當下**依主模型 `n_ctx` 的 12% 計算，使用固定
 ASCII/CJK token 代理估算，再套各工具 safety cap；已不再是固定 12,000 字元。明示較大的
@@ -696,7 +701,7 @@ confirm_against_image 設 True。
 
 ## 表格精確查值與 OCR 正文覆核
 
-`query_table` 直接查目前入庫版本的 canonical table，沒有 LLM、embedding、reranker 或向量 top-k。`review_text` 保留 MinerU 原始 OCR 與人工校字，確認記錄綁定文字版本及 PDF／content_list 雜湊。
+`query_table` 直接查目前入庫版本的 canonical table，沒有 LLM、embedding、reranker 或向量 top-k；`list_table_rows` 對同一批可信表格列出、過濾或計數**全部**符合的列。`review_text` 保留 MinerU 原始 OCR 與人工校字，確認記錄綁定文字版本及 PDF／content_list 雜湊。
 
 ### 精確表格查值
 
@@ -732,6 +737,40 @@ register 名稱逐字、區分大小寫比對，不做模糊搜尋。地址僅�
 ```
 
 `status` 為 `ok`、`not_found`、`ambiguous`、`unverified` 或 `error`。有歧義或選中的格不可信時 `matches` 為空；`excluded` 只含定位與原因，不帶未驗證數值。`ok` 僅表示在所選、可信、目前入庫的表中唯一符合；排除項目仍會列出。
+
+<a id="table-rows"></a>
+
+### 列舉、過濾與計數
+
+「哪些暫存器的 reset 值不是 0」「有幾個 IRQ 接到 core1」這類問題要的是**全集**。`query_table` 一次只回
+一格、命中多列就回 `ambiguous`；`query_knowledge` 是排序檢索，只給最相關的幾段，漏了也看不出來。
+這類問題用 `list_table_rows`：
+
+```python
+list_table_rows(document_id="registers.pdf", where=[{"column": "Reset", "op": "!=", "value": 0}])
+list_table_rows(figure_id="fig_<16-hex>", where=[{"column": "Core", "op": "=", "value": "core1"}],
+                columns=["IRQ", "Source"])
+```
+
+在對話裡可以直接說「請用 `list_table_rows` 列出 registers.pdf 裡 Reset 不是 0 的暫存器，並回報總數」。
+`where` 最多 4 個條件、全部成立才算符合；`columns` 只決定顯示哪些欄，不影響哪些列符合。
+
+先看結果開頭的完整性帳，再看列：
+
+- `counts.matched` 是整個範圍的符合列數，與分頁無關；只要計數時加 `limit=0`。
+- `complete: true` 才代表範圍內每一張表都掃了、每一列都判定了。只要有表待覆核（列在 `excluded`）、
+  有表沒有你篩選的欄位（列在 `skipped`，附它實際的欄名）、或有列無法判定（列在 `undetermined`），
+  就是 `complete: false`：`matched` 只能當下界，回答時要一起交代。
+- 整份文件常有幾張表待覆核或欄名不同。要完整的答案，就用 `figure_id` 把範圍收斂到要查的那張表；
+  `figure_id` 在結果的 `table:` 行與 `review_figures(action="list")` 都看得到。
+- 零符合時先看 `value_samples`（篩選欄實際出現的值），確認不是條件寫錯；`next:` 還會要求用
+  `query_knowledge` 在同一份來源確認一次，才能回答「沒有」。
+- 列太多時 `next:` 會給下一頁的 `offset`；照它續查，計數不必重算。
+
+數值條件只認明確的整數（十進位或 `0x` 十六進位，位數間可用 `_` 分隔）；格子不是這種寫法時那一列列為
+無法判定，不會被當成符合或不符合。文字條件忽略大小寫與多餘空白。不是直接觀察到的格子（合併格、
+看不清、兩個通道不一致）不給文字。每個欄位的定義見
+[MCP 工具契約](mcp-tools.md#list_table_rows列舉過濾與計數)。
 
 ### 正文校字與確認
 
@@ -979,6 +1018,80 @@ python3 <CODETRAIL_REPO>/lessons.py hit L-001        # 人工記一次命中(見
 3. 改用 `cat <SANDBOX_ROOT>/.codetrail/lessons.md` 直接看注入內容(此檔自動產生,勿手改;`.codetrail/` 已在 .gitignore)。
 
 注意:寫入當下的 session 其 context 已載入完成,新 lesson 於**下一個** session 才注入(tool 回覆會提醒模型本 session 先直接遵守)。
+<a id="playbooks"></a>
+
+## 流程指示（playbook）
+
+想讓模型照一套固定流程做事（某個平台的 bring-up 步驟、review checklist），以前只能寫進 `AGENTS.md`、
+lessons 或 `instructions.md`，而它們每一輪都**全量**進 system prompt。流程指示把「何時使用」和「完整步驟」
+分開：system prompt 只多一行索引，本文在任務符合時才由模型用 `load_playbook` 載入。
+
+| | `AGENTS.md`／lessons／`instructions.md` | 流程指示 |
+|---|---|---|
+| 每一輪進 system prompt 的內容 | 全文 | 每份流程一行（名稱＋何時使用） |
+| 完整內容何時進對話 | 一直都在 | 任務符合索引的說明，或你點名它時 |
+| 適合 | 每一題都要遵守的短規則 | 特定任務才需要的多步驟流程 |
+
+### 安裝一份流程
+
+一份流程一個檔，放在 `~/.config/codetrail/playbooks/<名稱>.md`：
+
+```bash
+mkdir -p ~/.config/codetrail/playbooks
+```
+
+檔案內容（開頭是固定的 front matter）：
+
+```markdown
+---
+description: UART-X 平台 bring-up 檢查；使用者要求 bring-up、初始化順序或開機檢查時使用
+---
+# UART-X bring-up 檢查流程
+
+依序完成，每一步都要有工具證據：
+
+1. 用 list_table_rows 列出規格 Table 1 中 Reset 值不是 0 的暫存器。
+2. 用 read_file 讀 src/uart.c 的 uartx_init，列出它寫入的暫存器與數值。
+3. 逐一比對兩者，回報一致與不一致的項目。
+```
+
+規則如下；任何一項不合，`aicode` 會在啟動時報錯並指出檔案，不會靜默跳過，也不會截斷：
+
+- 名稱＝檔名去掉 `.md`：只能用小寫英數與 `-`，開頭是英數，最長 40 字元（例如 `uartx-bringup`、
+  `review-checklist`）。
+- 第一行必須是 `---`；front matter 裡恰好一行 `description: …`（一行、1–160 字元）；再以單獨一行
+  `---` 結束。不接受其他鍵。
+- 本文 1–6,000 字元；最多安裝 24 份流程；檔案必須是 UTF-8。
+- 目錄裡 `.` 開頭、或不是 `.md` 結尾的項目會被忽略；`.md` 結尾但名稱不合規則的檔案是錯誤。
+
+### 權限
+
+流程指示是唯一一種「工具結果被當成指示」的內容，所以來源只接受只有你改得動的檔案：只要
+`playbooks/` 目錄存在，`~/.config/codetrail/`、`playbooks/` 兩層目錄與每個流程檔都必須由你擁有，而且
+group 與 other 不可寫（`~/.config` 本身也必須由你擁有）；任何一層是符號連結也會被拒絕。`umask 002` 的環境
+建出來的 `0775` 目錄、`0664` 檔案要先收緊：
+
+```bash
+chmod go-w ~/.config/codetrail ~/.config/codetrail/playbooks ~/.config/codetrail/playbooks/*.md
+```
+
+CodeTrail 只檢查、不會替你改權限。這一版只讀這個使用者目錄，不讀被分析專案裡的任何流程檔。
+
+### 什麼時候會載入
+
+- 啟動時 `aicode` 讀一次這個目錄，把每份流程的名稱與 `description` 組成 system prompt 的索引。
+  **新增、刪除或改名之後要重開 `aicode`**，索引才會更新。`/status` 的 `流程指示=` 那一行列出這次啟動
+  進了索引的名稱；沒有安裝時顯示 `流程指示=未安裝`，system prompt 也不會多出這一段。
+- 你的要求符合某一份的 `description`，或你直接點名（「請照 uartx-bringup 流程檢查這個專案」），模型會先
+  呼叫 `load_playbook`——畫面上看得到這張工具卡——再依步驟進行。不符合的問題不會載入。
+- 本文每次載入都重新讀檔、重新檢查權限，所以改步驟不必重開；只有索引是啟動時的快照。
+- 流程的步驟不能凌駕基底規則、人工核准與你當下的要求：流程要求改檔或執行命令時，核准框照樣出現。
+- 流程可以指定回報格式，模型會照著填。但主聊天預設 `think=off`，這時模型常會在格式區塊前面先寫一段
+  過程敘述；流程要求「回覆第一行固定」這類嚴格格式時，先 `/think on` 再下指令。
+- 對話很長時，早先載入的本文可能被清除或壓縮；索引已告訴模型「仍需要時重新載入」，你也可以再點名一次。
+- 本文超過這一次工具結果的預算（預設是主模型 `n_ctx` 的 12%）時不會載入半份，而是回報錯誤；請把流程縮短。
+- `/review` 的審查不使用流程指示。
+
 <a id="build-context"></a>
 
 ## 使用實際 build target 分析程式

@@ -1,6 +1,6 @@
 # CodeTrail — 本地 Code-RAG / RAG / MCP 工作台
 
-CodeTrail 是公開原始碼專案，包含本地 RAG、Code-RAG、21 個 MCP 工具，以及自己的
+CodeTrail 是公開原始碼專案，包含本地 RAG、Code-RAG、23 個 MCP 工具，以及自己的
 Python／Textual 全螢幕聊天客戶端。模型透過工具搜尋程式、閱讀規格、分析圖片與 firmware，
 再以檔案行號或 REF 回答。使用者入口是終端指令 `aicode`，推理服務使用
 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的 `llama-server` 與本地 GGUF。
@@ -248,6 +248,10 @@ Tab 補全（路徑含空白寫成 `@"路徑"`）；把檔案拖進終端機或�
 請用 query_knowledge_strict 查 reset assert 最小時間，附 REF，證據不足就拒答。
 ```
 
+「哪些暫存器的 reset 值不是 0」「有幾個 IRQ 接到某顆 core」這類要全集的表格題，用
+`list_table_rows(...)` 依欄位條件列出或計數全部符合的列；結果會交代掃了哪些表、哪些待覆核或被跳過，
+見[列舉、過濾與計數](docs/usage.md#table-rows)。
+
 圖片直接交給 `ingest_document`，它會自行使用 VL，不必先 `analyze_file`。
 聊天截圖加 `mode="chat"`。圖多的 PDF 先用 `preflight_only=True` 估成本，零寫入；
 入庫後看 `review_figures` 的狀態與原因。單張抽壞只讓那一張缺席，其餘有效內容可以入庫；
@@ -265,14 +269,19 @@ VL 服務、來源身分或文件級契約失敗則整份中止。未驗證圖�
 | 用途 | 工具 |
 |---|---|
 | 程式探索 | `list_dir`、`read_file`、`grep_code`、`code_rag_search`、`file_info` |
-| 知識查詢 | `query_knowledge`、`query_knowledge_strict`、`query_table` |
+| 知識查詢 | `query_knowledge`、`query_knowledge_strict`、`query_table`、`list_table_rows` |
 | 修改與驗證 | `git_status`、`git_diff`、`apply_patch`、`run_lint`、`run_command` |
 | 附件與知識庫 | `analyze_file`、`ingest_document`、`remove_document`、`reload_knowledge_base`、`review_figures`、`review_text`、`import_external_file` |
 | 行為規則 | `record_lesson` |
+| 流程指示 | `load_playbook` |
 
 八個工具每次需人工核准：`apply_patch`、`run_lint`、`run_command`、`remove_document`、
 `record_lesson`、`review_figures`、`review_text`、`import_external_file`。
 核准框完整顯示參數；Esc 拒絕該工具，Ctrl+C 中斷整輪。
+
+只在特定任務才需要的多步驟流程（某個平台的 bring-up 步驟、review checklist）可以寫成流程指示，
+放在 `~/.config/codetrail/playbooks/<名稱>.md`：system prompt 只多一行索引，任務符合或你點名時模型才用
+`load_playbook(...)` 載入全文，不必每一輪都帶著，見[流程指示](docs/usage.md#playbooks)。
 
 `apply_patch` 接受 SEARCH/REPLACE、unified diff。最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數）。
 套用後只做唯讀 syntax check，lint／test 必須分別呼叫並核准。
@@ -282,6 +291,7 @@ VL 服務、來源身分或文件級契約失敗則整份中止。未驗證圖�
 每次 MCP 呼叫固定 read timeout 為 **660 秒**；到期會取消工具，寬限期過則重啟該 MCP instance。
 
 工具文字結果以 `status: ok|partial|error` 開頭。`partial` 與 `next:` 表示需續讀或修復；
+查不到時也是 `partial`，`next:` 會指出該用哪一種另一個索引在同一範圍確認一次，無法維持範圍就回報該範圍內未知；
 省略 `max_chars` 時依 live `n_ctx` 的 12% 配置，明示較大的值會標 `context_risk`。
 完整上限、唯讀政策與逐工具說明見[MCP 工具契約](docs/mcp-tools.md)。
 

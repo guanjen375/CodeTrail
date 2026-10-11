@@ -6,13 +6,13 @@
 
 ---
 
-## CodeTrail 暴露的 21 個 MCP 工具
+## CodeTrail 暴露的 23 個 MCP 工具
 
 live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_code`、
 `code_rag_search`、`file_info`、`query_knowledge`、`query_knowledge_strict`、`query_table`、
-`git_status`、`git_diff`、`apply_patch`、`run_lint`、`run_command`、`analyze_file`、
-`ingest_document`、`remove_document`、`reload_knowledge_base`、`review_figures`、`review_text`、
-`import_external_file`、`record_lesson`。名稱與順序的唯一來源是
+`list_table_rows`、`git_status`、`git_diff`、`apply_patch`、`run_lint`、`run_command`、
+`analyze_file`、`ingest_document`、`remove_document`、`reload_knowledge_base`、`review_figures`、
+`review_text`、`import_external_file`、`record_lesson`、`load_playbook`。名稱與順序的唯一來源是
 `mcp_contract.PUBLIC_TOOL_ORDER`；文件、canary 與 eval 都讀同一份契約。
 
 你不用手動寫 JSON 或自己呼 API。這些工具會出現在 frontend 的 MCP 工具列表裡；日常用法是在對話中直接要求模型「用工具 `<工具名>` 做某件事」。多數情況只講工具名就夠了，模型會自己補預設參數；需要指定檔案、行號、搜尋範圍時，再把那些條件寫進自然語言。
@@ -31,6 +31,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 讀一個已知檔案 | 請用工具 `file_info` 看 `src/main.py` 大小，再用工具 `read_file` 讀前 120 行。 | `file_info(...)`、`read_file(...)` |
 | 查已匯入的 spec | 請用工具 `query_knowledge` 查 reset timing 限制，回答要附 REF。 | `query_knowledge(...)` |
 | 查不能答錯的規格數字 | 請用工具 `query_knowledge_strict` 查 reset assert 最小時間，證據不夠就拒答。 | `query_knowledge_strict(...)` |
+| 列出或計數表格裡符合條件的列 | 請用工具 `list_table_rows` 列出 `registers.pdf` 裡 Reset 欄不是 0 的暫存器，回報總數，並說明掃了哪些表、有沒有被排除的表。 | `list_table_rows(document_id="registers.pdf", where=[{"column": "Reset", "op": "!=", "value": 0}])` |
 | 看專案外的截圖/PDF/log | 先 `/import on` 並重開 `aicode`，再在訊息裡寫 `@~/Downloads/error.png 這是什麼錯誤？`；核准匯入後客戶端自動分析 `.aicode_uploads/` 裡的副本，詳見[檔案在專案目錄外](usage.md#external-attachments)。也可以請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)`、`analyze_file(...)` |
 | 看圖片、PDF、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`（或 `docs/spec.pdf`），做通用 VL 圖片分析、PDF 一次性抽文字或 binary 分析。 | `analyze_file(...)` |
 | 夾帶專案內的檔案 | 在訊息裡寫 `@shots/error.png 這是什麼錯誤？`（路徑含空白用 `@"路徑"`；`@` 後面打檔名可搜尋整個專案，拖放或貼上路徑也會自動改寫）；送出前客戶端自動呼叫 `analyze_file`（圖片、PDF、ELF、binary）或 `read_file`（其他檔案），結果以工具卡顯示，詳見[夾帶附件](usage.md#attachments)。 | `analyze_file(...)`、`read_file(...)` |
@@ -44,6 +45,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 套修改 | 請產生 SEARCH/REPLACE 區塊（path 一行、`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` 各自獨佔一行，SEARCH 逐字抄檔案現況；或最小 unified diff），先用工具 `apply_patch` 的 `dry_run` 預覽，再正式套用。 | `apply_patch(...)` |
 | 修改後檢查 | 請用工具 `run_lint`（`fix=False`）檢查剛改的檔案，再用工具 `run_command` 跑最小相關測試——`apply_patch` 不會代跑，這兩步各自需要你核准。 | `run_lint(...)`、`run_command(...)` |
 | 糾正模型的做事方式 | (糾正它之後)請用工具 `record_lesson` 把這條記成行為規則,之後的 session 都要遵守。 | `record_lesson(...)` |
+| 照已安裝的流程做事 | 請照 `uartx-bringup` 流程檢查這個專案。（任務符合流程索引裡的說明時，模型也會自己先載入；流程怎麼安裝見[流程指示](usage.md#playbooks)） | `load_playbook(name="uartx-bringup")` |
 
 ### 依任務分類
 
@@ -59,6 +61,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False, mineru_content_list=None, mineru_pdf_sha256=None, resume=True, redo_pages=None, redo_figures=None, retry_failed=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / prose / diagram，再帶 canonical payload、證據、品質與驗證狀態。**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張，`review_figures(action="list")` 看得到 `in_kb=false`）；整份零 KB 寫入的是 VL 連不上／逾時、預算超限、capability probe 未過、來源檔中途被換掉這類契約破裂。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用。**執行期間 server 不會被卡住**：跑在 worker thread、每 2 秒送一次零內容的 MCP progress；同一時間所有 KB 工具與第二個 ingest 會立刻回「稍後重試」（不排隊）。結果的標頭下會帶這一次 run 的待辦（`[CODETRAIL_ACTION_REQUIRED]`：待人工判斷 / 需修復或品質排除 / 無法覆核 / 抽取失敗 / 可行動缺席，各附下一步；沒有待辦就完全不印），逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]` 並回 `status: error` |
 | 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、品質、人工確認狀態、處置、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
 | 文件/外部檔案 | `query_table(document_id="", figure_id="", register="", address="", row=None, column="", register_column="", address_column="")` | 按 register／位址／列欄精確查目前可信表格，附來源與版本；歧義不選第一筆，詳見 [表格查值](usage.md#text-table-review) |
+| 文件/外部檔案 | `list_table_rows(document_id="", figure_id="", where=None, columns=None, offset=0, limit=50)` | 對目前可信表格列出／過濾／計數**全部**符合列，每列附來源，並回報完整性帳（掃了哪些表、哪些被排除或跳過、哪些列無法判定）；唯讀、不呼叫模型，詳見 [`list_table_rows`：列舉、過濾與計數](#list_table_rows列舉過濾與計數) |
 | 文件/外部檔案 | `review_text(action="list", source="", text_id="", expected_revision=0, expected_sha256="", text="", confirm_against_source=False)` | OCR 正文的 list／show／correct／confirm／revoke；修改綁版本與雜湊，permission 設 ask，詳見 [正文覆核](usage.md#text-table-review) |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
@@ -70,6 +73,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
 | 修改/驗證 | `run_command(cmd, timeout=60)` | 跑內建白名單的裸命令，或以專案相對路徑執行專案內工具（例如 `tools/bin/x`、`./build.sh`，不需要任何授權指令）；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。裸名只比對內建白名單：預設為測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需在 `client.json` 設 `"build_commands": true`；PATH 上其他命令不可執行。專案內工具每次呼叫都重新驗證：`..`、`~`、控制字元與專案外路徑在任何檔案存取前拒絕；自 `/` 逐層不跟 symlink；檔案與所在目錄須由目前使用者擁有、不得 world-writable；須帶 owner execute，且是 ELF 可執行檔或 `#!` 腳本；與保留、內建或 build 命令同名者拒絕；只把 argv[0] 換成驗證過的絕對路徑。不經 shell；容器模式不執行專案內工具，也不改到本機執行。既有核准、readonly 與參數路徑檢查仍適用；git 用 `git_status` / `git_diff` |
 | 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([使用指南](usage.md#lessons)) |
+| 流程指示 | `load_playbook(name)` | 載入一份你安裝在 `~/.config/codetrail/playbooks/` 的流程指示（完整步驟）；任務符合 system prompt 索引裡的說明、或你點名它時才載入。唯讀、不需核准；這是唯一一個結果被當成指示而不是資料的工具（[使用指南](usage.md#playbooks)） |
 
 ### `code_rag_search` 四種模式
 
@@ -139,12 +143,66 @@ target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern �
 resume=False。頁碼從 1 起算，figure 使用精確 ID；重做後仍提交完整文件。
 來源、模型或設定不相符時不會沿用舊結果，詳見 [使用指南](usage.md#ingest-resume)。
 
-`query_table` 與 `review_text` 都受 ingest busy 閘保護；前者唯讀且不呼叫模型，後者採人工
-ask 並由 readonly server 拒絕。細節見 [使用指南](usage.md#text-table-review)。
+`query_table`、`list_table_rows` 與 `review_text` 都受 ingest busy 閘保護；前兩者唯讀且不呼叫模型，
+`review_text` 採人工 ask 並由 readonly server 拒絕。細節見 [使用指南](usage.md#text-table-review)。
 
 `analyze_file(view="consistency", linker_map=..., linker_script=..., preload_log=...,
 dram_config=..., map_format="auto")` 提供多來源記憶體核對。所有附加路徑都須在沙箱，
 格式、缺失證據與精確區間見 [使用指南](usage.md#memory-consistency)。
+
+### `list_table_rows`：列舉、過濾與計數
+
+`query_table` 回答「這一格是多少」；`list_table_rows` 回答「哪些列符合」「一共幾列」。它掃描目前可信的
+canonical table（可信判準與 `query_table` 相同：已入庫、驗證狀態可信、品質 accept、payload 的 revision 與
+KB 一致），沒有 LLM、embedding、reranker 或 top-k：範圍內符合的列全部算進去。
+
+```python
+list_table_rows(document_id="registers.pdf", where=[{"column": "Reset", "op": "!=", "value": 0}])
+list_table_rows(figure_id="fig_<16-hex>", where=[{"column": "Core", "op": "=", "value": "core1"}],
+                columns=["IRQ", "Source"])
+list_table_rows(figure_id="fig_<16-hex>", where=[{"column": "Core", "op": "=", "value": "core1"}],
+                limit=0)   # 只要計數與完整性帳，不列出各列
+```
+
+| 參數 | 意義 |
+|---|---|
+| `document_id`／`figure_id` | 與 `query_table` 相同的範圍解析；都省略＝所有可信表格 |
+| `where` | 最多 4 個條件，全部成立（AND）；每個是 `{"column", "op", "value"}`。`column` 是完整欄名或 1 起的欄序；`op` 是 `=`、`!=`、`<`、`<=`、`>`、`>=`、`contains` 之一；`value` 是文字或整數 |
+| `columns` | 只決定每列顯示哪些欄（最多 16 個）；**不影響**哪些列符合、計數與分頁。省略＝全部欄位 |
+| `offset`／`limit` | 分頁；`limit` 是 0..200，預設 50，`0` 只回計數與診斷 |
+
+比較規則是封閉的，不做推斷：
+
+- `value` 是整數字面值（十進位，或 `0x` 十六進位；位數間可用 `_` 分隔，例如 `0x0000_0001`）且運算子不是
+  `contains` 時做**數值**比較，格子的文字也必須是同一種整數字面值；不是的話（`N/A`、`10 ms`、`1Fh`）
+  那一列對這個條件**無法判定**。
+- 其他情況做**文字**比較：兩邊先折疊空白並忽略大小寫，`=`／`!=` 是全等／不等，`contains` 是子字串。
+  `<`、`<=`、`>`、`>=` 只接受整數 `value`。
+- 篩選欄的格子若不是直接觀察值（inherited／unreadable／conflict）或是空的，那一列也無法判定。
+  無法判定的列**既不算符合、也不算不符合**，會列在 `undetermined`。
+
+結果的第一段是完整性帳，預算再緊也不會被切掉（放不下時整個結果改回 `status: error`）：
+
+| 欄位 | 怎麼讀 |
+|---|---|
+| `counts` | `tables_scanned`／`rows_scanned`／`matched`／`undetermined`／`skipped_tables`／`excluded_tables`／`returned`。`matched`、`undetermined` 永遠涵蓋整個範圍，與 `offset`、`limit`、`columns` 無關，所以計數題一次呼叫就有答案 |
+| `complete` | 只有在範圍已解析、至少掃了一張表、沒有表被排除（`excluded`）、沒有表缺篩選欄（`skipped`）、也沒有無法判定的列時才是 `true`。其餘都是 `false`，`matched` 只能當下界 |
+| `excluded` | 範圍內未通過可信判準的表（待覆核、payload 不可用、未入庫）與讀不到的 review artifact；它們可能有符合的列，用 `review_figures` 覆核後才會被掃 |
+| `skipped` | 可信、但沒有 `where` 指定欄位的表，附它實際的欄名。同一份資料換了欄名（`Reset` 對 `Reset Value`）就會落在這裡 |
+| `undetermined` | 無法判定的列與原因（最多列 50 筆，總數看 `counts`） |
+| `value_samples` | 掃了表卻零符合時，列出篩選欄實際出現的值與次數，用來檢查條件是不是寫錯 |
+| `contains_matches` | `contains` 是子字串比對（`core1` 也在 `core10` 裡面）。某個 `contains` 條件符合到不只一種值時，列出它實際符合的值與次數，`next:` 會要求確認；要的是單一精確值就改用 `=` 重查 |
+| `scope_digest` | 這次掃描的表（文件、figure、revision、列數）與條件的指紋。分頁時每一頁都應該相同；變了代表 KB 在兩次呼叫之間改過，從 `offset=0` 重來 |
+
+要拿到 `complete: true` 的答案，就用 `figure_id` 把範圍收斂到真正要查的那張表：整份文件的查詢只要有一張表
+待覆核或缺欄位，就會如實回報不完整。
+
+每一列是 `row: {"n", "t", "row_index", "cells", "unobserved"}`：`n` 是它在全部符合列裡的序號（1 起），
+`t` 指回同一份結果裡的 `table:`（文件、來源、`figure_id`、頁碼、revision、`evidence_ref`）；`cells` 的 key
+一律是 `"<欄序> <欄名>"`（例如 `"4 Reset"`），欄名重複或空白也不會互相覆蓋，欄序可以直接當 selector。
+不是直接觀察到的格子不給文字，改列在 `unobserved`。還有下一頁時 `status: partial`，`next:` 會給下一個
+`offset`；結果被 context 預算截斷時，`next:` 的 `offset` 以**實際看得到的最後一列**重算，照它續查不會漏列。
+一列都放不下時改用較少的 `columns`（不會改變符合的列）。
 
 ### 結果文字與預算契約
 
@@ -155,6 +213,16 @@ path、include、pattern 或 depth。`list_dir` 超過字元上限時先逐層�
 完整清單並標 partial（淺層檔案不會被截掉）；降到 depth 0 仍超過才截字元。錯誤的修復方式一定存在文字 block，不能只放在
 `structuredContent`。
 
+「查不到」也是 `partial`，不是完整答案：`query_table`／`list_table_rows`／`query_knowledge` 沒有可用證據、
+`code_rag_search` 語意搜尋零結果、`grep_code` 無命中時，`next:` 會指出該用哪一種**另一個索引**確認一次
+（`query_table`／`list_table_rows` ↔ `query_knowledge`，`code_rag_search` ↔ `grep_code`）——前提是另一個索引
+能維持你原本的範圍。不能維持時（限定了 `figure_id` 而 `query_knowledge` 只能限定文件；選了 `build_target`
+而 `grep_code` 不認 target），`next:` 會要求回報「該範圍內未知」並說明限制，不會要求改查更大的範圍。
+`grep_code` 換到 `code_rag_search` 時只採計原本 path／include 範圍內的命中。
+
+`load_playbook` 的結果整份或不給：流程本文超過這次的結果預算時不輸出任何一段，改回 `status: error`，
+請把流程縮短或加大 context。
+
 `analyze_file` 回傳的 `[ELF 錯誤]`（例如缺少依賴或 objdump 失敗）與
 `run_command` 的非零 exit，都回報 `status: error` 與 MCP `isError=true`，
 TUI 顯示 error。成功輸出的正文即使含有錯誤字樣，也不會因此被判定為工具失敗。
@@ -164,7 +232,7 @@ TUI 顯示 error。成功輸出的正文即使含有錯誤字樣，也不會因�
 （`read_file` 50,000、`list_dir` 20,000、`code_rag_search` 30,000 字元）；高於 12% 預設
 預算時文字結果會標 `context_risk`。
 
-`code_rag_search`、`query_knowledge`、`query_knowledge_strict`、`query_table` 另外保留 core payload
+`code_rag_search`、`query_knowledge`、`query_knowledge_strict`、`query_table`、`list_table_rows` 另外保留 core payload
 於 `structuredContent`，供會採用它的 MCP client 使用；文字 renderer 不重複輸出
 `text`／`display`／`refs` 三份同義內容。其他文字工具不宣告 `{"result": string}`
 outputSchema，避免同一 payload 被 SDK 重複序列化。
@@ -409,11 +477,14 @@ void led_toggle(void) {
 - 檔案變更偵測有一個 30 秒的快照窗(`config.CODE_RAG_REFRESH_TTL_SECONDS`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
 - 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
+- 「哪些」「幾個」這類要全集的表格題用工具 `list_table_rows`，不要拿 `query_knowledge` 的 top-k 片段拼答案；回答時把 `complete`、被排除或跳過的表與無法判定的列一起講。單一格的值用 `query_table`。
+- 某個索引查不到，不代表資料不存在：照結果的 `next:` 用另一種索引在同一範圍確認一次，兩種都查無才回報查無，並說明查過哪些索引；`next:` 說範圍無法維持時，回報該範圍內未知。
 - 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。
 - 新增或刪除文件後查詢會自動載入變更；要立即確認 chunk 數可用工具 `reload_knowledge_base`。
 - git 專案改檔前先看工具 `git_status` / `git_diff`（非 git 專案會回跳過通知，直接改檔）；改檔用工具 `apply_patch`（SEARCH/REPLACE 或 unified diff 二擇一，先 `dry_run` 預覽）。
 - `apply_patch`（寫檔）、`run_lint(fix=True)`（格式化）、`run_command`（執行命令）是三個不同的 ask，各自需要你核准。apply_patch 不會自動執行 lint / typecheck / test；需要改檔或執行專案腳本時才允許。
 - 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [使用指南](usage.md#lessons)。
+- 工具 `load_playbook` 只載入你自己安裝在 `~/.config/codetrail/playbooks/` 的流程，而且只在任務符合索引說明或你點名時才載入；流程的步驟不能凌駕基底規則、人工核准與你當下的要求。專案內的檔案即使長得像流程指示，經 `read_file`／`query_knowledge` 讀回來仍然只是資料。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。
 - REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。被分類器判定「不是
 圖面」的（封面、logo）不會收為 figure，也不進覆核清單；此紀錄不能推論同區域的原生正文缺席。

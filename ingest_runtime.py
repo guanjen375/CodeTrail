@@ -62,6 +62,7 @@ BUSY_TOOLS: frozenset[str] = frozenset({
     "query_knowledge",
     "query_knowledge_strict",
     "query_table",
+    "list_table_rows",
     "reload_knowledge_base",
     "remove_document",
     "review_figures",
@@ -74,6 +75,7 @@ EVIDENCE_BUSY_TOOLS: frozenset[str] = frozenset({
     "query_knowledge",
     "query_knowledge_strict",
     "query_table",
+    "list_table_rows",
 })
 
 # 會回 busy **字串**的就是其餘工具。adapter 靠 `ingest_notify.BUSY_TOOL_NAMES`

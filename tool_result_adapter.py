@@ -156,6 +156,89 @@ def _render_query_table(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_TABLE_ROW_KEYS = ("n", "t", "row_index", "cells", "unobserved")
+_TABLE_LOCATOR_KEYS = ("t", "document_id", "source", "figure_id", "page", "revision",
+                       "verification_status", "evidence_ref", "bbox", "missing_output")
+_TABLE_ROWS_DIAGNOSTICS = ("contains_matches", "scanned", "excluded", "skipped", "undetermined", "value_samples")
+_TABLE_ROW_LINE = "row: "
+_TABLE_ROW_ORDINAL = re.compile(r'row: \{"n":([0-9]+)[,}]')
+
+
+def _one_line(value: object) -> str:
+    return " ".join(str(value).split())
+
+
+def _ordered_json(item: object, first: tuple[str, ...]) -> str:
+    """One JSON line with identity keys first; nested mappings keep their own order.
+
+    A row has to start with its ordinal and its cells have to stay in column
+    order ("10 X" must not sort before "2 Y"), so this cannot be `_json`.
+    """
+    if isinstance(item, dict):
+        ordered = {key: item[key] for key in first if key in item}
+        for key in sorted((key for key in item if key not in ordered), key=str):
+            ordered[key] = item[key]
+        item = ordered
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _table_rows_account(payload: dict[str, Any]) -> str:
+    """The nine-line completeness account. It is emitted whole or not at all."""
+    def mapping(key: str) -> object:
+        value = payload.get(key)
+        return value if isinstance(value, dict) else {}
+
+    def listing(key: str) -> object:
+        value = payload.get(key)
+        return value if isinstance(value, list) else []
+
+    return "\n".join((
+        "table_rows_status: " + (_one_line(payload.get("status", "unknown")) or "unknown"),
+        "has_ref: " + _json(payload.get("has_ref", False)),
+        "complete: " + _json(payload.get("complete", False)),
+        "reason: " + _json(payload.get("reason", "")),
+        "counts: " + _json(mapping("counts")),
+        ("scope_digest: " + _one_line(payload.get("scope_digest") or "")).rstrip(),
+        "scope: " + _json(mapping("scope")),
+        "where: " + _json(listing("where")),
+        "columns: " + _json(listing("columns")),
+    ))
+
+
+def _render_list_table_rows(payload: dict[str, Any]) -> str:
+    # The account leads and diagnostics trail: a tail cut loses detail lines
+    # first and rows last, never the counts. Each locator directly precedes the
+    # first row that needs it, so every visible row keeps its source.
+    lines = [_table_rows_account(payload)]
+    locators: dict[object, object] = {}
+    unplaced: list[object] = []
+    tables = payload.get("tables")
+    for table in tables if isinstance(tables, list) else ():
+        ordinal = table.get("t") if isinstance(table, dict) else None
+        if isinstance(ordinal, (int, str)) and ordinal not in locators:
+            locators[ordinal] = table
+        else:
+            unplaced.append(table)
+    rows = payload.get("rows")
+    rows = rows if isinstance(rows, list) else []
+    for row in rows:
+        ordinal = row.get("t") if isinstance(row, dict) else None
+        if isinstance(ordinal, (int, str)) and ordinal in locators:
+            lines.append("table: " + _ordered_json(locators.pop(ordinal), _TABLE_LOCATOR_KEYS))
+        lines.append(_TABLE_ROW_LINE + _ordered_json(row, _TABLE_ROW_KEYS))
+    for table in (*locators.values(), *unplaced):
+        lines.append("table: " + _ordered_json(table, _TABLE_LOCATOR_KEYS))
+    lines.append("rows_shown: " + json.dumps(
+        {"offset": payload.get("offset", 0), "returned": len(rows),
+         "next_offset": _table_rows_payload_next(payload)},
+        ensure_ascii=False, separators=(",", ":"), default=str))
+    for key in _TABLE_ROWS_DIAGNOSTICS:
+        items = payload.get(key)
+        if isinstance(items, list):
+            lines.extend(f"{key}: " + _ordered_json(item, ()) for item in items)
+    return "\n".join(lines)
+
+
 def _render_review_text(payload: str) -> str:
     # The review API uses a JSON text protocol. Keep its failure status visible
     # and its CAS locator ahead of potentially large OCR/history values.
@@ -272,6 +355,8 @@ def _render_payload(tool_name: str, payload: object) -> str:
         return _render_review_text(payload)
     if tool_name == "query_table" and isinstance(payload, dict):
         return _render_query_table(payload)
+    if tool_name == "list_table_rows" and isinstance(payload, dict):
+        return _render_list_table_rows(payload)
     if tool_name == "query_knowledge" and isinstance(payload, dict):
         return _render_query_knowledge(payload)
     if tool_name == "query_knowledge_strict" and isinstance(payload, dict):
@@ -341,17 +426,229 @@ _PARTIAL_MARKERS: dict[str, tuple[str, ...]] = {
 }
 
 
+# A miss is not absence. These point at the sibling index of the same data only
+# where that index can keep the caller's scope; where it cannot (a figure for
+# query_knowledge, a build target for grep_code) the scoped answer stays unknown.
+_TABLE_SCOPE_NEXT = (
+    "Keep the requested document_id and figure_id scope; verify the current document ID, "
+    "figure and review status before retrying. Do not broaden to another source or infer a value."
+)
+#: The scope itself did not resolve: there is nothing to confirm in another index.
+_TABLE_SCOPE_UNRESOLVED_REASONS = frozenset({
+    "document_scope_not_found", "figure_scope_not_found", "document_scope_ambiguous",
+})
+_TABLE_DOCUMENT_MISS_NEXT = (
+    " Before reporting the value absent, confirm once with query_knowledge restricted to the same source."
+)
+_TABLE_FIGURE_MISS_NEXT = (
+    " query_knowledge cannot filter by figure_id; report the value as unknown for this figure "
+    "instead of searching wider."
+)
+_TABLE_UNSCOPED_MISS_NEXT = (
+    "No verified table row matched. Before reporting the value absent, confirm once with "
+    "query_knowledge; a value found only outside verified tables stays unverified. "
+    "Do not infer the missing answer."
+)
+_KNOWLEDGE_MISS_NEXT = (
+    "No reference passed the retrieval gate. If the fact is a table or register value, confirm once "
+    "with query_table or list_table_rows before reporting it absent, passing the same source as "
+    "document_id when one was given; otherwise report it unknown or ingest the missing evidence. "
+    "Do not infer the missing answer."
+)
+_CODE_MISS_NEXT = (
+    "No semantic hit in the code index. Before reporting it absent, confirm once with grep_code "
+    "for the exact identifier or literal; the index may be scoped or stale."
+)
+_CODE_TARGET_MISS_NEXT = (
+    "No semantic hit within the selected build_target. grep_code cannot honor a build_target: "
+    "a literal hit proves the text exists in the repository, not in this target. Report "
+    "target-scoped absence as unknown unless the user accepts a repository-wide search."
+)
+_GREP_MISS_PREFIX = "沒有找到 '"
+_GREP_MISS_NEXT = (
+    "No literal match in this scope. Before reporting it absent, confirm once with code_rag_search "
+    "if it is exposed this turn; it cannot restrict by path/include, so count only hits inside "
+    "the original scope."
+)
+
+_TABLE_ROWS_ERROR_NEXT = "Correct the reported selector, where or column problem before retrying."
+_TABLE_ROWS_ACCOUNT_NEXT = (
+    "The completeness account does not fit this result budget; shorten document_id/where/columns "
+    "selectors or raise the context. Nothing was returned."
+)
+_TABLE_ROWS_TAIL_NEXT = (
+    "Only trailing lines were cut by the result budget; every returned row is visible above "
+    "and counts cover the whole scope."
+)
+
+# The envelope is the only shape that is a playbook. Its body is arbitrary user
+# text, so no marker inside it may be read as this adapter's own status.
+_PLAYBOOK_ENVELOPE = "[流程指示 "
+_PLAYBOOK_BUDGET_NEXT = (
+    "The playbook does not fit this result budget; shorten it or raise the context. Nothing was loaded."
+)
+_PLAYBOOK_BUDGET_BODY = "流程指示超過本次結果預算,未載入任何內容。"
+
+
+def _positive_count(counts: object, key: str) -> int:
+    value = counts.get(key) if isinstance(counts, dict) else None
+    return value if type(value) is int and value > 0 else 0
+
+
+def _table_rows_payload_next(payload: dict[str, Any]) -> int | None:
+    value = payload.get("next_offset")
+    if type(value) is not int or value < 0:
+        return None
+    if not payload.get("rows") and value == payload.get("offset"):
+        # A count-only page: the same arguments would return the same nothing.
+        return None
+    return value
+
+
+def _table_rows_next(
+    payload: dict[str, Any], resume_offset: int | None, *,
+    no_row_fit: bool = False, details_cut: bool = False,
+) -> str | None:
+    """Say why a row listing is not the whole answer, then where to continue.
+
+    `resume_offset` is the position after the last row the model can see. The
+    two flags exist only for a budget cut: no returned row was visible, or the
+    diagnostic detail lines were dropped. Every continuation named here must be
+    able to make progress.
+    """
+    counts = payload.get("counts")
+    parts: list[str] = []
+    if payload.get("status") in ("not_found", "ambiguous", "unverified"):
+        parts.append(
+            "Keep the requested document_id and figure_id scope; verify the current document ID, "
+            "figure, column labels and review status before retrying. Do not broaden to another "
+            "source or infer rows."
+        )
+    excluded = _positive_count(counts, "excluded_tables")
+    if excluded:
+        # Deliberately names no review tool. Seen live, twice: any mention of review_figures
+        # here read as the next action, and the model opened an approval prompt for a
+        # question that had asked for no review.
+        parts.append(
+            f"{excluded} table(s) were excluded as unverified or unreadable (see excluded), so "
+            "counts are a lower bound; say so and leave reviewing them to the user."
+        )
+    skipped = _positive_count(counts, "skipped_tables")
+    if skipped:
+        parts.append(
+            f"{skipped} table(s) lack the filter column(s) (see skipped labels); if one holds the "
+            "same data under another label, rerun with that label or its figure_id."
+        )
+    undetermined = _positive_count(counts, "undetermined")
+    if undetermined:
+        parts.append(
+            f"{undetermined} row(s) could not be classified (see undetermined); they are neither "
+            "matches nor non-matches."
+        )
+    substring = payload.get("contains_matches")
+    if isinstance(substring, list) and substring:
+        # "core1" is inside "core10": a substring condition that hit several values may have
+        # counted more than was asked for, and only the caller knows which was meant.
+        parts.append(
+            "A contains condition matched more than one distinct value (see contains_matches); "
+            "if one exact value was meant, rerun with = and report that count instead."
+        )
+    matched = counts.get("matched") if isinstance(counts, dict) else None
+    if _positive_count(counts, "tables_scanned") and type(matched) is int and matched == 0:
+        parts.append(
+            "Zero rows matched in the scanned verified tables; check value_samples, then confirm "
+            "once with query_knowledge restricted to the same source before reporting none (it "
+            "cannot filter by figure_id: for a figure-scoped request report unknown for that "
+            "figure instead)."
+        )
+    if not parts and payload.get("complete") is not True:
+        # No well-formed result gets here; an unexplained incomplete scan must still not read as ok.
+        parts.append(
+            "The scan is not marked complete; treat the counts as a lower bound and check reason "
+            "before relying on them."
+        )
+    if no_row_fit:
+        offset = payload.get("offset")
+        parts.append(
+            "No row fit this result budget: request fewer columns (projection never changes which "
+            "rows match) or read one cell with query_table; continue from "
+            f"offset={offset if type(offset) is int and offset >= 0 else 0}."
+        )
+    elif resume_offset is not None:
+        parts.append(
+            f"Use list_table_rows with offset={resume_offset} and the same arguments to continue "
+            f"(scope_digest {_one_line(payload.get('scope_digest') or 'unavailable')}); "
+            "counts already cover the whole scope."
+        )
+    if details_cut and payload.get("rows"):
+        parts.append("Diagnostic details were cut; call again with limit=0 to list them.")
+    elif details_cut:
+        # Already a call without rows: asking for limit=0 again cannot show more.
+        parts.append("Diagnostic details were cut; narrow document_id or figure_id to list fewer of them.")
+    return " ".join(parts) or None
+
+
+def _code_rag_semantic_miss(payload: object) -> bool:
+    """An empty answer of the semantic lane only; graph and context modes say more."""
+    if not isinstance(payload, list):
+        return False
+    for item in payload:
+        if not isinstance(item, dict):
+            return False
+        mode = str(item.get("mode") or ("context" if "evidence" in item else "semantic"))
+        if mode != "semantic" or item.get("results") != [] or "path" in item:
+            return False
+    return True
+
+
+def _query_table_found_no_row(payload: dict[str, Any]) -> bool:
+    """The lookup resolved its scope and still established no row at all.
+
+    In a document with several tables this is rarely `not_found`: one table without a
+    register column or one table awaiting review turns the same miss into `ambiguous`
+    or `unverified`. Those are misses too. It is not a miss when a row did match
+    (several rows, or one whose requested cell is not directly observed): then the
+    value exists and the caller has to narrow the selection, not look elsewhere.
+    """
+    if payload.get("has_ref") is not False:
+        return False
+    if payload.get("status") not in ("not_found", "unverified", "ambiguous"):
+        return False
+    if payload.get("reason") in _TABLE_SCOPE_UNRESOLVED_REASONS:
+        return False
+    excluded = payload.get("excluded")
+    for item in excluded if isinstance(excluded, list) else ():
+        reason = item.get("reason") if isinstance(item, dict) else None
+        if reason == "multiple_matching_rows" or (isinstance(reason, str) and reason.startswith("result_cell_")):
+            return False
+    return True
+
+
 def _status_for(tool_name: str, payload: object, body: str) -> tuple[str, str | None]:
     lower = body.lower()
     if tool_name == "query_table" and isinstance(payload, dict):
         scope = payload.get("scope") or {}
         scoped = isinstance(scope, dict) and (scope.get("requested_document_id") or scope.get("requested_figure_id"))
-        if scoped and (payload.get("has_ref") is False or payload.get("status") == "error"):
-            return ("error" if payload.get("status") == "error" else "partial",
-                    "Keep the requested document_id and figure_id scope; verify the current document ID, "
-                    "figure and review status before retrying. Do not broaden to another source or infer a value.")
-        if payload.get("status") == "error":
+        table_status = payload.get("status")
+        missed = _query_table_found_no_row(payload)
+        if scoped and (payload.get("has_ref") is False or table_status == "error"):
+            next_step = _TABLE_SCOPE_NEXT
+            if missed:
+                # A document keeps its scope in query_knowledge(source=...); a figure does not.
+                next_step += (_TABLE_FIGURE_MISS_NEXT if scope.get("requested_figure_id")
+                              else _TABLE_DOCUMENT_MISS_NEXT)
+            return "error" if table_status == "error" else "partial", next_step
+        if table_status == "error":
             return "error", "Correct the reported table selector or source problem before retrying."
+        if not scoped and missed:
+            return "partial", _TABLE_UNSCOPED_MISS_NEXT
+    if tool_name == "list_table_rows" and isinstance(payload, dict):
+        if payload.get("status") == "error":
+            return "error", _TABLE_ROWS_ERROR_NEXT
+        next_step = _table_rows_next(payload, _table_rows_payload_next(payload))
+        return ("partial", next_step) if next_step else ("ok", None)
+    if tool_name == "load_playbook" and isinstance(payload, str) and body.startswith(_PLAYBOOK_ENVELOPE):
+        return "ok", None
     if tool_name == "analyze_file" and body.startswith("Memory consistency: "):
         if body.startswith(("Memory consistency: unknown;", "Memory consistency: conflict;")):
             return "partial", "Inspect the reported ranges and sources; resolve conflicts or supply missing evidence before declaring consistency."
@@ -371,10 +668,20 @@ def _status_for(tool_name: str, payload: object, body: str) -> tuple[str, str | 
             return ingest_status, ingest_step
     if _has_structured_error(payload):
         return "error", "Correct the reported input or environment problem, then retry once."
+    if tool_name == "query_knowledge" and isinstance(payload, dict) and payload.get("has_ref") is False:
+        return "partial", _KNOWLEDGE_MISS_NEXT
     if isinstance(payload, dict) and (
         payload.get("refused") is True or payload.get("has_ref") is False
     ):
         return "partial", "Use another indexed source or ingest evidence; do not infer the missing answer."
+    if tool_name == "code_rag_search" and _code_rag_semantic_miss(payload):
+        targeted = any(
+            isinstance(item.get("build_context"), dict) and item["build_context"].get("target")
+            for item in payload
+        )
+        return "partial", _CODE_TARGET_MISS_NEXT if targeted else _CODE_MISS_NEXT
+    if tool_name == "grep_code" and isinstance(payload, str) and body.startswith(_GREP_MISS_PREFIX):
+        return "partial", _GREP_MISS_NEXT
     if body.lstrip().startswith("✗ 驗證未通過") and "patch 已套用" in body:
         return "partial", "The patch remains applied; run lint/tests separately and inspect the reported failure."
     stripped = body.lstrip()
@@ -513,6 +820,60 @@ def _fit_review_figures_body(
     return "\n".join(kept).rstrip(), True
 
 
+def _fit_table_rows(
+    payload: dict[str, Any], full_body: str, budget: ResultBudget, *,
+    status: str, next_step: str | None, prefix_lines, suffix: str,
+) -> tuple[str, list[str]]:
+    """Cut a row listing without losing its account or its resume position.
+
+    The account is whole or the result is an error. The resume offset comes from
+    the last row the model can actually see, never from the payload's own
+    `next_offset`, which describes rows this cut may have removed.
+    """
+    def reserve(current_status: str, current_next: str) -> int:
+        shell = "\n".join(prefix_lines(current_status, current_next) + ["", suffix])
+        return _measure(shell, explicit=budget.explicit)
+
+    cut_status = "error" if status == "error" else "partial"
+    full_lines = full_body.split("\n")
+    row_lines = [line for line in full_lines if line.startswith(_TABLE_ROW_LINE)]
+    ordinals = [int(match[1]) for match in map(_TABLE_ROW_ORDINAL.match, row_lines) if match]
+    payload_next = _table_rows_payload_next(payload)
+    offset = payload.get("offset")
+    offset = offset if type(offset) is int and offset >= 0 else 0
+    # Reserve for the longest guidance this result can end with and fit once:
+    # whatever turns out to be visible, the final `next:` is no longer than that.
+    widest = max([offset + len(row_lines), payload_next or 0, *ordinals])
+    reserved = max(reserve(cut_status, candidate) for candidate in (
+        _table_rows_next(payload, widest, details_cut=True) or "",
+        _table_rows_next(payload, None, no_row_fit=True, details_cut=True) or "",
+        _TABLE_ROWS_ERROR_NEXT, _TABLE_ROWS_TAIL_NEXT,
+    ))
+    fitted, cut = _fit_body(full_body, budget, reserved=reserved)
+    if not cut:
+        return status, prefix_lines(status, next_step) + [full_body]
+    account = _table_rows_account(payload)
+    if fitted != account and not fitted.startswith(account + "\n"):
+        return "error", prefix_lines("error", _TABLE_ROWS_ACCOUNT_NEXT)
+    if cut_status == "error":
+        return "error", prefix_lines("error", _TABLE_ROWS_ERROR_NEXT) + [fitted, suffix]
+
+    visible = fitted.split("\n")
+    visible_rows = [line for line in visible if line.startswith(_TABLE_ROW_LINE)]
+    diagnostics = tuple(f"{key}: " for key in _TABLE_ROWS_DIAGNOSTICS)
+    details_cut = any(line.startswith(diagnostics) for line in full_lines[len(visible):])
+    no_row_fit = bool(row_lines) and not visible_rows
+    resume = None
+    if visible_rows and (len(visible_rows) < len(row_lines) or payload_next is not None):
+        last = _TABLE_ROW_ORDINAL.match(visible_rows[-1])
+        # A row's ordinal is one-based, so it is also the offset of the next row.
+        resume = int(last[1]) if last else offset + len(visible_rows)
+    elif not row_lines:
+        resume = payload_next
+    guidance = _table_rows_next(payload, resume, no_row_fit=no_row_fit, details_cut=details_cut)
+    return "partial", prefix_lines("partial", guidance or _TABLE_ROWS_TAIL_NEXT) + [fitted, suffix]
+
+
 def adapt_tool_result(
     tool_name: str, core_payload: object, *, budget: ResultBudget
 ) -> types.CallToolResult:
@@ -531,11 +892,20 @@ def adapt_tool_result(
     initial_text = "\n".join(initial + ([body] if body else []))
     total_limit = budget.char_limit if budget.explicit else budget.token_limit
     budget_truncated = _measure(initial_text, explicit=budget.explicit) > total_limit
-    if budget_truncated:
+    suffix = "[result truncated by context budget]"
+    if budget_truncated and tool_name == "load_playbook" and status != "error":
+        # Half a procedure is worse than none: the model would follow the visible steps.
+        status = "error"
+        lines = prefix_lines(status, _PLAYBOOK_BUDGET_NEXT) + [_PLAYBOOK_BUDGET_BODY]
+    elif budget_truncated and tool_name == "list_table_rows" and isinstance(core_payload, dict):
+        status, lines = _fit_table_rows(
+            core_payload, body, budget, status=status, next_step=next_step,
+            prefix_lines=prefix_lines, suffix=suffix,
+        )
+    elif budget_truncated:
         if status != "error":
             status = "partial"
         next_step = next_step or _narrowing_step(tool_name)
-        suffix = "[result truncated by context budget]"
         full_body = body
         lines = prefix_lines(status, next_step)
         for _pass in range(2):
