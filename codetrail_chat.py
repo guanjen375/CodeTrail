@@ -134,8 +134,14 @@ def _engine_options(
     # readonly 的 metrics 由 `client_config.apply_to_config(readonly=True)` 關掉
     # (MCP 子行程那一份由 `--readonly` 關)。
     model = _cli_model(str(getattr(args, "model", "") or ""))
-    observed_ctx = (preflight.n_ctx if preflight is not None else
-                    client_preflight.observe_main_n_ctx(config.LLAMA_BASE_URL))
+    if preflight is not None:
+        observed_ctx = preflight.n_ctx
+        parallel_tool_calls = getattr(preflight, "parallel_tool_calls", False) is True
+    else:
+        # headless 沒有 preflight:一次 /props 同時取 live n_ctx 與 parallel tool call 能力。
+        server = client_preflight.observe_main_server(config.LLAMA_BASE_URL)
+        observed_ctx = server.n_ctx
+        parallel_tool_calls = server.parallel_tool_calls is True
     if type(observed_ctx) is not int or observed_ctx <= 0:
         raise client_preflight.PreflightError("主 server 沒有有效的 live n_ctx，拒絕建立 Engine。")
     # preflight 已經解析過主模型與觀測過 server 的 n_ctx。用它的值,不要再讓
@@ -154,6 +160,8 @@ def _engine_options(
         keep_reasoning=_settings(args).keep_historical_reasoning,
         thinking_kwarg=config.MAIN_THINKING_KWARG,
         attachment_scope=_attachment_scope(),
+        # 主 server 模板明確宣告支援(JSON true)才開;與 n_ctx 出自同一次 /props 觀測。
+        parallel_tool_calls=parallel_tool_calls,
     )
 
 
@@ -171,7 +179,7 @@ def _settings(args: argparse.Namespace | None = None) -> client_config.ClientSet
 
 def _build(
     root: Path, args: argparse.Namespace, *, persist: bool, preflight=None,
-    defer_session: bool = False,
+    defer_session: bool = False, aux_preflight_done: bool = False,
 ):
     readonly = getattr(args, "policy", "interactive") == "readonly"
     settings = _settings(args)
@@ -181,6 +189,9 @@ def _build(
     # headless 同樣先觀測 live ctx，且只觀測一次，再交同值給 Engine 與 MCP argv。
     options = _engine_options(root, args, preflight)
     scope = options.attachment_scope
+    # 只有互動啟動在 preflight 剛通過附屬探測時才帶這個 kwarg(McpClient 只讓第一次
+    # spawn 用它);headless 不帶,shared_client 的呼叫形狀與以前完全相同。
+    aux_kwargs = {"aux_preflight_done": True} if aux_preflight_done is True else {}
     mcp = client_mcp.shared_client(
         root,
         readonly=readonly,
@@ -193,6 +204,7 @@ def _build(
         # 外部匯入的授權是**啟動時的快照**,與附件範圍同一份:MCP 取消逾時後重建時
         # 會重讀 client.json,若由 server 自己讀,`/import` 改過之後兩邊就不一致。
         external_import_roots=scope.roots if scope is not None and scope.enabled else (),
+        **aux_kwargs,
     )
     if readonly and not mcp.readonly:
         # shared_client 只在第一次建立時決定 argv。同一個行程若先起過互動 client,
@@ -303,7 +315,13 @@ def command_chat(args: argparse.Namespace) -> int:
     except client_preflight.PreflightError as exc:
         print(f"[aicode] {exc}", file=sys.stderr)
         return 2
-    mcp, engine = _build(root, args, persist=True, preflight=checks, defer_session=True)
+    # 主 MCP 是這次啟動流程內第一次 spawn 的 server:附屬探測剛在 preflight 通過
+    # (同一份 run_checks、同一份 profile),只有這個證據在才讓它的**第一次** spawn
+    # 免重複探測;取消逾時重建與 /review 的 MCP 照常探測。
+    mcp, engine = _build(
+        root, args, persist=True, preflight=checks, defer_session=True,
+        aux_preflight_done=getattr(checks, "aux_preflight_passed", False) is True,
+    )
     try:
         compactor = _compactor(engine, args)
         # 啟動對話區保持空白。摘要、壓縮狀態與所有 stderr 警告留給 /status，

@@ -7,7 +7,8 @@ worker 阻塞在核准上、取消與回合收尾互相搶跑。三者都真的�
 核准的三條也在這裡:沒回答 = 拒絕、只能回答一次、非 bool 不算核准。
 
 prompt cache 預熱的那三條也在這裡:它**不是**一輪(不進 busy、不被 cancel 認得),
-只在壓縮真的換掉歷史之後、放掉回合鎖才排,而且每一次跑完都經 ``on_prime`` 回報。
+只在壓縮真的換掉歷史之後、或 think on 的回合成功收尾之後(各一次)、放掉回合鎖才排,
+而且每一次跑完都經 ``on_prime`` 回報。
 """
 from __future__ import annotations
 
@@ -833,6 +834,53 @@ def test_a_compaction_that_replaced_the_history_primes_after_the_turn_lock_is_re
         assert _primes_after("compacted", manual=manual) == [("compaction", False)]
         for status in ("skipped", "stopped", "failed"):
             assert _primes_after(status, manual=manual) == [], (status, manual)
+
+
+@pytest.mark.smoke
+def test_a_successful_think_on_turn_primes_the_next_prefix_once_after_the_turn_lock(monkeypatch):
+    """think on 的下一輪會剝掉這一輪的 reasoning,prefix 在這一輪第一則 assistant 就分岔。
+
+    所以成功收尾、放掉回合鎖之後要排**一次** ``prime("turn")``(記下的 busy 必須是 False)。
+    think off、非真 bool 的旗標、沒有 options 的舊替身、沒有成功的回合都不排;佇列接續時
+    只在最後一輪之後排一次;壓縮換掉歷史時只有 ``compaction`` 那一次,不重複。
+    """
+
+    class _Thinking(_Engine):
+        def __init__(self, thinking, *, finish=client_events.REASON_STOP, queue_next=None):
+            super().__init__()
+            self.options = types.SimpleNamespace(thinking=thinking)
+            self.finish = finish
+            self.queue_next = queue_next
+
+        def send(self, text, *, on_event=None, on_user_recorded=None, **_kwargs):
+            self.sent.append(text)
+            if on_user_recorded is not None:
+                on_user_recorded()
+            if self.queue_next is not None:
+                self.coordinator.enqueue(self.queue_next)
+                self.queue_next = None
+            if on_event:
+                on_event(client_events.text_event(self.session_id, "ok"))
+            return _Result(finish=self.finish)
+
+    def _primes(engine, compactor=None):
+        coordinator, _recorder = _coordinator(engine, compactor=compactor)
+        engine.coordinator = coordinator
+        monkeypatch.setattr(coordinator, "_spawn", lambda body, _name: body())
+        coordinator.start_turn("first")
+        assert not coordinator.busy
+        return list(engine.primes)
+
+    assert _primes(_Thinking(True)) == [("turn", False)]
+    for thinking in (False, None, "true", 1):
+        assert _primes(_Thinking(thinking)) == [], thinking
+    assert _primes(_Engine()) == []
+    assert _primes(_Thinking(True, finish="length")) == []
+    queued = _Thinking(True, queue_next="second")
+    assert _primes(queued) == [("turn", False)]
+    assert queued.sent == ["first", "second"]
+    compacted = _Compactor(outcome=_Outcome("compacted", "已壓縮"))
+    assert _primes(_Thinking(True), compacted) == [("compaction", False)]
 
 
 def test_priming_is_invisible_to_busy_and_cancel_and_refused_while_a_turn_runs():

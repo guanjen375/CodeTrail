@@ -237,6 +237,7 @@ class McpClient:
         build_commands: bool = False,
         client_config: str | os.PathLike[str] | None = None,
         skip_aux_preflight: bool = False,
+        aux_preflight_done: bool = False,
         external_import_roots: Sequence[str] = (),
         env: Mapping[str, str] | None = None,
         cancel_grace: float = CANCEL_GRACE_SECONDS,
@@ -267,6 +268,14 @@ class McpClient:
             skip_aux_preflight=skip_aux_preflight,
             external_import_roots=self.external_import_roots,
         )
+        #: 一次性:aicode 的 preflight 剛在這次啟動流程內通過附屬 server 探測時,
+        #: **只有第一次** spawn 的 argv 多帶 `--aux-preflight-done`(server 不再重複探測)。
+        #: 第一次 spawn 一開始就用掉,不論那次 handshake 成功與否 —— 之後的 spawn
+        #: (取消逾時重建、restart、啟動失敗後再 start)一律照常探測:那時距離 preflight
+        #: 已經不知多久,附屬 server 可能早就不在了。刻意不放進 `self._argv`(那一份是
+        #: 「每次 spawn 都沿用」的設定),也不開放成公開屬性(/review 等其他 MCP 不得繼承)。
+        #: 只認真的 True(它關掉的是一道硬閘);`argv=` 自訂整條命令時不附加,與其他旗標一致。
+        self._aux_preflight_done_once = aux_preflight_done is True and not argv
         self._env_overrides = dict(env or {})
         # `env=` 是**覆寫**通道:呼叫端明確要求的值,套用在剝除之後。被剝掉的那
         # 幾個前綴在這一代沒有任何合法的覆寫用途 —— 舊世代前端那一組只會是升級
@@ -473,6 +482,8 @@ class McpClient:
         也要跳過,否則外層跳了、child 照樣失敗。
         `external_import_roots`:外部匯入的來源根,一個根一個 `--external-import-root`。
         server 只認這裡交過去的(沒有 = 關),readonly 一律不帶。
+        一次性的 `--aux-preflight-done` **不在**這裡:它只屬於第一次 spawn,由 `_spawn`
+        附加在那一次的副本上(見 `_aux_preflight_done_once`)。
         """
         argv = [sys.executable, str(SERVER_SCRIPT), "--root", self.root]
         if readonly:
@@ -495,13 +506,19 @@ class McpClient:
             if self._start_aborted.is_set() or self._closed:
                 raise McpCallCancelledError("MCP startup cancelled")
             self._startup_complete = False
+        argv = self._argv
+        if self._aux_preflight_done_once:
+            # 一次性旗標在這裡用掉(呼叫端都持有 self._lock):這一次之後的每一次
+            # spawn 都照常探測附屬 server。
+            self._aux_preflight_done_once = False
+            argv = [*self._argv, "--aux-preflight-done"]
         with self._stderr_lock:
             self._stderr_tail = deque()
             self._stderr_bytes = 0
         self._stderr_handle = _open_stderr_log(self._stderr_log, self.on_notice)
         try:
             proc = process_env.popen(
-                self._argv,
+                argv,
                 stdin=process_env.PIPE,
                 stdout=process_env.PIPE,
                 stderr=process_env.PIPE,
@@ -894,6 +911,9 @@ def shared_client(root: str | os.PathLike[str], **kwargs: Any) -> McpClient:
 
     **關閉與替換在同一把鎖裡完成**:``close()`` 回來時舊子行程已經走了,所以
     不會出現「舊的還在收屍、新的已經起來」的重疊窗口。
+
+    ``kwargs`` 原樣交給 :class:`McpClient`(含一次性的 ``aux_preflight_done``),
+    而且只在**第一次**建立時生效 —— 與 argv 的其他設定相同。
     """
     key = str(Path(root).resolve())
     with _SHARED_LOCK:

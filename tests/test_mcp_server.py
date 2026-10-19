@@ -1941,3 +1941,121 @@ def test_list_dir_over_budget_keeps_shallow_entries_instead_of_cutting_root_file
     depth0 = module.EXEC.list_files(path=".", depth=0)
     tiny = module.list_dir.fn(path=".", depth=2, max_chars=10)
     assert tiny.startswith(depth0[:10] + "\n\n... [MCP wrapper 截斷"), tiny
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 速度優化 #8:附屬探測不重複(`--aux-preflight-done`)與 BM25 快取的發布權限
+# ═══════════════════════════════════════════════════════════════════════════
+_AUX_DONE_LINE = "[MCP] model-preflight 已由啟動它的 aicode 在本次啟動完成，不重複探測"
+
+
+def _run_aux_gate(args: dict) -> tuple[list[str], int, object]:
+    """把模組層那段附屬 server 硬閘(`if _ARGS["skip_aux_preflight"]:` 起的 if/elif/else)
+    抽出來跑,回傳 (log 行, 探測次數, exit code)。
+
+    完整 import 會拉起整支 server,而被 import 時 `_ARGS` 一律是 skip;真的 spawn 一次
+    去打沒人聽的 port 又要等 HTTP 重試退避。探測換成記錄器,結果一律失敗。
+    """
+    import ast as _ast
+    import types as _types
+
+    tree = _ast.parse((REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8"))
+    gate = next(
+        node for node in tree.body
+        if isinstance(node, _ast.If)
+        and _ast.unparse(node.test) == "_ARGS['skip_aux_preflight']"
+    )
+    logs: list[str] = []
+    probes: list[int] = []
+
+    def run_checks():
+        probes.append(1)
+        return [_types.SimpleNamespace(ok=False)]
+
+    namespace = {
+        "_ARGS": dict(args),
+        "_log": logs.append,
+        "sys": sys,
+        "_run_required_model_checks": run_checks,
+        "_render_required_model_report": lambda checks, prefix: [f"{prefix} FAIL"],
+    }
+    code = None
+    try:
+        exec(compile(_ast.Module(body=[gate], type_ignores=[]), "<aux-gate>", "exec"), namespace)
+    except SystemExit as exc:
+        code = exc.code
+    return logs, len(probes), code
+
+
+@pytest.mark.smoke
+def test_aux_preflight_done_is_a_valueless_startup_flag():
+    """`--aux-preflight-done` 不帶值、預設關;帶值的寫法一律 fail-loud(不是靜默當成開)。"""
+    assert _parse([])["aux_preflight_done"] is False
+    parsed = _parse(["--root", "/tmp/x", "--aux-preflight-done"])
+    assert parsed["aux_preflight_done"] is True and parsed["skip_aux_preflight"] is False
+    for bad in (["--aux-preflight-done=1"], ["--aux-preflight-done=true"]):
+        with pytest.raises(SystemExit) as excinfo:
+            _parse(bad)
+        assert excinfo.value.code == 2
+
+
+@pytest.mark.smoke
+def test_the_aux_preflight_gate_still_probes_unless_told_otherwise():
+    """附屬 server 硬閘:沒有旗標就照跑(探測失敗 exit 3);`--aux-preflight-done` 只記
+    一行並跳過;與 `--skip-aux-preflight` 同給時以 skip 的 WARN 為準。
+
+    預設那條路一旦被跳過,就是一個沒人探測過附屬 server 的 session —— 缺 reranker
+    要到第一個 RAG 問題才炸,而且看不出原因。被 import 時(doctor / 測試)照舊只走 skip。
+    """
+    logs, probes, code = _run_aux_gate({"skip_aux_preflight": False, "aux_preflight_done": False})
+    assert (probes, code) == (1, 3)
+    assert logs == ["[MCP][model-preflight] FAIL"]
+
+    logs, probes, code = _run_aux_gate({"skip_aux_preflight": False, "aux_preflight_done": True})
+    assert (probes, code) == (0, None)
+    assert logs == [_AUX_DONE_LINE]
+
+    logs, probes, code = _run_aux_gate({"skip_aux_preflight": True, "aux_preflight_done": True})
+    assert (probes, code) == (0, None)
+    assert len(logs) == 1 and "--skip-aux-preflight" in logs[0] and _AUX_DONE_LINE not in logs
+
+
+@pytest.mark.smoke
+def test_kb_loads_publish_the_bm25_cache_only_on_a_writable_server(mcp_module_factory, monkeypatch):
+    """BM25 快取只有可寫的 server 才發布:每個建 KB 處都傳 `publish_bm25_cache=not readonly`。
+
+    readonly replay 的契約是「前後 project state 不變」—— 啟動、查詢前的自動重載與
+    `reload_knowledge_base` 都不得在專案內多出快取檔。判準在**呼叫當下**讀 `_ARGS`。
+    """
+    import ast as _ast
+    import types as _types
+
+    tree = _ast.parse((REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8"))
+    sites = [
+        node for node in _ast.walk(tree)
+        if isinstance(node, _ast.Call)
+        and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
+        in ("KnowledgeBase", "load_knowledge_base_strict")
+    ]
+    assert sites, "mcp_server.py 找不到建 KB 的呼叫"
+    for node in sites:
+        flags = [kw for kw in node.keywords if kw.arg == "publish_bm25_cache"]
+        assert len(flags) == 1 and _ast.unparse(flags[0].value) == "not _ARGS['readonly']", (
+            _ast.unparse(node)
+        )
+
+    module = mcp_module_factory()
+    published: list[bool] = []
+    fake_kb = _types.SimpleNamespace(source_changed=lambda: True, get_status=lambda: "fake KB")
+
+    def strict(_path, **kwargs):
+        published.append(kwargs["publish_bm25_cache"])
+        return fake_kb
+
+    monkeypatch.setattr(module, "KB", fake_kb)
+    monkeypatch.setattr(module, "load_knowledge_base_strict", strict)
+    for readonly in (False, True):
+        module._ARGS["readonly"] = readonly  # noqa: SLF001
+        module._ensure_kb_fresh()  # noqa: SLF001
+        assert module.reload_knowledge_base() == "[KB reloaded] fake KB"
+    assert published == [True, True, False, False]

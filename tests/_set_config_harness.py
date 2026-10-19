@@ -168,6 +168,32 @@ def sparse_layered_moe_gguf(
         handle.truncate(data_start + offset)
 
 
+def sparse_gguf(path: Path, tensors: list[tuple[str, tuple[int, ...], int]]) -> None:
+    """通用 sparse GGUF:tensors 是依序緊接存放的 (名稱, dims, storage bytes)。
+
+    上面幾個 fixture 的 dims 一律寫 [1](parser 以前只看 offset);set_config 現在會從
+    output.weight / token_embd.weight 的 dims 讀 n_embd / n_vocab,這裡照實寫進 tensor
+    table。沒有 metadata;storage 必須 > 0(offset 差為 0 會被當成異常),資料區用
+    truncate 撐出 st_size,不占磁碟。
+    """
+    header = struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), 0)
+    table = bytearray()
+    offset = 0
+    for name, dims, size in tensors:
+        encoded = name.encode("utf-8")
+        table.extend(struct.pack("<Q", len(encoded)) + encoded)
+        table.extend(struct.pack("<I", len(dims)) + struct.pack(f"<{len(dims)}Q", *dims))
+        table.extend(struct.pack("<I", 0) + struct.pack("<Q", offset))
+        offset += size
+    metadata_end = len(header) + len(table)
+    data_start = (metadata_end + 31) // 32 * 32
+    with open(path, "wb") as handle:
+        handle.write(header)
+        handle.write(table)
+        handle.write(b"\0" * (data_start - metadata_end))
+        handle.truncate(data_start + offset)
+
+
 def write_fake_nvidia_smi(bin_dir: Path, output: str, exit_code: int = 0) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     executable = bin_dir / "nvidia-smi"

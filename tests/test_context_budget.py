@@ -578,6 +578,154 @@ def test_gated_completion_returns_model_text_when_within_budget(monkeypatch):
     assert seen["stream"] is False
 
 
+@pytest.mark.smoke
+def test_gated_completion_bounds_generation_with_the_reserved_budget(monkeypatch):
+    """擴寫生成有界，而且實送的 n_predict 就是 gate 的保留額（同一個數字、呼叫當下讀）。
+
+    保留額比實送上限小，閘放行的 prompt 仍可能在生成途中撐爆 ctx、被 server 從前面
+    靜默截掉；不設上限則模型答完第一行還會一路續寫到 EOS／逾時，單 slot 的主模型
+    整段對話被擠出——兩種都沒有錯誤訊息。
+    """
+    import knowledge
+    import llama_client
+
+    reserved = []
+    real_check = context_budget.check_and_log
+
+    def spy_check(**kwargs):
+        reserved.append(kwargs.get("reserved_output_tokens"))
+        return real_check(**kwargs)
+
+    sent = []
+    monkeypatch.setattr(context_budget, "check_and_log", spy_check)
+    monkeypatch.setattr(llama_client, "native_completion",
+                        lambda **kwargs: sent.append(kwargs) or {"content": " uart, baud "})
+    monkeypatch.setattr(config, "require_main_model", lambda: "test-model")
+
+    assert knowledge._gated_completion(
+        source="kb_query_expansion", prompt="short question", temperature=0, timeout=30
+    ) == "uart, baud"
+    assert sent[-1]["n_predict"] == reserved[-1] == config.KB_EXPANSION_MAX_TOKENS
+    assert sent[-1]["stop"] == list(config.KB_EXPANSION_STOP) == ["\n"]
+
+    # config 是在呼叫當下讀的：def 時 snapshot 的話，這裡仍會送 64 / ["\n"]。
+    monkeypatch.setattr(config, "KB_EXPANSION_MAX_TOKENS", 17)
+    monkeypatch.setattr(config, "KB_EXPANSION_STOP", ("\n", "。"))
+    knowledge._gated_completion(
+        source="kb_multi_query", prompt="short question", temperature=0.3, timeout=20
+    )
+    assert sent[-1]["n_predict"] == reserved[-1] == 17
+    assert sent[-1]["stop"] == ["\n", "。"]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("limit_signal", [{"stop_type": "limit"}, {"stopped_limit": True}])
+def test_gated_completion_discards_output_that_hit_the_limit(monkeypatch, limit_signal):
+    """撞上 n_predict 上限＝沒寫完：回空字串，半截的關鍵字不得變成查詢變體。
+
+    舊版 llama-server 沒有 stop_type，改報 stopped_limit；兩種都必須當成撞上限。
+    正常收尾（stop_type=word／沒有這個欄位）照舊回模型輸出。
+    """
+    import knowledge
+    import llama_client
+
+    reply = {"content": "uart, baud rate, 暫存器, 115"}
+    monkeypatch.setattr(config, "require_main_model", lambda: "test-model")
+
+    def ask(response):
+        monkeypatch.setattr(llama_client, "native_completion", lambda **_kwargs: response)
+        return knowledge._gated_completion(
+            source="kb_multi_query", prompt="short question", temperature=0.3, timeout=20
+        )
+
+    assert ask({**reply, **limit_signal}) == ""
+    assert ask({**reply, "stop_type": "word"}) == reply["content"]
+    assert ask(dict(reply)) == reply["content"]
+
+
+@pytest.mark.smoke
+def test_multi_query_sends_at_most_the_configured_expansion_calls(monkeypatch):
+    """每次查詢實送的擴寫生成 ≤ config.KB_EXPANSION_MAX_CALLS；被跳過、沒送出的 translate 不計。
+
+    每一次擴寫生成都會把單 slot 主模型的對話擠出 slot；次數沒有上限是無聲的延遲。
+    """
+    import knowledge
+
+    prompts = []
+
+    def fake_completion(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return "uart, baud"
+
+    monkeypatch.setattr(knowledge, "_gated_completion", fake_completion)
+    monkeypatch.setattr(config, "require_main_model", lambda: "test-model")
+    monkeypatch.setattr(knowledge, "MULTI_QUERY_ENABLED", True)
+    monkeypatch.setattr(knowledge, "QUERY_BILINGUAL_ENABLED", True)
+    monkeypatch.setattr(knowledge, "MULTI_QUERY_TYPES", ["key_terms", "translate", "code_hint"])
+    monkeypatch.setattr(knowledge, "MULTI_QUERY_COUNT", 3)
+    monkeypatch.setattr(config, "KB_EXPANSION_MAX_CALLS", 2)
+    kb = knowledge.KnowledgeBase.__new__(knowledge.KnowledgeBase)
+
+    # 三種都會送：上限截在第二次，code_hint 不得送出。
+    kb._generate_multi_queries("UART 鮑率暫存器要怎麼設定")
+    assert len(prompts) == 2
+    assert prompts[0].endswith("術語:") and prompts[1].endswith("English:")
+
+    # 沒有中文也沒有英文詞的問題，translate 被跳過、沒有送出 → 不佔名額，code_hint 照送。
+    prompts.clear()
+    kb._generate_multi_queries("0x40 12")
+    assert len(prompts) == 2
+    assert prompts[0].endswith("術語:") and prompts[1].endswith("程式碼元素:")
+
+
+@pytest.mark.smoke
+def test_overflow_hint_names_the_constant_that_sets_this_reserve(monkeypatch, capsys):
+    """溢位訊息叫人調小的常數，必須是真正決定這一次保留額的那一個。
+
+    strict 與 KB 擴寫都明送自己的保留額；只看「有沒有明送」的話，兩者都會被指去改
+    客戶端的 config.CLIENT_MAX_OUTPUT_TOKENS——照做之後一模一樣溢位，沒有任何錯誤告訴
+    使用者為什麼。這個名稱只進訊息，JSONL 欄位不變。
+    """
+    import knowledge
+    import llama_client
+
+    def explode(**_kwargs):
+        raise AssertionError("gate 應該在送出前就擋下來")
+
+    monkeypatch.setattr(llama_client, "native_completion", explode)
+    monkeypatch.setattr(config, "require_main_model", lambda: "test-model")
+    monkeypatch.setattr(utils, "CLAIM_TO_EVIDENCE_ENABLED", False)
+    monkeypatch.setattr(config, "N_CTX", 32)
+    # 溢位時順手打 /props 的輔助診斷（每個行程一次）與這裡無關，連不上還要等重試。
+    monkeypatch.setattr(context_budget, "_OFFLOAD_CHECK_FIRED", True)
+
+    strict_answer = utils.answer_with_self_check("question", "", "[REF 1] evidence")
+    assert "[CTX_OVERFLOW]" in strict_answer
+    assert f"{context_budget.INTERNAL_RESERVE_ENV} 調小" in strict_answer
+    assert context_budget.CLIENT_RESERVE_ENV not in strict_answer
+
+    capsys.readouterr()
+    assert knowledge._gated_completion(
+        source="kb_query_expansion", prompt="short question", temperature=0, timeout=5
+    ) == ""
+    expansion_hint = capsys.readouterr().err
+    assert "[CTX_OVERFLOW]" in expansion_hint
+    assert "config.KB_EXPANSION_MAX_TOKENS 調小" in expansion_hint
+    assert context_budget.CLIENT_RESERVE_ENV not in expansion_hint
+
+    # 客戶端 request（明送、沒有名稱）仍指客戶端的常數；名稱不進 JSONL。
+    client = context_budget.build_usage(
+        source="chat", requested_num_ctx=32, prompt="x", reserved_output_tokens=500,
+    )
+    assert f"{context_budget.CLIENT_RESERVE_ENV} 調小" in context_budget.overflow_message(client)
+    named = context_budget.build_usage(
+        source="generate_stream", requested_num_ctx=32, prompt="x",
+        reserved_output_tokens=500, reserve_name=context_budget.INTERNAL_RESERVE_ENV,
+    )
+    assert set(named.to_log_dict()) == set(client.to_log_dict())
+    assert "reserve_name" not in named.to_log_dict()
+
+
 # ── 原 test_trim.py:trim.py 的 markers、per-tool strategies、priority orchestration ──
 
 # ============================================================

@@ -442,6 +442,11 @@ class _FakeEngine:
     def openai_tools(self):
         return []
 
+    def summary_payload(self, view, instruction):
+        # 與真 engine 同形狀:對話 system + 要摘要的 view + 尾端一則 user 指示。
+        return ([{"role": "system", "content": "SYSTEM"}] + [dict(m) for m in view]
+                + [{"role": "user", "content": instruction}])
+
     def count_input_tokens(self, messages, **_kwargs):
         # Offline token-service double; production must use the server tokenizer.
         return cc.context_budget.estimate_tokens(messages=list(messages))[0]
@@ -501,8 +506,12 @@ def test_the_rules_are_appended_not_replacing_the_instructions(tmp_path, monkeyp
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     engine = _FakeEngine(_conversation(4), summary=_seven_field_summary())
     _compactor(engine).compact(manual=True)
-    system = engine.requests[0][0]["content"]
-    assert system.index("結構化摘要") < system.index(compaction_formula.RULES_BLOCK_MARKER)
+    # 指示(任務說明 + 規則)是摘要請求最後那一則 user;system 仍是對話原本那一份。
+    assert engine.requests[0][0] == {"role": "system", "content": "SYSTEM"}
+    instruction = engine.requests[0][-1]
+    assert instruction["role"] == "user"
+    content = instruction["content"]
+    assert content.index("結構化摘要") < content.index(compaction_formula.RULES_BLOCK_MARKER)
 
 
 def test_a_drifted_summary_stops_this_session(tmp_path, monkeypatch):
@@ -584,6 +593,11 @@ def test_a_context_too_small_for_the_formula_is_reported_not_silently_skipped(tm
 
 
 def test_the_summary_request_never_carries_tool_arguments(tmp_path, monkeypatch):
+    """新增的指示(含狀態校正節錄)不帶工具參數與輸出;前段只是 engine 的對話投影。
+
+    2026-10-19(速度優化 #11):摘要請求改為沿用對話已送過的 prefix,那段本來就含對話裡
+    的工具呼叫與結果,所以判準從「整個請求沒有參數」改成「沒有在對話投影之外再抄一份」。
+    """
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     messages = _conversation(3) + [
         {"role": "user", "content": "q"},
@@ -602,9 +616,15 @@ def test_the_summary_request_never_carries_tool_arguments(tmp_path, monkeypatch)
     ]
     engine = _FakeEngine(messages, summary=_seven_field_summary())
     _compactor(engine).compact(manual=True)
-    sent = json.dumps(engine.requests[0], ensure_ascii=False)
-    assert "/secret/nda.pdf" not in sent
-    assert "BODY" in sent          # 工具**結果**是「已確定事實」的來源,要進摘要
+    head, _tail = cc.split_for_compaction(messages, preserve_recent_tokens=0)
+    request = engine.requests[0]
+    # 這個替身沒有 prune_for_summary:對話投影就是原始 head,一則不多、一則不少。
+    assert request[1:-1] == head
+    instruction = request[-1]["content"]
+    assert "/secret/nda.pdf" not in instruction
+    assert "BODY" not in instruction
+    # 工具**結果**是「已確定事實」的來源,仍經對話投影進得了摘要。
+    assert "BODY" in json.dumps(request[1:-1], ensure_ascii=False)
 
 
 # ============================================================
@@ -709,7 +729,9 @@ def test_the_summary_request_uses_the_pruned_history(tmp_path, monkeypatch):
     _compactor(engine).compact(manual=True)
     sent = json.dumps(engine.requests[-1], ensure_ascii=False)
     assert "SECRET-OLD-OUTPUT" not in sent
-    assert "[cleared]" in sent
+    # 實送的 wire 訊息裡,那筆工具結果只剩 prune_for_summary 給的佔位。
+    view = engine.requests[-1][1:-1]
+    assert [m["content"] for m in view if m.get("role") == "tool"] == ["[cleared]"]
 
 
 # ============================================================

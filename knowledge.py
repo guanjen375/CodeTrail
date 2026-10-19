@@ -478,6 +478,179 @@ class Bm25Index:
     idf: dict = field(default_factory=dict)
 
 
+def _bm25_index_from_postings(index: dict, doc_lens: list) -> Bm25Index:
+    """由 inverted index 與 doc_lens 算出 idf / avg_doc_len。
+
+    記憶體建索引與 BM25 快取解碼共用這一條公式：兩邊各寫一份，改了一邊另一邊不跟，
+    快取命中與未命中的分數就會無聲地分岔。
+
+    BM25 IDF（加上 +1 避免負值）：log((N - df + 0.5) / (df + 0.5) + 1)，df = 含該詞的文件數，
+    也就是該詞 postings 的長度（每份文件在 postings 裡只出現一次）。
+    """
+    n_docs = len(doc_lens)
+    idf = {}
+    for term, postings in index.items():
+        df = len(postings)
+        idf[term] = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
+    return Bm25Index(
+        index=index,
+        doc_lens=doc_lens,
+        avg_doc_len=sum(doc_lens) / len(doc_lens) if doc_lens else 1.0,
+        idf=idf,
+    )
+
+
+# ============================================================
+# BM25 索引快取（載入加速）：檔案與安全 IO 歸 kb_cache，內容與身分歸這裡。
+# ============================================================
+# 身分＝這個 schema ＋ 分詞規則版本 ＋ jieba 版本與它實際讀的辭典 ＋ 三套語料的文件字串
+# 雜湊。任一不符就忽略快取、在記憶體重建；身分不需要 store generation（語料雜湊本身
+# 就證明「這份索引出自這批文字」）。
+BM25_CACHE_SCHEMA = "codetrail-bm25-v1"
+# 改 `_tokenize_for_bm25`（regex、stopwords、長度過濾）或 `_jieba_tokens` 必須 +1：
+# 快取身分只涵蓋語料文字與 jieba，分詞規則變了而這個數字沒變，舊快取會被當成新的用，
+# 文件側的 token 與查詢側的 token 從此對不上——查詢照樣回答，只是 lexical 分數錯了。
+BM25_TOKENIZER_VERSION = 1
+
+
+def _bm25_corpus_digest(documents) -> dict:
+    """一套語料的身分：文件數 ＋ 逐份長度前綴串接的 sha256（相鄰文件的邊界不會碰撞）。"""
+    digest = hashlib.sha256()
+    count = 0
+    for text in documents:
+        encoded = text.encode("utf-8", "surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        count += 1
+    return {"docs": count, "sha256": digest.hexdigest()}
+
+
+def _jieba_identity(tokenizer) -> dict | None:
+    """jieba 版本 ＋ 預設分詞器實際讀的辭典檔 sha256。
+
+    任何一項拿不到（替身、損壞的安裝）就回 None：證明不了分詞器是哪一個，就不讀也不寫
+    快取，改在記憶體建——jieba 真的壞了，建索引那一步會照常 fail-loud。
+    """
+    try:
+        version = tokenizer.__version__
+        handle = tokenizer.dt.get_dict_file()
+    except Exception:  # noqa: BLE001 - 身分不明 = 不用快取
+        return None
+    digest = hashlib.sha256()
+    try:
+        with handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(version, str) or not version:
+        return None
+    return {"version": version, "dictionary_sha256": digest.hexdigest()}
+
+
+def _bm25_bytes_field(text: str):
+    """字串存成 uint8 陣列（UTF-8）：np.load(allow_pickle=False) 讀得回來，也不用 UTF-32 撐大。"""
+    return np.frombuffer(text.encode("utf-8", "surrogatepass"), dtype=np.uint8)
+
+
+def _bm25_text_field(value) -> str:
+    array = np.asarray(value)
+    if array.dtype != np.uint8 or array.ndim != 1:
+        raise ValueError("BM25 cache text field must be a 1-D uint8 array")
+    return array.tobytes().decode("utf-8", "surrogatepass")
+
+
+def _bm25_encode(prefix: str, bm25: Bm25Index) -> dict:
+    """一套索引 → 詞表（首次出現順序）＋ CSR（term offsets／doc id／tf）＋ doc_lens。"""
+    terms = list(bm25.index)
+    offsets = [0]
+    doc_ids: list = []
+    tfs: list = []
+    for term in terms:
+        postings = bm25.index[term]
+        doc_ids.extend(postings.keys())     # 文件遞增（建索引時依序走文件）
+        tfs.extend(postings.values())
+        offsets.append(len(doc_ids))
+    return {
+        f"{prefix}_terms": _bm25_bytes_field(json.dumps(terms, ensure_ascii=False)),
+        f"{prefix}_offsets": np.asarray(offsets, dtype=np.int64),
+        f"{prefix}_doc_ids": np.asarray(doc_ids, dtype=np.int32),
+        f"{prefix}_tfs": np.asarray(tfs, dtype=np.int32),
+        f"{prefix}_doc_lens": np.asarray(bm25.doc_lens, dtype=np.int32),
+    }
+
+
+def _bm25_decode(payload, prefix: str, n_docs: int) -> Bm25Index:
+    """CSR → 與 `_build_bm25_text_index` 同構的索引；任何不一致都 raise（呼叫端改在記憶體建）。
+
+    重建順序與記憶體建法相同：term 依詞表（首次出現）順序插入、每個 term 的文件遞增；
+    內層同樣是 defaultdict(int)。idf／avg_doc_len 由 `_bm25_index_from_postings` 重算。
+    """
+    terms = json.loads(_bm25_text_field(payload[f"{prefix}_terms"]))
+    offsets = np.asarray(payload[f"{prefix}_offsets"])
+    doc_ids = np.asarray(payload[f"{prefix}_doc_ids"])
+    tfs = np.asarray(payload[f"{prefix}_tfs"])
+    doc_lens = np.asarray(payload[f"{prefix}_doc_lens"])
+    if (not isinstance(terms, list) or not all(isinstance(t, str) for t in terms)
+            or len(set(terms)) != len(terms)):
+        raise ValueError("BM25 cache vocabulary is malformed")
+    for array in (offsets, doc_ids, tfs, doc_lens):
+        if array.ndim != 1 or array.dtype.kind not in "iu":
+            raise ValueError("BM25 cache arrays must be 1-D integers")
+    nnz = doc_ids.shape[0]
+    if (doc_lens.shape[0] != n_docs or tfs.shape[0] != nnz
+            or offsets.shape[0] != len(terms) + 1 or int(offsets[0]) != 0
+            or int(offsets[-1]) != nnz or np.any(np.diff(offsets) < 1)):
+        raise ValueError("BM25 cache CSR shape does not match its vocabulary/corpus")
+    if nnz and (int(doc_ids.min()) < 0 or int(doc_ids.max()) >= n_docs
+                or int(tfs.min()) < 1):
+        raise ValueError("BM25 cache postings are out of range")
+    if np.any(doc_lens < 0):
+        raise ValueError("BM25 cache doc lengths are negative")
+    starts = np.zeros(nnz, dtype=bool)
+    starts[offsets[:-1]] = True
+    if nnz > 1 and not np.all((np.diff(doc_ids) > 0) | starts[1:]):
+        raise ValueError("BM25 cache postings are not strictly increasing per term")
+    # 每個 token 只計入一個 posting：每份文件的 tf 總和必須等於它的 token 數。
+    # （整數和遠小於 2**53，float64 的 bincount 是精確的。）
+    per_doc = np.bincount(doc_ids.astype(np.intp), weights=tfs.astype(np.float64),
+                          minlength=n_docs)
+    if not np.array_equal(per_doc, doc_lens.astype(np.float64)):
+        raise ValueError("BM25 cache term frequencies do not add up to the doc lengths")
+
+    from collections import defaultdict
+
+    doc_list = doc_ids.tolist()
+    tf_list = tfs.tolist()
+    bounds = offsets.tolist()
+    index = {}
+    for position, term in enumerate(terms):
+        start, end = bounds[position], bounds[position + 1]
+        index[term] = defaultdict(int, zip(doc_list[start:end], tf_list[start:end]))
+    return _bm25_index_from_postings(index, doc_lens.tolist())
+
+
+def _bm25_from_cache(payload, identity: dict):
+    """快取 → (retrieval, gate, section)；身分不完全相符或格式壞掉 → None（在記憶體重建）。
+
+    gate 為 "alias" 時回傳的就是 retrieval 那個物件（與記憶體建法的別名關係相同）。
+    """
+    if payload is None:
+        return None
+    try:
+        if json.loads(_bm25_text_field(payload["identity"])) != identity:
+            return None
+        corpora = identity["corpora"]
+        retrieval = _bm25_decode(payload, "retrieval", corpora["retrieval"]["docs"])
+        gate = (retrieval if corpora["gate"] == "alias"
+                else _bm25_decode(payload, "gate", corpora["gate"]["docs"]))
+        section = (None if corpora["section"] is None
+                   else _bm25_decode(payload, "section", corpora["section"]["docs"]))
+    except Exception:  # noqa: BLE001 - 格式不符 = 不用快取
+        return None
+    return retrieval, gate, section
+
+
 def _gated_completion(*, source: str, prompt: str, temperature: float,
                       timeout: int) -> str:
     """knowledge.py 內所有主模型 `/completion` 的唯一出口:先過 context gate。
@@ -487,7 +660,14 @@ def _gated_completion(*, source: str, prompt: str, temperature: float,
     Overflow 保留安全拒絕契約：不送 HTTP，回空字串而不新增 query。
     Gate 觸發的細節(估算 token、utilization、[CTX_OVERFLOW])已經進 telemetry
     與 stderr,不需要再把錯誤字串當成模型輸出往下傳。
+
+    生成一律有界：取 config 的擴寫界線（呼叫當下讀，不在 def 時 snapshot）。實送的
+    n_predict 同時是 gate 的保留額，兩者是同一個數字；溢位訊息因此指名
+    `config.KB_EXPANSION_MAX_TOKENS`。server 回報撞上上限（stop_type == "limit"）代表
+    輸出沒寫完，回空字串——與擴寫端「結果過長就丟棄」同義，半截的關鍵字不得變成查詢變體。
     """
+    n_predict = config.KB_EXPANSION_MAX_TOKENS
+    stop = config.KB_EXPANSION_STOP
     model = config.require_main_model()
     try:
         usage = context_budget.check_and_log(
@@ -495,6 +675,8 @@ def _gated_completion(*, source: str, prompt: str, temperature: float,
             requested_num_ctx=config.N_CTX,
             prompt=prompt,
             model=model,
+            reserved_output_tokens=n_predict,
+            reserve_name="config.KB_EXPANSION_MAX_TOKENS",
         )
     except context_budget.ContextOverflowError:
         return ""
@@ -506,6 +688,8 @@ def _gated_completion(*, source: str, prompt: str, temperature: float,
             temperature=temperature,
             stream=False,
             timeout=timeout,
+            n_predict=n_predict,
+            stop=list(stop),
         )
     except Exception as exc:
         usage.error_type = type(exc).__name__
@@ -515,6 +699,9 @@ def _gated_completion(*, source: str, prompt: str, temperature: float,
     context_budget.parse_usage_from_response(data, usage)
     context_budget.emit_post_call_line(usage)
     context_budget.log_metrics(usage)
+    # 舊版 llama-server 沒有 stop_type，撞上限時改報 stopped_limit。
+    if data.get("stop_type") == "limit" or data.get("stopped_limit") is True:
+        return ""
     return (data.get("content") or data.get("response") or "").strip()
 
 
@@ -530,7 +717,7 @@ class KnowledgeBase:
     """
 
     def __init__(self, json_path: str = KNOWLEDGE_FILE, *, allow_rebuild: bool = True,
-                 on_loaded=None):
+                 on_loaded=None, publish_bm25_cache: bool = False):
         self.chunks = []
         self.documents = []
         self.loaded = False
@@ -554,6 +741,11 @@ class KnowledgeBase:
         # Numpy 加速用的預計算陣列
         self._embeddings = None  # shape: (n_chunks, dim)
         self._embeddings_normalized = False
+        # True ＝ `_embeddings` 是 `_attach_matrices` 接上的已驗證矩陣：第 i 列就是第 i 個
+        # chunk 的向量，chunk 本身不再帶 inline 向量（`_chunk_vector` 用到才取那一列）。
+        # legacy inline 路徑（`_precompute_embeddings`）的矩陣只收有向量的 chunk，列與
+        # chunk_idx 不一定對齊，所以那條路徑一律是 False。
+        self._vectors_from_matrix = False
         # 決策訊號：content-only 的向量矩陣。沒有任何 ctx 的 KB 直接別名到
         # retrieval 矩陣（兩者組字本來就相同），不多佔一份記憶體。
         self._gate_embeddings = None
@@ -574,6 +766,9 @@ class KnowledgeBase:
         # `allow_rebuild=False` 給離線體檢工具用：它要報告「這份 KB 現在的磁碟
         # 狀態能不能直接載入」，重算會把答案改掉。
         self._allow_rebuild = allow_rebuild
+        # BM25 快取只有呼叫端明確授權才發布（MCP 非 readonly）；其餘呼叫端只在記憶體建索引，
+        # readonly session 因此不會因為載入 KB 而在專案內多出檔案。
+        self._publish_bm25_cache = bool(publish_bm25_cache)
         self._emb_path = kb_cache.cache_file(json_path)
 
         # staleness 偵測：記下載入當下的檔案簽章，之後用 source_changed() 比對。
@@ -622,6 +817,9 @@ class KnowledgeBase:
                 data = json.loads(raw)
 
             self.chunks = data.get("chunks", [])
+            # 新讀進來的 chunk 還沒有接上任何矩陣；在 `_attach_matrices` 之前，向量讀點
+            # 看到的只能是 JSON 自己的 inline 向量。
+            self._vectors_from_matrix = False
             self._index_chunks()
             self._backfill_figure_verification()
             metadata = data.get("metadata", {})
@@ -655,7 +853,7 @@ class KnowledgeBase:
             if self.chunks:
                 sample_dims = set()
                 for chunk in self.chunks[:5]:
-                    emb = chunk.get("embedding", [])
+                    emb = self._chunk_vector(chunk)
                     if emb:
                         sample_dims.add(len(emb))
 
@@ -680,7 +878,7 @@ class KnowledgeBase:
                 # retrieval 矩陣直接別名成 gate，於是 KB_CONTEXT_USE=0、拒答
                 # 門檻、信心判斷全都吃到含生成脈絡的向量——正是雙訊號要擋的
                 # 循環 grounding。gate 向量只能來自驗過的第二組矩陣。
-                if any(chunk.get("embedding") for chunk in self.chunks):
+                if any(self._chunk_vector(chunk) for chunk in self.chunks):
                     if self._needs_gate:
                         raise KnowledgeStoreError(
                             "this knowledge base carries untrusted chunk context but its "
@@ -699,9 +897,9 @@ class KnowledgeBase:
                     # 依 knowledge.json 重算。重算不了 ＝ fail-loud，絕不沿用。
                     self._rebuild_embeddings_cache()
 
-            # P0 改進：預計算 BM25 索引
+            # P0 改進：預計算 BM25 索引（快取身分相符就直接解碼，見 `_load_bm25_indexes`）
             if BM25_ENABLED:
-                self._precompute_bm25_index()
+                self._load_bm25_indexes()
 
             # 速度優化：記錄載入的 metadata 供快取驗證
             self._cache_metadata = {
@@ -803,8 +1001,9 @@ class KnowledgeBase:
         matrices = kb_cache.rebuild(
             self.path, self.chunks, getattr(self, "_loaded_metadata", {}), reason=stale)
         self._attach_matrices(matrices)
-        # 重算時 RAG.generate_embeddings 會把 gate 向量掛在 chunk 上；查詢端不留
-        # 那份（n×dim 的 Python float list），決策點一律用 chunk_idx 讀矩陣列。
+        # 重算時 RAG.generate_embeddings 會把（未正規化的）retrieval 與 gate 向量掛在
+        # chunk 上；retrieval 那份由 `_attach_matrices` 移除，gate 這份在這裡移除——查詢端
+        # 不留 n×dim 的 Python float list，決策點一律用 chunk_idx 讀矩陣列。
         for chunk in self.chunks:
             chunk.pop("embedding_gate", None)
 
@@ -823,19 +1022,37 @@ class KnowledgeBase:
             f"ready ({len(self._section_nodes)} nodes)"
             if self._section_embeddings is not None else "off (no section store)"
         )
-        self._section_bm25 = (
-            self._build_bm25_text_index(
-                node.text for node in self._section_nodes
-            ) if BM25_ENABLED and self._section_nodes else None
-        )
+        # 章節 BM25 與 chunk 的兩套一起由 `_precompute_bm25_index`／`_load_bm25_indexes`
+        # 建（三套共用一份 BM25 快取）；接矩陣這一步不再自己斷詞。
+        self._section_bm25 = None
 
-        # P0：把 retrieval 向量掛回每個 chunk。
-        # RAG 存 knowledge.json 時為了體積「不再 inline embedding」（只留 cache），
-        # 若這裡只設 self._embeddings 而不回填 chunk["embedding"]，下游的 MMR /
-        # 污染控制（都讀 chunk.get("embedding")）會一律拿到空向量、把相似度算成 0。
-        # gate 向量刻意**不**掛回 chunk。
-        for i, chunk in enumerate(self.chunks):
-            chunk["embedding"] = embeddings[i].tolist()
+        # 向量讀點一律經 `_chunk_vector`，用到才取這個矩陣的列（P0-5：下游的 MMR /
+        # 污染控制拿不到向量會把相似度算成 0）。chunk 上的 inline 向量在這裡**移除**：
+        # 重算路徑（kb_cache.rebuild → RAG.generate_embeddings）會在原 chunk 留下未正規化
+        # 的向量，留著就可能繞過已驗證矩陣被讀到；載入時整份 tolist 也是 n×dim 的
+        # Python float。gate 向量同樣不掛回 chunk。
+        for chunk in self.chunks:
+            chunk.pop("embedding", None)
+        self._vectors_from_matrix = True
+
+    def _chunk_vector(self, chunk: dict) -> list:
+        """chunk 的 retrieval 向量（用到才取）；knowledge.py 每個向量讀點都經過這裡。
+
+        1. 合併 chunk（帶 `member_chunk_idx`）→ 它自己在合併時算出的 `embedding`
+           （成員平均，沿用既有的 Python float 路徑）。
+        2. 已接上驗證過的矩陣且 `chunk_idx` 合法 → 該列 `.tolist()`（與以前載入時
+           掛回 chunk 的值逐位元相同）。
+        3. 其餘（legacy inline：`_precompute_embeddings` 路徑、離線替身）→ chunk 自己的
+           inline 向量。
+        """
+        if "member_chunk_idx" in chunk:
+            return chunk.get("embedding", [])
+        if getattr(self, "_vectors_from_matrix", False):
+            matrix = self._embeddings
+            index = chunk.get("chunk_idx")
+            if matrix is not None and isinstance(index, int) and 0 <= index < matrix.shape[0]:
+                return matrix[index].tolist()
+        return chunk.get("embedding", [])
 
     def _decision_order(self, candidates: list) -> list:
         """決策用的候選排序。
@@ -875,7 +1092,7 @@ class KnowledgeBase:
             index = chunk.get("chunk_idx")
             if matrix is not None and isinstance(index, int) and 0 <= index < matrix.shape[0]:
                 return matrix[index].tolist()
-        return chunk.get("embedding", [])
+        return self._chunk_vector(chunk)
 
     def _gate_matrix(self):
         """決策用的 content-only 矩陣；沒有就退回 retrieval（代表 KB 無 ctx）。"""
@@ -923,7 +1140,7 @@ class KnowledgeBase:
             scores = self._matrix_scores_for(indices, q_emb, matrix)
             return max(scores.values()) if scores else 0.0
         # 未建立矩陣的 legacy inline 向量就是 content-only 的訊號本身。
-        embedding = chunk.get("embedding", [])
+        embedding = self._chunk_vector(chunk)
         if embedding and q_emb:
             return self._cosine_similarity(q_emb, embedding)
         return 0.0
@@ -975,6 +1192,9 @@ class KnowledgeBase:
                 "that carries untrusted chunk context; rebuild it so the NPZ has both "
                 "matrices"
             )
+        # 這條路徑的矩陣只收有 inline 向量的 chunk（列對應 `_embedding_indices`，不一定
+        # 等於 chunk_idx），向量來源因此就是 chunk 自己的 inline 向量。
+        self._vectors_from_matrix = False
         self._section_embeddings = None
         self._section_nodes = ()
         self._section_bm25 = None
@@ -988,7 +1208,7 @@ class KnowledgeBase:
         valid_indices = []
 
         for i, chunk in enumerate(self.chunks):
-            emb = chunk.get("embedding", [])
+            emb = self._chunk_vector(chunk)
             if emb and isinstance(emb, list) and len(emb) > 0:
                 embeddings_list.append(emb)
                 valid_indices.append(i)
@@ -1032,62 +1252,126 @@ class KnowledgeBase:
     def _bm25_idf(self):
         return self._bm25.idf if self._bm25 else None
 
-    def _build_bm25_index(self, *, use_ctx: bool) -> Bm25Index:
-        """Build a chunk-only corpus; section rows must not affect its IDF."""
-        return self._build_bm25_text_index(
-            context_signals.bm25_document_text(chunk, use_ctx=use_ctx)
-            for chunk in self.chunks
-        )
+    def _bm25_corpora(self) -> dict:
+        """三套 BM25 語料的文件字串；建索引與快取身分用的是同一份。
+
+        - retrieval：chunk 文本（含 ctx）。chunk-only，章節列不得影響它的 IDF。
+        - gate：content-only 文本；沒有生成 ctx 或 MinerU heading/caption 時為 None
+          （＝別名 retrieval，與以前「兩套文本相同就直接別名」同一條判準）。
+        - section：章節全文，獨立語料；BM25 關閉或沒有章節節點時為 None。
+        """
+        retrieval = [context_signals.bm25_document_text(chunk, use_ctx=True)
+                     for chunk in self.chunks]
+        gate = ([context_signals.bm25_document_text(chunk, use_ctx=False)
+                 for chunk in self.chunks]
+                if context_signals.needs_gate_matrix(self.chunks) else None)
+        section = ([node.text for node in self._section_nodes]
+                   if BM25_ENABLED and self._section_nodes else None)
+        return {"retrieval": retrieval, "gate": gate, "section": section}
 
     def _build_bm25_text_index(self, documents) -> Bm25Index:
         """建一套 BM25 索引。
 
         BM25 公式：
         score = sum( IDF(t) * (tf * (k1+1)) / (tf + k1 * (1 - b + b * dl/avgdl)) )
+
+        inverted index 的順序是快取解碼要重現的形狀：term 依首次出現、每個 term 的
+        文件遞增，內層是 defaultdict(int)。idf／avg_doc_len 見 `_bm25_index_from_postings`。
         """
-        import math
         from collections import defaultdict
 
         inverted_index = defaultdict(lambda: defaultdict(int))
         doc_lens = []
-        doc_freqs = defaultdict(int)
 
         for idx, full_text in enumerate(documents):
             tokens = self._tokenize_for_bm25(full_text)
             doc_lens.append(len(tokens))
-
-            term_set = set()
             for token in tokens:
                 inverted_index[token][idx] += 1
-                term_set.add(token)
-            for term in term_set:
-                doc_freqs[term] += 1
 
-        n_docs = len(doc_lens)
-        idf = {}
-        for term, df in doc_freqs.items():
-            # BM25 IDF 公式（加上 +1 避免負值）
-            idf[term] = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
+        return _bm25_index_from_postings(dict(inverted_index), doc_lens)
 
-        return Bm25Index(
-            index=dict(inverted_index),
-            doc_lens=doc_lens,
-            avg_doc_len=sum(doc_lens) / len(doc_lens) if doc_lens else 1.0,
-            idf=idf,
-        )
+    def _build_bm25_indexes(self, corpora: dict) -> None:
+        """在記憶體建三套索引（gate 為別名時與 retrieval 是同一個物件）。"""
+        self._bm25 = self._build_bm25_text_index(corpora["retrieval"])
+        self._bm25_gate = (self._build_bm25_text_index(corpora["gate"])
+                           if corpora["gate"] is not None else self._bm25)
+        self._section_bm25 = (self._build_bm25_text_index(corpora["section"])
+                              if corpora["section"] is not None else None)
 
     def _precompute_bm25_index(self):
-        """預計算 BM25 索引：retrieval 一套，gate（content-only）一套。
+        """預計算 BM25 索引（記憶體）：retrieval、gate（content-only）與章節各一套。
 
-        沒有生成 ctx 或 MinerU heading/caption 時兩套文本相同，可直接別名。
+        沒有生成 ctx 或 MinerU heading/caption 時 gate 與 retrieval 文本相同，可直接別名。
+        章節 BM25 用章節全文與自己的語料統計，只在 BM25 啟用且有章節節點時建。
         """
         if not self.chunks:
             return
-        self._bm25 = self._build_bm25_index(use_ctx=True)
-        self._bm25_gate = (
-            self._build_bm25_index(use_ctx=False)
-            if context_signals.needs_gate_matrix(self.chunks) else self._bm25
-        )
+        self._build_bm25_indexes(self._bm25_corpora())
+
+    def _bm25_identity(self, tokenizer, corpora: dict) -> dict | None:
+        """BM25 快取身分；分詞器身分不明時回 None（不讀也不寫快取）。"""
+        jieba_identity = _jieba_identity(tokenizer)
+        if jieba_identity is None:
+            return None
+        return {
+            "schema": BM25_CACHE_SCHEMA,
+            "tokenizer_version": BM25_TOKENIZER_VERSION,
+            "jieba": jieba_identity,
+            "corpora": {
+                "retrieval": _bm25_corpus_digest(corpora["retrieval"]),
+                "gate": ("alias" if corpora["gate"] is None
+                         else _bm25_corpus_digest(corpora["gate"])),
+                "section": (None if corpora["section"] is None
+                            else _bm25_corpus_digest(corpora["section"])),
+            },
+        }
+
+    def _load_bm25_indexes(self) -> None:
+        """載入時的 BM25：快取身分完全相符就解碼，否則在記憶體建。
+
+        - 快取命中也先驗 jieba：查詢端的斷詞同樣需要它，命中不是跳過依賴檢查的理由。
+        - 身分或格式不符一律忽略、在記憶體重建；路徑安全違規由 kb_cache fail-loud。
+        - 只有呼叫端明確授權（`publish_bm25_cache`，MCP 非 readonly）**且**允許重建時
+          才發布；其餘呼叫端（eval、離線體檢、測試）只在記憶體建，不在專案內新增檔案。
+        """
+        if not self.chunks:
+            return
+        tokenizer = _require_jieba()
+        corpora = self._bm25_corpora()
+        payload = kb_cache.read_bm25(self.path)   # 路徑安全違規在這裡 raise
+        publish = self._publish_bm25_cache and self._allow_rebuild
+        # 沒有快取可驗、也不打算發布時，不必為身分雜湊整份語料與辭典。
+        identity = (self._bm25_identity(tokenizer, corpora)
+                    if payload is not None or publish else None)
+        if payload is not None and identity is not None:
+            cached = _bm25_from_cache(payload, identity)
+            if cached is not None:
+                self._bm25, self._bm25_gate, self._section_bm25 = cached
+                return
+        self._build_bm25_indexes(corpora)
+        if publish and identity is not None:
+            self._publish_bm25(identity)
+
+    def _publish_bm25(self, identity: dict) -> None:
+        """把剛建好的三套索引交給 kb_cache 原子發布（世代檢查在那裡）。
+
+        編碼或寫入失敗只印一行原因：記憶體裡的索引已經建好，代價只是下次載入再建一次。
+        路徑安全違規（KnowledgeStoreError）照樣往外拋。
+        """
+        try:
+            fields = {"identity": _bm25_bytes_field(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")))}
+            fields.update(_bm25_encode("retrieval", self._bm25))
+            if identity["corpora"]["gate"] != "alias":
+                fields.update(_bm25_encode("gate", self._bm25_gate))
+            if identity["corpora"]["section"] is not None:
+                fields.update(_bm25_encode("section", self._section_bm25))
+        except Exception as exc:  # noqa: BLE001 - 寫不出快取不影響這次的索引
+            print(f"[WARN] BM25 索引快取未寫入（{type(exc).__name__}: {exc}）；"
+                  "這次的索引已在記憶體建好")
+            return
+        kb_cache.publish_bm25(self.path, fields, getattr(self, "_loaded_metadata", {}))
 
     def _content_for_bm25(self, chunk: dict) -> str:
         """去掉合成前綴（overlap + heading）的本文；定義在 context_signals。"""
@@ -1100,6 +1384,9 @@ class KnowledgeBase:
         - 支援中英文混合
         - 保留程式碼 token（函式名、變數名）
         - 移除 stopwords
+
+        改這裡的規則（regex、stopwords、長度過濾）必須把 `BM25_TOKENIZER_VERSION` +1，
+        否則磁碟上的 BM25 快取會繼續被當成用新規則建的。
         """
         # 先轉小寫
         text = text.lower()
@@ -1428,8 +1715,13 @@ class KnowledgeBase:
 
         model = config.require_main_model()
 
-        # 根據啟用的類型生成變體
+        # 根據啟用的類型生成變體。主模型只有一個 slot，每一次擴寫生成都會把對話擠出
+        # slot：以「實際送出的生成次數」計，到 config.KB_EXPANSION_MAX_CALLS 就停
+        # （被跳過、沒送出的 translate 不算）。
+        sent = 0
         for query_type in MULTI_QUERY_TYPES[:MULTI_QUERY_COUNT]:
+            if sent >= config.KB_EXPANSION_MAX_CALLS:
+                break
             if query_type == "key_terms":
                 # P0-3: 改進 prompt，保留符號和允許中英文混合
                 prompt = f"""從以下問題中提取 3-5 個最重要的技術術語，用於搜尋技術文件。
@@ -1499,6 +1791,7 @@ English:"""
                 temperature=0.3,
                 timeout=20,
             )
+            sent += 1
 
             if result and len(result) < 200:
                 if query_type == "translate":
@@ -2281,7 +2574,7 @@ English:"""
         for idx, chunk in enumerate(self.chunks):
             if allowed_indices is not None and idx not in allowed_indices:
                 continue
-            emb = chunk.get("embedding", [])
+            emb = self._chunk_vector(chunk)
             if emb:
                 score = self._cosine_similarity(q_emb, emb)
                 results.append((score, idx))
@@ -2807,7 +3100,7 @@ English:"""
             chunk_idx = c.get("chunk_index", 0)
             chunk_type = c.get("type", "doc")
             chunk_section = c.get("section", "")
-            c_emb = c.get("embedding", [])
+            c_emb = self._chunk_vector(c)
 
             if buffer is None:
                 buffer = _start(c, key, chunk_idx, chunk_type, chunk_section, c_emb)
@@ -3979,15 +4272,17 @@ English:"""
         return line
 
 
-def load_knowledge_base_strict(json_path: str, *, on_loaded=None) -> KnowledgeBase:
+def load_knowledge_base_strict(json_path: str, *, on_loaded=None,
+                               publish_bm25_cache: bool = False) -> KnowledgeBase:
     """建立新 KnowledgeBase;任何載入失敗都拋 KnowledgeStoreError,不回傳半殘物件。
 
     給「自動重載 / 手動 reload」的呼叫端用:呼叫端把回傳值當 candidate,
     例外時保留手上還能用的舊 KB(不要先覆蓋再發現壞掉)。
     「檔案不存在」是合法空庫,正常回傳(loaded=False、load_error=None)。
-    `on_loaded` 同 KnowledgeBase:重載的那一代也要交給快照。
+    `on_loaded` 同 KnowledgeBase:重載的那一代也要交給快照。`publish_bm25_cache` 同 KnowledgeBase。
     """
-    kb = KnowledgeBase(json_path, on_loaded=on_loaded)   # KnowledgeStoreError 由 _load 直接傳播
+    kb = KnowledgeBase(json_path, on_loaded=on_loaded,
+                       publish_bm25_cache=publish_bm25_cache)   # KnowledgeStoreError 由 _load 直接傳播
     if kb.load_error is not None:
         raise KnowledgeStoreError(
             f"knowledge.json 載入失敗: {kb.load_error}(path={json_path})"

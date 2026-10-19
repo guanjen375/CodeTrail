@@ -43,6 +43,7 @@ fail-loud，**絕不「跳過檢查繼續做」**。
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -65,6 +66,9 @@ from runtime_dependencies import require_safe_filesystem
 # 都在 .gitignore 裡——NDA 內容不會因為換位置而外洩。
 CACHE_RELDIR = Path(".codetrail") / "cache" / "embeddings"
 CACHE_FILENAME = "embeddings.npz"
+# BM25 索引快取與向量放同一個 `<kb-id>` 目錄：同一套路徑防線、同一次 purge 一起清掉。
+# 內容與身分由 knowledge.py 決定，這裡只管檔案與安全 IO。
+BM25_FILENAME = "bm25.npz"
 
 SECTION_NPZ_FIELDS = (
     "section_schema", "section_ids", "section_fingerprints",
@@ -154,6 +158,7 @@ def _checked_cache_dir(json_path) -> Path:
 
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 # `os.replace` 與 `os.rename` 在 POSIX 是同一個 syscall，但只有 rename 會被列進
 # supports_dir_fd（figure_review 也用同一個代理判斷）；實際呼叫 replace，因為覆寫
 # 語意才是我們要的。
@@ -859,7 +864,7 @@ def _unchanged_generation(json_path: Path, metadata: Mapping):
 
     呼叫端**必須**在沒有持有 store lock 的情況下進來：flock 綁在 open file
     description 上，同一個行程持著 shared lock 再要 exclusive 會擋住自己。
-    `locate(mutate=True)` 與 `rebuild()` 都只從鎖外的載入路徑呼叫（見
+    `locate(mutate=True)`、`rebuild()` 與 `publish_bm25()` 都只從鎖外的載入路徑呼叫（見
     `RAG.load_knowledge_base` 與 `KnowledgeBase._load`）。
     """
     from knowledge_store import knowledge_store_lock
@@ -1073,6 +1078,89 @@ def _publish_rebuilt(json_path: Path, payload: dict, chunks, metadata) -> Option
         raise
     except Exception as exc:  # noqa: BLE001 — 寫不進去只是下次還要重算，不影響正確性
         print(f"[WARN] embeddings cache 寫入失敗（這次的向量仍然是重算出來的）: {exc}")
+        return None
+
+
+# ==========================================================================
+# BM25 索引快取（檔案與安全 IO；內容與身分見 knowledge.py）
+# ==========================================================================
+def _bm25_path_error(where: Path, what: str) -> KnowledgeStoreError:
+    return KnowledgeStoreError(
+        f"拒絕使用 {where}：{what}。這個檔案由 CodeTrail 自動產生，不應該是連結或特殊檔；"
+        "若不是你自己建的，請檢查後移除它。"
+    )
+
+
+def read_bm25(json_path) -> Optional[dict]:
+    """讀 BM25 索引快取的原始欄位；沒有就回 None。
+
+    路徑與 embeddings cache 同一套防線：先逐層驗目錄（`_checked_cache_dir`，不建立任何
+    目錄），讀取期間持有 `<kb-id>` 的目錄 fd，檔案以 `O_NOFOLLOW|O_NONBLOCK` 開並 fstat
+    確認是一般檔（FIFO 不會把載入卡住）。symlink／特殊檔／逃出 KB 目錄 → fail-loud；
+    讀不回來的壞檔 → None（呼叫端在記憶體重建）。`np.load(allow_pickle=False)`。
+    """
+    _checked_cache_dir(json_path)
+    np = _require_numpy()
+    where = cache_dir(json_path) / BM25_FILENAME
+    with cache_dir_fd(json_path, create=False) as dfd:
+        if dfd is None:
+            return None
+        try:
+            info = os.lstat(BM25_FILENAME, dir_fd=dfd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise KnowledgeStoreError(f"無法 lstat {where}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise _bm25_path_error(where, "它是 symlink")
+        if not stat.S_ISREG(info.st_mode):
+            raise _bm25_path_error(where, "它存在但不是一般檔案")
+        try:
+            fd = os.open(BM25_FILENAME, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK, dir_fd=dfd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:   # lstat 之後才被換成 symlink
+                raise _bm25_path_error(where, "它是 symlink") from exc
+            print(f"[INFO] BM25 索引快取打不開（{exc}），改在記憶體建")
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise _bm25_path_error(where, "它存在但不是一般檔案")
+            try:
+                with np.load(handle, allow_pickle=False) as data:
+                    return {name: data[name] for name in data.files}
+            except Exception as exc:  # noqa: BLE001 — 壞檔是可重建的
+                print(f"[INFO] BM25 索引快取讀不回來（{type(exc).__name__}），改在記憶體建")
+                return None
+
+
+def publish_bm25(json_path, fields: Mapping, metadata: Mapping) -> Optional[Path]:
+    """原子發布 BM25 索引快取——只在 KB 還是同一代的時候（同 `_publish_rebuilt`）。
+
+    索引是在鎖外建的；建的期間有人提交了新的一代，就不寫（不蓋掉新一代可能已經發布的
+    快取）。寫入走持有目錄 fd 的 `write_npz_at`（temp O_EXCL|O_NOFOLLOW → fsync →
+    replace）。只寫進**已經存在**的 `<kb-id>` 目錄（向量 cache 在那裡）：BM25 快取只是
+    載入加速，不為它在專案裡長出新目錄（legacy inline KB 因此照舊每次在記憶體建）。
+    寫不進去只印一行原因（記憶體裡的索引不受影響）；路徑安全違規與 store lock 失敗照樣
+    raise。呼叫端（knowledge.py）只在明確授權發布時才會走到這裡。
+    """
+    json_path = Path(json_path)
+    try:
+        with _unchanged_generation(json_path, metadata) as same:
+            if not same:
+                print("[WARN] 建 BM25 索引期間 knowledge.json 已換代；本次不寫入 BM25 快取")
+                return None
+            _checked_cache_dir(json_path)
+            with cache_dir_fd(json_path, create=False) as dfd:
+                if dfd is None:
+                    return None
+                write_npz_at(dfd, fields, name=BM25_FILENAME)
+            return cache_dir(json_path) / BM25_FILENAME
+    except KnowledgeStoreError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 寫不進去只是下次載入再建一次
+        print(f"[WARN] BM25 索引快取寫入失敗（這次的索引已在記憶體建好）: {exc}")
         return None
 
 

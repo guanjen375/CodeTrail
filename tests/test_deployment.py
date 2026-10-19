@@ -475,7 +475,8 @@ def test_aux_cache_ram_boundaries_build_expected_command(tmp_path, role, cache_r
     assert command[command.index("--cache-ram") + 1] == str(cache_ram)
 
 
-@pytest.mark.parametrize("role", ["main", "vl"])
+# main 的 cache_ram 已開放給使用者手設(見下一條);VL 仍不接受這個 key。
+@pytest.mark.parametrize("role", ["vl"])
 def test_cache_ram_is_rejected_for_generating_roles(tmp_path, role):
     _write_local(
         tmp_path,
@@ -483,6 +484,33 @@ def test_cache_ram_is_rejected_for_generating_roles(tmp_path, role):
     )
     with pytest.raises(ProfileError, match="not allowed"):
         load_effective_profile(_env(tmp_path))
+
+
+@pytest.mark.smoke
+def test_main_cache_ram_is_user_settable_with_the_same_validation_and_flag(tmp_path):
+    """main 可手設 cache_ram(host RAM 的 prompt cache 上限):與附屬服務同一驗證、同一個
+    --cache-ram 映射。接受了卻沒進 argv 是無聲的 —— server 照樣用 llama.cpp 預設;
+    沒設就不輸出旗標(profile 不替使用者決定 main 的值)。"""
+    model = tmp_path / "main.gguf"
+    model.write_bytes(b"fixture")
+    env = _env(tmp_path)
+
+    def main_command(parameters: dict) -> list[str]:
+        _write_local(
+            tmp_path,
+            {"schema_version": 1,
+             "services": {"main": {"model": str(model), "parameters": parameters}}},
+        )
+        service = load_effective_profile(env).service("main")
+        return build_server_command(service, "/opt/llama-server", env, must_exist=True)
+
+    for cache_ram in (0, 262_144):
+        command = main_command({"cache_ram": cache_ram})
+        assert command[command.index("--cache-ram") + 1] == str(cache_ram)
+    assert "--cache-ram" not in main_command({})
+    for value in (-1, 262_145, True, "0"):
+        with pytest.raises(ProfileError, match="cache_ram must be an integer in 0..262144"):
+            main_command({"cache_ram": value})
 
 
 @pytest.mark.parametrize("value", [-1, 262_145, True, 0.0, "0"])

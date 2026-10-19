@@ -2,8 +2,9 @@
 """CodeTrail 一鍵設定精靈(`./set_config.sh` 的實作)。
 
 純問答式設定:不以容量估算限制使用者輸入。部分數值題會提供方向或維護者
-驗證值;CPU-MoE 另依 GGUF 權重與 nvidia-smi 的 free VRAM 給推薦區間,
-全部只供參考、不擋合法輸入。使用者選擇題由使用者作答,工具只驗證輸入在
+驗證值;CPU-MoE 另依 GGUF 權重與 nvidia-smi 的 free VRAM 給推薦區間(主模型
+另扣套 CPU-MoE 時 -ub 加大的 compute buffer 估計),全部只供參考、不擋合法輸入。
+使用者選擇題由使用者作答,工具只驗證輸入在
 合理範圍(例如選項只有 1-2 卻輸入 3 會重問)。
 VRAM 塞不塞得下以啟動後實測為準(產生的 ~/start.sh 啟動完會提醒用
 nvidia-smi 稍微監控)。
@@ -129,6 +130,14 @@ _AUX_MODEL_HINTS = {
 
 AUX_PARALLEL = 1                        # 本地單使用者服務不預留四個同時 request slot
 VL_FIT_TARGET_MIB = 3 * 1024            # VL 最後啟動後仍保留給 mmproj / inference transient
+# 主模型的 -b / -ub。schema 規定 ubatch ≤ batch ≤ ctx,ctx 比它們小時一律夾到 ctx
+# (規則只在 _main_batch_sizes 一處)。
+MAIN_BATCH = 2048
+MAIN_UBATCH = 512
+# 主模型套 CPU-MoE(--cpu-moe 或 --n-cpu-moe N)時的 -ub:留在 RAM 的 experts 每個 ubatch
+# 都要整批搬上 GPU 算一次,ubatch 越大,長 prompt 的 prefill 搬運趟數越少。代價是
+# compute buffer 變大;CPU-MoE 層數的推薦值會扣掉它的估計值(cpu_moe_ubatch_reserve_mib)。
+MAIN_CPU_MOE_UBATCH = 2048
 
 # llama.cpp --cpu-moe 使用的 expert tensor 命名規則。這裡刻意對齊
 # common/arg.cpp::llm_ffn_exps_cpu_override(),不靠模型檔名猜是不是 MoE。
@@ -138,6 +147,9 @@ _CPU_MOE_TENSOR_RE = re.compile(
 # --n-cpu-moe 以 block 編號劃界(blk.0..N-1 的 experts 留 CPU),
 # 推薦值因此需要 per-layer 的 expert storage。
 _BLK_INDEX_RE = re.compile(r"(?:^|\.)blk\.(\d+)\.")
+# 讀 n_vocab / n_embd 的 tensor,依優先序:輸出投影 output.weight,沒有(tied embedding)
+# 才用 token_embd.weight。兩者的 GGUF dims 都是 ne[0]=n_embd、ne[1]=n_vocab。
+_EMBEDDING_DIM_TENSORS = ("output.weight", "token_embd.weight")
 _GGUF_FIXED_TYPES: dict[int, tuple[str, int]] = {
     0: ("<B", 1),   # UINT8
     1: ("<b", 1),   # INT8
@@ -230,6 +242,11 @@ class ModelLayout:
     # CPU-MoE 的權威仍是 tensor 名稱(那才是 --cpu-moe 真正會抓的東西)。
     architecture: str = ""
     expert_count: int = 0
+    # output.weight(沒有才用 token_embd.weight)的 dims:ne[0]=n_embd、ne[1]=n_vocab。
+    # 只用來估主模型套 CPU-MoE、-ub 加大後多出來的 compute buffer
+    # (cpu_moe_ubatch_reserve_mib);0 = GGUF 讀不到,推薦值不扣。
+    vocab_size: int = 0
+    embedding_length: int = 0
 
     @property
     def is_moe(self) -> bool:
@@ -841,12 +858,17 @@ def _inspect_gguf_file(path: Path) -> ModelLayout:
                 raise SetupError(f"GGUF alignment 異常:{path.name} ({alignment})")
 
             tensors: list[tuple[int, str]] = []
+            # 只保留 _EMBEDDING_DIM_TENSORS 的 (ne[0], ne[1]);其他 tensor 的 dims 讀了就丟。
+            embedding_dims: dict[str, tuple[int, int]] = {}
             for _ in range(tensor_count):
                 name = _gguf_string(handle, path, capture=True)
                 n_dims = _gguf_u32(handle, path)
                 if n_dims > 16:
                     raise SetupError(f"GGUF tensor 維度異常:{path.name} ({n_dims})")
-                _gguf_exact(handle, n_dims * 8, path)  # dimensions
+                dims = _gguf_exact(handle, n_dims * 8, path)  # dimensions
+                if name in _EMBEDDING_DIM_TENSORS and n_dims >= 2:
+                    ne = struct.unpack(f"<{n_dims}Q", dims)
+                    embedding_dims[name] = (ne[0], ne[1])
                 _gguf_u32(handle, path)                # ggml tensor type
                 offset = _gguf_u64(handle, path)
                 tensors.append((offset, name or ""))
@@ -860,6 +882,12 @@ def _inspect_gguf_file(path: Path) -> ModelLayout:
             tensor_bytes=0, expert_bytes=0,
             architecture=architecture, expert_count=expert_count,
         )
+    # 依優先序取第一個兩維都有值的;這一片兩個 tensor 都沒有 = 0、0(交給別片)。
+    embedding_length, vocab_size = next(
+        (embedding_dims[name] for name in _EMBEDDING_DIM_TENSORS
+         if name in embedding_dims and min(embedding_dims[name]) > 0),
+        (0, 0),
+    )
     tensors.sort()
     data_bytes = file_size - data_start
     if data_bytes <= 0:
@@ -885,6 +913,8 @@ def _inspect_gguf_file(path: Path) -> ModelLayout:
         expert_layer_bytes=tuple(sorted(per_layer.items())),
         architecture=architecture,
         expert_count=expert_count,
+        vocab_size=vocab_size,
+        embedding_length=embedding_length,
     )
 
 
@@ -894,14 +924,20 @@ def inspect_model_layout(candidate: ModelCandidate) -> ModelLayout:
     expert = 0
     per_layer: dict[int, int] = {}
     # split GGUF 只有第一片帶完整 metadata,其餘片可能什麼都沒有 → 取第一個有值的。
+    # output.weight / token_embd.weight 可能落在任何一片 → vocab / embedding 同樣
+    # 取第一個有值的 shard(兩個值來自同一個 tensor,成對取)。
     architecture = ""
     expert_count = 0
+    vocab_size = 0
+    embedding_length = 0
     for path in _candidate_files(candidate):
         layout = _inspect_gguf_file(path)
         total += layout.tensor_bytes
         expert += layout.expert_bytes
         architecture = architecture or layout.architecture
         expert_count = max(expert_count, layout.expert_count)
+        if not vocab_size and layout.vocab_size and layout.embedding_length:
+            vocab_size, embedding_length = layout.vocab_size, layout.embedding_length
         for layer, size in layout.expert_layer_bytes:
             per_layer[layer] = per_layer.get(layer, 0) + size
     if total <= 0:
@@ -914,6 +950,8 @@ def inspect_model_layout(candidate: ModelCandidate) -> ModelLayout:
         expert_layer_bytes=tuple(sorted(per_layer.items())),
         architecture=architecture,
         expert_count=expert_count,
+        vocab_size=vocab_size,
+        embedding_length=embedding_length,
     )
 
 
@@ -1297,30 +1335,67 @@ def cpu_moe_fit_layers(layout: ModelLayout, budget_bytes: int) -> int | None:
 
 
 def cpu_moe_recommendation(layout: ModelLayout, gpu: Gpu | None,
-                           reserve_mib: int = 0) -> str:
+                           reserve_mib: int = 0, *, cpu_moe_reserve_mib: int = 0) -> str:
     """給使用者一個可以直接照打的推薦區間,例如 "38-43"。
 
-    下界 = 權重剛好放得進(free VRAM - reserve_mib)的最小層數;
+    下界 = 權重剛好放得進 VRAM 預算的最小層數:N = 0(不 offload)的預算是
+    free VRAM - reserve_mib;N ≥ 1(真的套 CPU-MoE)再扣 cpu_moe_reserve_mib。
     上界 = 全部 experts 移到 RAM(GPU 負載最低)。
 
     reserve_mib 是留給 KV cache / compute buffer / mmproj 的手動餘量。VL 特別需要
     它:一旦套用 CPU-MoE,llama.cpp 的 --fit 會直接放棄(見 build_vl_parameters),
     -ngl 退化成「全部層上 GPU」而沒有任何自動退讓,下界貼著權重上限就等於必 OOM。
-    KV cache、compute buffer、共用同一顆卡的附屬服務仍然沒被精算,所以這是
+    cpu_moe_reserve_mib 是「套了 CPU-MoE 才會多出來」的 VRAM:主模型套 CPU-MoE 時
+    -ub 拉到 MAIN_CPU_MOE_UBATCH,compute buffer 跟著變大(cpu_moe_ubatch_reserve_mib);
+    N = 0 仍是 -ub MAIN_UBATCH,沒有這塊,所以 0 那一檔不扣。
+    KV cache、共用同一顆卡的附屬服務仍然沒被精算,compute buffer 也只是估計,所以這是
     「從這裡開始試」的推薦,不是保證,也不拿來限制輸入(仍只驗證 0-MAX 範圍)。
     """
     ceiling = cpu_moe_layer_ceiling(layout)
     if gpu is None or not layout.expert_layer_bytes:
         # 沒有 GPU 資訊、或 expert tensors 沒有 blk 編號 → 只能推薦「全部移到 RAM」。
         return str(ceiling)
-    fit = cpu_moe_fit_layers(layout, max(0, gpu.free_mib - reserve_mib) * MIB)
+    budget_mib = max(0, gpu.free_mib - reserve_mib)
+    if cpu_moe_gpu_bytes(layout, 0) <= budget_mib * MIB:
+        return "0(權重整顆放得進 GPU)"
+    # 0 已放不下;從 1 起找,預算再扣掉只有 CPU-MoE 才有的那塊(因此 fit 不會是 0)。
+    fit = cpu_moe_fit_layers(layout, max(0, budget_mib - cpu_moe_reserve_mib) * MIB)
     if fit is None:
         return f"{ceiling}(GPU 負載已最低,這顆卡仍可能放不下)"
-    if fit == 0:
-        return "0(權重整顆放得進 GPU)"
     if fit >= ceiling:
         return str(ceiling)
     return f"{fit}-{ceiling}"
+
+
+def cpu_moe_ubatch_reserve_mib(layout: ModelLayout | None, ctx: int) -> int:
+    """主模型套 CPU-MoE、-ub 從一般模式拉大後,compute buffer 多出來的估計值(MiB,進位)。
+
+    4 bytes × Δubatch × (n_vocab + 64 × n_embd):f32 logits 每 token 佔 4·n_vocab bytes,
+    其餘活化值依架構差很大,以每 token 64·n_embd 個 float 估。係數是用本機三顆模型的
+    llama-fit-params 試算校準的(ub 512 → 2048 實際增量:DeepSeek-V4-Flash 955、
+    GLM-5.2 3120、Qwen3.5-9B 1527 MiB;本式 2294 / 3212 / 2991 MiB,三顆都不低估;
+    只算 vocab 會把 GLM 低估 3.4 倍)—— 這是估計值,不是任意模型的上界。
+    Δubatch 用實際會寫進 deployment.json 的兩個 -ub(_main_batch_sizes;小 ctx 會夾限)。
+    GGUF 讀不到 vocab / embedding 維度時回 0:推薦值不扣,題目提示會明講沒扣。
+    """
+    if layout is None or layout.vocab_size <= 0 or layout.embedding_length <= 0:
+        return 0
+    delta = (_main_batch_sizes(ctx, cpu_moe=True)[1]
+             - _main_batch_sizes(ctx, cpu_moe=False)[1])
+    if delta <= 0:
+        return 0
+    extra_bytes = 4 * delta * (layout.vocab_size + 64 * layout.embedding_length)
+    return -(-extra_bytes // MIB)
+
+
+def _cpu_moe_ubatch_hint(layout: ModelLayout | None, ctx: int, reserve_mib: int) -> str:
+    """主模型 CPU-MoE 題多一行:推薦數值有沒有扣 -ub 加大後的 compute buffer(單位 MiB)。"""
+    ubatch = _main_batch_sizes(ctx, cpu_moe=True)[1]
+    if layout is None or layout.vocab_size <= 0 or layout.embedding_length <= 0:
+        return (f"GGUF 讀不到 vocab/embedding 維度:推薦數值未扣除 CPU-MoE 時 -ub {ubatch}"
+                " 多出的 compute buffer。")
+    return (f"CPU-MoE 時 -ub {ubatch}:compute buffer 估計多約 {reserve_mib} MiB,"
+            "推薦數值已扣除(估計值,不是上界)。")
 
 
 def choose_compaction_mode(
@@ -1380,6 +1455,8 @@ def choose_cpu_moe_layers(
     notes: list[str],
     gpu: Gpu | None = None,
     reserve_mib: int = 0,
+    cpu_moe_reserve_mib: int = 0,
+    extra_hints: tuple[str, ...] = (),
 ) -> tuple[bool, int | None]:
     """CPU-MoE 只有一題:「幾層 experts 留 RAM」。沒有 y/n 分流、不限制輸入。
 
@@ -1390,6 +1467,8 @@ def choose_cpu_moe_layers(
 
     非 MoE 模型(GGUF 沒有 expert tensors)不問,直接印出原因;
     build 不支援對應旗標時也不問,只留 note。
+    reserve_mib / cpu_moe_reserve_mib 只影響推薦區間(見 cpu_moe_recommendation);
+    extra_hints 接在推薦數值後面印出(主模型用來說明 -ub 的 compute buffer 扣了沒)。
     """
     all_flag, none_flag, n_flag = flag_names
     ceiling = cpu_moe_layer_ceiling(layout)
@@ -1467,9 +1546,13 @@ def choose_cpu_moe_layers(
             f"(0 = 不 offload),或 {all_flag} / {none_flag}。"
         )
 
+    recommendation = cpu_moe_recommendation(
+        layout, gpu, reserve_mib, cpu_moe_reserve_mib=cpu_moe_reserve_mib,
+    )
     hints = (
         "數值越大 → GPU 負載越低(0 = 不 offload)。",
-        f"推薦數值:{cpu_moe_recommendation(layout, gpu, reserve_mib)}",
+        f"推薦數值:{recommendation}",
+        *extra_hints,
     )
     value = choose_int(
         f"{role_label} CPU-MoE 留在 RAM 的層數", None, False,
@@ -1538,6 +1621,19 @@ def resolve_vl_mmproj(
 # 主模型啟動參數(依使用者選定的模式組裝;不改寫使用者選的數值)
 # ---------------------------------------------------------------------------
 
+def _main_batch_sizes(ctx: int, *, cpu_moe: bool) -> tuple[int, int]:
+    """主模型寫進 deployment.json 的 (batch, ubatch);-b / -ub 的規則只在這裡。
+
+    schema 規定 ubatch ≤ batch ≤ ctx;小 ctx(CLI 允許到 1024)不夾限的話,
+    使用者答完全部問題才會被自己的驗證打死。套 CPU-MoE(含 --n-cpu-moe N)時
+    ubatch 取 MAIN_CPU_MOE_UBATCH(同樣夾到 batch,也就是 ubatch = batch),
+    其他情況維持 MAIN_UBATCH。cpu_moe_ubatch_reserve_mib 用同一個規則算 Δubatch。
+    """
+    batch = min(MAIN_BATCH, ctx)
+    ubatch = min(MAIN_CPU_MOE_UBATCH if cpu_moe else MAIN_UBATCH, batch)
+    return batch, ubatch
+
+
 def build_main_parameters(candidate: ModelCandidate, ctx: int, threads: int | None,
                           fit_supported: bool, cpu_moe: bool, notes: list[str], *,
                           n_cpu_moe: int | None = None) -> tuple[dict, int, int]:
@@ -1581,10 +1677,14 @@ def build_main_parameters(candidate: ModelCandidate, ctx: int, threads: int | No
         # 新版 llama.cpp 的 --fit 預設可能是 on;明確關閉才不會重寫使用者選定的
         # -ngl 99 / CPU-MoE placement。
         parameters["fit"] = "off"
-    # schema 規定 ubatch ≤ batch ≤ ctx;小 ctx(CLI 允許到 1024)不夾限的話,
-    # 使用者答完全部問題才會被自己的驗證打死。
-    batch = min(2048, ctx)
-    ubatch = min(512, batch)
+    batch, ubatch = _main_batch_sizes(ctx, cpu_moe=cpu_moe)
+    if cpu_moe:
+        notes.append(
+            f"主模型套 CPU-MoE → -b {batch} -ub {ubatch}(一般模式是 -ub {MAIN_UBATCH}):"
+            "留在 RAM 的 experts 每個 ubatch 都要整批搬上 GPU 算一次,ubatch 大,"
+            "長 prompt 的 prefill 就少搬幾趟;代價是 compute buffer 變大、多佔一些 VRAM"
+            "(放不放得下以啟動後 nvidia-smi 實測為準)。"
+        )
     notes.append("取樣參數(temp/top-p/top-k)刻意不寫死:各模型官方建議不同,"
                  "需要時自行加進 ~/.config/codetrail/deployment.json 的 services.main.parameters。")
     return parameters, batch, ubatch
@@ -1774,6 +1874,8 @@ def build_deployment_config(plan: Plan) -> dict:
 
 # set_config 自己管理(每次重寫)的參數鍵:舊檔裡這些鍵缺席或不同屬正常,不警告。
 # 舊版工具寫過的 fit_target(main 已不再產生)也列入,重跑時安靜淘汰。
+# cache_ram 在這裡是 embedding / reranker 那一份(本工具固定寫 0);main 的 cache_ram
+# 屬使用者領域,列在下面的保留鍵 —— merge 先查保留鍵,所以 main 的值不會被這裡吞掉。
 _MANAGED_PARAMETER_KEYS = {
     "jinja", "flash_attention", "cache_type_k", "cache_type_v", "threads",
     "gpu_layers", "cpu_moe", "n_cpu_moe", "fit", "fit_target", "parallel",
@@ -1781,8 +1883,10 @@ _MANAGED_PARAMETER_KEYS = {
 }
 # 明確屬於使用者領域的主模型參數(本工具刻意不寫死)→ 重跑時原樣保留。
 # no_mmap 已不由本工具自動判定,使用者(或舊版工具)設過就尊重。
+# cache_ram(main 的 host RAM prompt cache 上限;省略 = llama.cpp 自己的預設,b10276 是
+# 8192 MiB)本工具從不寫:需要多少視模型與對話而定,使用者手設過就保留,不能被重跑靜默丟掉。
 _PRESERVED_MAIN_SAMPLING_KEYS = (
-    "temperature", "top_p", "top_k", "min_p", "presence_penalty", "no_mmap",
+    "temperature", "top_p", "top_k", "min_p", "presence_penalty", "no_mmap", "cache_ram",
 )
 # 每個 role 重跑時要原樣帶回的「使用者領域」鍵。VL 自從也能套 CPU-MoE 之後,
 # no_mmap 對它同樣有意義(experts 留 RAM + mmap = 第一次推論從 SSD 逐頁載入),
@@ -3463,6 +3567,9 @@ def run(args: argparse.Namespace) -> int:
                 "客戶端的 context gate 與壓縮門檻都會以此值推導。"
             )
         main_layout = _layout_of(main_cand, "主模型", notes)
+        # 套 CPU-MoE 時主模型 -ub 會拉大(_main_batch_sizes):多出來的 compute buffer 估計
+        # 只從 N ≥ 1 的 VRAM 預算扣掉(N = 0 仍是一般模式的 -ub);VL 的 -ub 不變,不扣。
+        ubatch_reserve_mib = cpu_moe_ubatch_reserve_mib(main_layout, ctx)
         cpu_moe, n_cpu_moe = choose_cpu_moe_layers(
             "主聊天模型",
             main_layout,
@@ -3473,6 +3580,8 @@ def run(args: argparse.Namespace) -> int:
             flag_names=("--cpu-moe", "--no-cpu-moe", "--n-cpu-moe"),
             notes=notes,
             gpu=main_gpu,
+            cpu_moe_reserve_mib=ubatch_reserve_mib,
+            extra_hints=(_cpu_moe_ubatch_hint(main_layout, ctx, ubatch_reserve_mib),),
         )
         dspark_choice = choose_main_dspark(args, main_cand.path,
                                            codetrail_dir / "deployment.json", notes)
@@ -3599,10 +3708,20 @@ def run(args: argparse.Namespace) -> int:
             notes.append(
                 "VL 依當下剩餘 VRAM 自動 offload(llama.cpp 會另計 mmproj worst-case memory)。"
             )
+        if main_layout is not None and main_layout.is_moe and ubatch_reserve_mib > 0:
+            # 主模型那題的推薦值另扣了 -ub 加大後的 compute buffer 估計:講清楚扣了什麼、
+            # 那只是估計。讀不到維度(沒扣)或主模型不是 MoE 時維持原句;VL 那題算法不變。
+            counted = (
+                "是 GGUF 權重加上主模型套 CPU-MoE 時"
+                f" -ub {_main_batch_sizes(ctx, cpu_moe=True)[1]} 多出的 compute buffer 估計"
+                f"(約 {ubatch_reserve_mib} MiB;估計值,不是上界),未計 KV cache /"
+                f" -ub {MAIN_UBATCH} 本來就有的 compute buffer / 共卡的附屬服務"
+            )
+        else:
+            counted = "只算 GGUF 權重(未計 KV cache / compute buffer / 共卡的附屬服務)"
         notes.append(
-            "CPU-MoE 那題顯示的 GPU 用量只算 GGUF 權重(未計 KV cache / compute buffer /"
-            " 共卡的附屬服務),是找起點用的粗估;VRAM/RAM 真的放不放得下,"
-            "以 ~/start.sh 啟動後 nvidia-smi 實測為準(啟動結尾會提醒)。"
+            f"CPU-MoE 那題顯示的 GPU 用量{counted},是找起點用的粗估;"
+            "VRAM/RAM 真的放不放得下,以 ~/start.sh 啟動後 nvidia-smi 實測為準(啟動結尾會提醒)。"
         )
         if allow_remote:
             notes.append("⚠ --allow-remote:四個 llama-server 會綁 0.0.0.0,同網段任何人都能呼叫模型 API"

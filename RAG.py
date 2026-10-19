@@ -3330,28 +3330,58 @@ def _embedding_input(chunk: Dict) -> str:
     return context_signals.gate_embedding_input(chunk)
 
 
+def _embedding_unit(checkpoint, text: str) -> Tuple[str, str]:
+    """一段文字的 checkpoint 單元身分（name, fingerprint）；逐筆與批次共用。"""
+    fingerprint = checkpoint.key("embedding", {"text": text}, role="embedding")
+    return "embedding/" + hashlib.sha256(text.encode("utf-8")).hexdigest(), fingerprint
+
+
+def _reuse_embedding(text: str, cache: Dict, state: Dict, checkpoint, unit) -> Optional[List[float]]:
+    """命中規則的唯一定義；命中記一次 hit 並回向量，未命中回 None。
+
+    有 checkpoint 時只認 checkpoint 單元（壞向量 fail-closed，不當 miss）；
+    沒有時查內容雜湊快取——舊版可能留下空向量，空值視為 miss 並重新請求。
+    """
+    if checkpoint is not None:
+        cached = checkpoint.get(*unit)
+        if cached is not None:
+            _validate_checkpoint_vector(cached)
+            state["hits"] += 1
+        return cached
+    cached = cache.get(_content_hash(text))
+    if cached:
+        state["hits"] += 1
+        return cached
+    return None
+
+
+def _embedding_unreachable(exc: Exception) -> RuntimeError:
+    return RuntimeError(
+        f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
+        "Check the embedding llama-server (deployment.json 的 services.embedding)."
+    )
+
+
+def _empty_embedding() -> RuntimeError:
+    return RuntimeError(
+        f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
+        "Check the embedding llama-server (deployment.json 的 services.embedding)."
+    )
+
+
 def _embed_text_cached(text: str, cache: Dict, state: Dict) -> List[float]:
-    """算一段文字的 embedding，先查內容雜湊快取。
+    """算一段文字的 embedding，先查內容雜湊快取（逐筆路徑）。
 
     快取 key 是「實際送出的字串」的雜湊，所以 retrieval（含 ctx）與 gate
     （純內容）兩種組字自然分屬不同 key，不會互相污染。
     """
     checkpoint = ingest_checkpoint.current_job()
-    if checkpoint is not None:
-        fingerprint = checkpoint.key("embedding", {"text": text}, role="embedding")
-        name = "embedding/" + hashlib.sha256(text.encode("utf-8")).hexdigest()
-        cached = checkpoint.get(name, fingerprint)
-        if cached is not None:
-            _validate_checkpoint_vector(cached)
-            state["hits"] += 1
-            return cached
-        checkpoint.start(name, fingerprint)
-    key = _content_hash(text)
-    # 舊版可能留下空向量，空值視為 miss 並重新請求。
-    cached = cache.get(key) if checkpoint is None else None
-    if cached:
-        state["hits"] += 1
+    unit = _embedding_unit(checkpoint, text) if checkpoint is not None else None
+    cached = _reuse_embedding(text, cache, state, checkpoint, unit)
+    if cached is not None:
         return cached
+    if checkpoint is not None:
+        checkpoint.start(*unit)
 
     try:
         embedding = llama_client.embed_one(
@@ -3361,24 +3391,93 @@ def _embed_text_cached(text: str, cache: Dict, state: Dict) -> List[float]:
             timeout=120,
         )
     except Exception as exc:
-        raise RuntimeError(
-            f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
-            "Check the embedding llama-server (deployment.json 的 services.embedding)."
-        ) from exc
+        raise _embedding_unreachable(exc) from exc
 
     if not embedding:
-        raise RuntimeError(
-            f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
-            "Check the embedding llama-server (deployment.json 的 services.embedding)."
-        )
+        raise _empty_embedding()
 
     if checkpoint is not None:
         _validate_checkpoint_vector(embedding)
-        checkpoint.put(name, fingerprint, embedding)
+        checkpoint.put(*unit, embedding)
 
-    cache[key] = embedding
+    cache[_content_hash(text)] = embedding
     state["updated"] = True
     return embedding
+
+
+def _embedding_batches_match_single_requests() -> bool:
+    """embedding server 恰好一個 slot 時，/v1/embeddings 批次與逐筆逐位元相同。
+
+    單一 slot 的 server 仍逐段一個 task 計算；多 slot 會把同批多段一起算而改變
+    向量。探測走專用、不重試的 transport（max_retries=0），連不上立刻失敗，
+    不吃共用 session 的連線重試退避。/slots 不可得（含被關掉回非 200）、不是
+    list、或不是恰好 1 個 slot 一律回 False（走逐筆）。每次
+    _generate_embedding_fields 最多探測一次，成功與失敗都不沿用：server 隨時
+    可能改成 -np>1。
+    """
+    request = llama_client.RequestCancellation()
+    try:
+        slots = llama_client.get_slots(LLAMA_EMBED_BASE_URL, timeout=5, quiet=True, cancel=request)
+    finally:
+        request.close()
+    return isinstance(slots, list) and len(slots) == 1
+
+
+def _print_embedding_progress(done: int, total: int, state: Dict, detail: str = "") -> None:
+    status = f"(快取命中: {state['hits']})" if state["hits"] > 0 else ""
+    print(f"  Embedding: {done}/{total} {detail}{status}", end='\r')
+
+
+def _embed_pending_in_batches(texts: List[str], units: Dict, vectors: Dict,
+                              cache: Dict, state: Dict, checkpoint) -> None:
+    """依 EMBED_BATCH_SIZE／EMBED_BATCH_MAX_CHARS 分批送 /v1/embeddings。
+
+    每批：start_many → embed_batch → 逐列驗證 → put_many → 更新快取。任一列不合格
+    整批都不 put（該批單元留在 running，續跑只重算這一批與之後未送的批）。
+    """
+    from code_rag import plan_embed_batches  # 延遲 import：切批規則與 code_rag 同一份
+
+    batches = plan_embed_batches(
+        texts, config_module.EMBED_BATCH_SIZE, config_module.EMBED_BATCH_MAX_CHARS
+    )
+    done = 0
+    for number, indices in enumerate(batches, 1):
+        batch = [texts[index] for index in indices]
+        done += len(batch)
+        _print_embedding_progress(done, len(texts), state, f"批次 {number}/{len(batches)} ")
+        entries = [units[text] for text in batch] if checkpoint is not None else []
+        if checkpoint is not None:
+            checkpoint.start_many(entries)
+        try:
+            # 與 code_rag._embed_texts_batched 相同：一批受筆數／字數雙預算限制，
+            # -np 1 下遠低於 300 秒；server 卡住時也在 300 秒內 fail-loud。
+            rows = llama_client.embed_batch(
+                base_url=LLAMA_EMBED_BASE_URL,
+                contents=batch,
+                model=EMBEDDING_MODEL,
+                timeout=300,
+            )
+        except llama_client.EmbeddingContractError:
+            raise  # /v1/embeddings 嚴格契約違規：訊息已明確，不包成 unreachable
+        except Exception as exc:
+            raise _embedding_unreachable(exc) from exc
+        count = len(rows) if isinstance(rows, list) else None
+        if count != len(batch):
+            raise llama_client.EmbeddingContractError(
+                f"/v1/embeddings cardinality mismatch: sent {len(batch)} inputs, got {count} rows"
+            )
+        for row in rows:
+            if not row:
+                raise _empty_embedding()
+            if checkpoint is not None:
+                _validate_checkpoint_vector(row)
+        if checkpoint is not None:
+            checkpoint.put_many([(name, fingerprint, row)
+                                 for (name, fingerprint), row in zip(entries, rows)])
+        for text, row in zip(batch, rows):
+            cache[_content_hash(text)] = row
+            vectors[text] = row
+        state["updated"] = True
 
 
 def _validate_checkpoint_vector(vector):
@@ -3399,6 +3498,11 @@ def _generate_embedding_fields(
 
     chunk 沒有 ctx 時兩套組字完全相同，直接共用同一個向量，不會多打一次
     embedding server——「沒開 contextual」的部署因此不會多付任何成本。
+
+    三段：A) 依原順序算每段組字並查 checkpoint／內容雜湊快取，未命中的相異
+    字串依第一次出現的順序排隊；B) embedding server 只有一個 slot 時分批送
+    /v1/embeddings（checkpoint 一批一次 journal fsync＋一次 head 發布），其餘
+    情況逐段走 _embed_text_cached；C) 依原順序回填。失敗時不回填任何 chunk。
     """
     total = len(chunks)
     if not total:
@@ -3414,22 +3518,54 @@ def _generate_embedding_fields(
     cache = _load_embedding_cache(cache_path) if checkpoint is None and not _FRESH_EMBEDDINGS.get() else {}
     state = {"hits": 0, "updated": False}
 
-    for i, chunk in enumerate(chunks):
-        # 進度顯示
-        if (i + 1) % 10 == 0 or i == 0 or i == total - 1:
-            status = f"(快取命中: {state['hits']})" if state["hits"] > 0 else ""
-            print(f"  Embedding: {i + 1}/{total} {status}", end='\r')
+    # A) 命中直接用；同一字串再出現時與逐筆路徑一樣記成命中。
+    vectors: Dict[str, List[float]] = {}
+    units: Dict[str, Tuple[str, str]] = {}
+    pending: List[str] = []
+    queued = set()
 
+    def require(text):
+        if text in vectors or text in queued:
+            state["hits"] += 1
+            return
+        unit = _embedding_unit(checkpoint, text) if checkpoint is not None else None
+        cached = _reuse_embedding(text, cache, state, checkpoint, unit)
+        if cached is not None:
+            vectors[text] = cached
+            return
+        queued.add(text)
+        pending.append(text)
+        if unit is not None:
+            units[text] = unit
+
+    plan = []
+    for chunk in chunks:
         retrieval_text = context_signals.retrieval_embedding_input(chunk, use_ctx=True)
         gate_text = context_signals.gate_embedding_input(chunk)
-
+        # 與逐段寫法相同的判準：gate 組字等於 retrieval 組字且 chunk 有（或這次
+        # 就會有）retrieval 向量時，gate 直接複製那一份。
+        copy_gate = gate and gate_text == retrieval_text and bool(retrieval or chunk.get('embedding'))
         if retrieval:
-            chunk['embedding'] = _embed_text_cached(retrieval_text, cache, state)
+            require(retrieval_text)
+        if gate and not copy_gate:
+            require(gate_text)
+        plan.append((retrieval_text, gate_text, copy_gate))
+
+    # B) 只剩一段時批次與逐筆成本相同，不必探測。
+    if len(pending) > 1 and _embedding_batches_match_single_requests():
+        _embed_pending_in_batches(pending, units, vectors, cache, state, checkpoint)
+    else:
+        for index, text in enumerate(pending):
+            if (index + 1) % 10 == 0 or index == 0 or index == len(pending) - 1:
+                _print_embedding_progress(index + 1, len(pending), state)
+            vectors[text] = _embed_text_cached(text, cache, state)
+
+    # C) 依原順序回填
+    for chunk, (retrieval_text, gate_text, copy_gate) in zip(chunks, plan):
+        if retrieval:
+            chunk['embedding'] = vectors[retrieval_text]
         if gate:
-            if gate_text == retrieval_text and chunk.get('embedding'):
-                chunk['embedding_gate'] = list(chunk['embedding'])
-            else:
-                chunk['embedding_gate'] = _embed_text_cached(gate_text, cache, state)
+            chunk['embedding_gate'] = list(chunk['embedding']) if copy_gate else vectors[gate_text]
 
     # 儲存更新後的快取
     if state["updated"] and checkpoint is None and not _FRESH_EMBEDDINGS.get():

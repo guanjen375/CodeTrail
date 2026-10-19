@@ -203,7 +203,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_client_review.py": (
         "review 的隔離 readonly MCP、受限 JSON true 工具、共享模型鎖與精確 gate；"
-        "草稿不外洩、無歷史或 metrics 寫入，來源至 HTTP/工具/發布全程可取消",
+        "草稿不外洩、無歷史或 metrics 寫入，來源至 HTTP/工具/發布全程可取消"
+        "；/review 的 MCP 即使在附屬探測完成後啟動也照常探測",
         (
             "test_review_forces_thinking_off_without_changing_the_interactive_mode",
             "test_review_isolated_mcp_ephemeral_history_shared_lock_and_exact_gate",
@@ -214,6 +215,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_review_cancels_stream_and_pending_tool_without_next_file",
             "test_review_queue_rejects_start_and_stale_snapshot_suppresses_findings",
             "test_review_cancels_headers_and_late_connect_before_releasing_model_slot",
+            "test_review_mcp_probes_aux_servers_even_after_an_aux_preflight_startup",
         ),
     ),
     "test_deployment_entrypoints.py": (
@@ -282,12 +284,16 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_strict_query_language.py": (
-        "顯式 strict 不因語言降級；英文數值略過擴寫但仍守 content-only/verification 閘與依賴失敗",
+        "顯式 strict 不因語言降級；英文數值略過擴寫但仍守 content-only/verification 閘與依賴失敗"
+        "；strict 自檢延伸初稿請求、兩次生成上限＝保留額、撞上限一律 [ERROR]、預設串流呼叫不設上限",
         (
             "test_english_numeric_query_skips_expansion_without_hiding_dependency_failure",
             "test_explicit_strict_answers_verified_evidence_when_automatic_grounding_is_off",
             "test_explicit_strict_refuses_unverified_weak_or_missing_evidence",
             "test_english_numeric_lexical_recall_still_requires_verification_and_grounding",
+            "test_strict_self_check_extends_the_draft_request_under_one_output_limit",
+            "test_strict_output_limit_is_an_error_never_a_partial_or_unverified_answer",
+            "test_default_stream_call_stays_uncapped_with_the_internal_reserve",
         ),
     ),
     "test_pdf_real_regressions.py": (
@@ -365,7 +371,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_ingest_resume.py": (
-        "私有持久checkpoint的中斷、單位身分、完整文件重組與覆核CAS；壞來源與未知selector不得提交",
+        "私有持久checkpoint的中斷、單位身分、完整文件重組與覆核CAS；壞來源與未知selector不得提交"
+        "；embedding 批次與逐筆逐位元相同、批次 checkpoint 先 durable 再發布 head、失敗只重算未提交的批、只在新鮮 /slots 探測恰好一個 slot 時批次",
         (
             "test_checkpoint_shared_codetrail_permissions_preserve_private_units",
             "test_embedding_checkpoint_writes_are_linear_and_durable",
@@ -384,6 +391,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_source_and_text_review_cas_prevent_stale_checkpoint_overwrite",
             "test_read_status_never_creates_state_or_probes_models",
             "test_visual_resume_probes_missing_candidates_before_render_and_skips_completed_ones",
+            "test_embedding_batches_match_the_per_text_path_bit_for_bit_and_in_order",
+            "test_embedding_batch_makes_payloads_durable_before_one_journal_head",
+            "test_embedding_batch_failure_resumes_without_recomputing_finished_batches",
+            "test_embedding_batches_only_when_a_fresh_slots_probe_finds_exactly_one_slot",
         ),
     ),
     "test_feature_integration.py": (
@@ -727,7 +738,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "而且一定帶壓縮狀態行(自動壓縮被停用是使用者唯一會看到的地方);"
         "`banner_lines()` 是進 TUI 的那一份:摘要一行 + 壓縮狀態行 + 警告(含 preflight 期間"
         "所有 stderr 行),進度行不得進畫面,但 `lines` 仍是完整 transcript;"
-        "`keep=True` 不得改變 `note()` 印出來的字(改了就是兩份不一致的 transcript)",
+        "`keep=True` 不得改變 `note()` 印出來的字(改了就是兩份不一致的 transcript)"
+        "；parallel_tool_calls 只認 /props 模板能力的 JSON true;附屬探測通過的證據才交給 canary 協定 lane",
         (
             "test_the_profile_environment_is_home_only",
             "test_userprofile_is_only_a_fallback_when_home_is_absent",
@@ -743,6 +755,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_keep_does_not_change_what_note_prints",
             "test_every_profile_env_helper_has_the_same_home_only_shape",
             "test_the_canary_child_environment_is_stripped",
+            "test_parallel_tool_calls_follow_only_a_json_true_capability",
+            "test_aux_preflight_evidence_reaches_the_canary_protocol_lane_only_after_it_passed",
+            "test_the_canary_hands_aux_preflight_done_to_the_protocol_lane_only_when_true",
         ),
     ),
     "test_set_config.py": (
@@ -753,7 +768,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "restore manifest 兩個世代共用同一個檔:含這一代不會寫的目標時整份拒絕、一個檔都不動;"
         "產生的 `~/start.sh` 不 export / 不 unset 任何變數(殼層裡的舊名字對啟動指令無效),"
         "GPU 與 llama-server 路徑寫進 `deployment.json` 的 `services.<role>.gpu` / `llama_bin`;"
-        "切回本機不得沿用 B 的遠端端點或授權，主聊天重設仍固定單一 slot",
+        "切回本機不得沿用 B 的遠端端點或授權，主聊天重設仍固定單一 slot"
+        "；CPU-MoE 主模型 -ub＝-b(夾到 ctx)、維度取自 output.weight、推薦值只對 N≥1 扣 compute buffer 估計、重跑保留手設的 main cache_ram",
         (
             "test_generated_start_sh_ignores_legacy_shell_overrides",
             "test_generated_start_sh_rejects_removed_commands_before_dispatch",
@@ -788,6 +804,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_corrupt_manifest_does_not_fall_back_to_per_file_backups",
             "test_restore_refuses_when_a_symlinked_config_was_repointed",
             "test_a_manifest_that_cannot_be_written_does_not_survive_stale",
+            "test_cpu_moe_main_ubatch_equals_batch_and_clamps_to_small_ctx",
+            "test_gguf_vocab_and_embedding_dims_come_from_output_weight",
+            "test_main_ubatch_buffer_estimate_lifts_only_the_offloaded_recommendation",
+            "test_main_cpu_moe_question_deducts_the_ubatch_buffer_in_mib",
+            "test_rerun_preserves_a_hand_set_main_cache_ram",
         ),
     ),
     "test_doctor.py": (
@@ -835,7 +856,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "而 GIT_DIR/.git 壞掉時必須是錯誤(誤報成「沒有倉庫」等於放行模型跳過改檔前的 git 檢查)；"
         "外部匯入:核准框以 server 真正的 path 參數算落點、非 ASCII 檔名的落點保留副檔名、"
         "imported_path 只認真實匯入結果裡唯一一行「已匯入」、授權只來自客戶端 argv "
-        "`--external-import-root`(server 不採用自己讀到的 client.json 這兩個鍵,readonly 一律關)",
+        "`--external-import-root`(server 不採用自己讀到的 client.json 這兩個鍵,readonly 一律關)"
+        "；`--aux-preflight-done` 是不帶值的一次性旗標、沒帶就照常探測;KB 載入只有可寫的 server 才發布 BM25 快取(readonly 不寫)",
         (
             "test_graph_dependency_failure_is_an_mcp_error",
             "test_elf_tool_failures_are_mcp_errors",
@@ -871,6 +893,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_imported_path_parses_the_real_import_result",
             "test_imported_path_accepts_every_name_the_import_can_land",
             "test_external_import_authority_comes_only_from_the_client_argv",
+            "test_aux_preflight_done_is_a_valueless_startup_flag",
+            "test_the_aux_preflight_gate_still_probes_unless_told_otherwise",
+            "test_kb_loads_publish_the_bm25_cache_only_on_a_writable_server",
         ),
     ),
     "test_mcp_ingest.py": (
@@ -984,7 +1009,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "所有進行中的呼叫回成 error 再重新 spawn;每次呼叫的 read timeout 固定不得由呼叫端放寬;"
         "工具目錄在啟動時就驗;MCP stderr 預設不落檔且尾端有上限;同一 root 只有一個 instance;"
         "外部匯入的來源根只以建構時固定的 argv `--external-import-root` 交給 server(readonly 不帶),"
-        "取消逾時的重建沿用同一份 argv",
+        "取消逾時的重建沿用同一份 argv"
+        "；`--aux-preflight-done` 只附在第一次 spawn 的 argv 副本(自訂 argv 不附加),之後的重建照常探測",
         (
             "test_abort_review_start_cancels_without_lifecycle_lock_or_late_process",
             "test_private_review_cancel_escalation_cannot_respawn_or_close_interactive",
@@ -1013,6 +1039,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_process_env_popen_class_is_not_a_raw_spawn_bypass",
             "test_client_config_and_skip_aux_preflight_reach_the_server_argv",
             "test_external_import_roots_travel_as_argv_and_survive_a_respawn",
+            "test_aux_preflight_done_reaches_only_the_first_spawn",
         ),
     ),
     "test_client_progress.py": (
@@ -1063,7 +1090,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "(補的「已中斷」結果排在該群組既有結果之後);"
         "只有終結 chunk + `timings.prompt_n` 才記成 sent(`incomplete` / `no_timings` 不寫 telemetry);"
         "專案外 @ 附件先以 synthetic import_external_file 逐次核准(核准框收到 path 與真落點),"
-        "只有匯入完成才以第二則 synthetic tool_calls 讀落點,拒絕／錯誤不追加,匯入中取消先 heal、零模型請求",
+        "只有匯入完成才以第二則 synthetic tool_calls 讀落點,拒絕／錯誤不追加,匯入中取消先 heal、零模型請求"
+        "；收斂指示接在上一步請求尾端、摘要請求延伸下一輪前綴並帶同一份 tools、parallel_tool_calls 只在 True 時計數與送出、預熱的 thinking 與歷史同一快照",
         (
             "test_chat_thinking_count_and_generation_share_one_snapshot",
             "test_compaction_is_explicitly_off_while_chat_context_count_tracks_thinking",
@@ -1182,6 +1210,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_prime_arriving_during_session_creation_cannot_keep_the_old_history_alive",
             "test_failed_session_creation_does_not_disable_future_priming",
             "test_external_attachment_imports_with_approval_then_reads_the_landed_copy",
+            "test_convergence_keeps_the_previous_step_prefix_and_appends_one_instruction",
+            "test_the_summary_request_extends_the_next_turn_prefix_with_one_instruction",
+            "test_every_summary_batch_is_counted_gated_and_sent_with_the_conversation_tools",
+            "test_parallel_tool_calls_is_counted_and_sent_only_when_the_option_is_true",
+            "test_prime_snapshots_thinking_with_its_history_and_matches_the_next_turn",
         ),
     ),
     "test_http_cancel.py": (
@@ -1199,7 +1232,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "tool-calls 的 step 不算終止、thinking 不得進事件流;headless 預設 ephemeral;"
         "readonly 連客戶端自己的 context metrics 也要關;"
         "headless `run` 沒有預熱的呼叫點(多一條就是 headless 在沒有使用者訊息時打模型);"
-        "自檢通過後進 TUI 的橫幅不重播進度 LOG(端對端,真的走 `client_preflight.run()`)",
+        "自檢通過後進 TUI 的橫幅不重播進度 LOG(端對端,真的走 `client_preflight.run()`)"
+        "；parallel_tool_calls 與 n_ctx 出自同一次觀測;只有 command_chat 把附屬探測證據交給主 MCP,headless 不得跳過探測",
         (
             "test_headless_resumption_compacts_before_send_and_recovers_without_retry",
             "test_a_provider_prefixed_model_is_normalised_like_the_wrapper",
@@ -1215,6 +1249,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_headless_run_never_primes_the_prompt_cache",
             "test_startup_diagnostics_keep_warnings_for_status_and_defer_session_creation",
             "test_interactive_build_defers_disk_session_until_first_binding",
+            "test_parallel_tool_calls_reach_engine_options_from_one_observation",
+            "test_only_command_chat_hands_the_aux_preflight_evidence_to_the_main_mcp",
+            "test_headless_run_never_lets_the_mcp_skip_the_aux_probe",
         ),
     ),
     "test_client_turns.py": (
@@ -1225,7 +1262,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "`prime_in_background` 不取回合鎖、不動 `_turn_done` / `_cancelled`(取消對預熱是 no-op、"
         "預熱不得讓 `busy` 變真),回合進行中不得排,壓縮換掉歷史後的那一次必須在放掉回合鎖之後;"
         "每一次預熱(含壓縮後協調器自己排的)都經 `on_prime(reason, outcome)` 回報,先 `on_prime` 再 "
-        "`on_done`,engine raise 時 outcome 是 None 而不是不叫,回呼的例外不冒出預熱執行緒、也不互相帶走",
+        "`on_done`,engine raise 時 outcome 是 None 而不是不叫,回呼的例外不冒出預熱執行緒、也不互相帶走"
+        "；think on 的成功回合收尾後在回合鎖外排一次預熱(reason=turn)",
         (
             "test_cancel_wakes_a_turn_waiting_for_approval",
             "test_idle_preparation_is_cancellable_and_does_not_widen_automatic_modes",
@@ -1257,6 +1295,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_compaction_that_replaced_the_history_primes_after_the_turn_lock_is_released",
             "test_priming_is_invisible_to_busy_and_cancel_and_refused_while_a_turn_runs",
             "test_every_prime_the_coordinator_runs_reports_through_on_prime",
+            "test_a_successful_think_on_turn_primes_the_next_prefix_once_after_the_turn_lock",
         ),
     ),
     "test_client_attachments.py": (
@@ -1540,12 +1579,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "`LLAMA_BIN`、`MODELS_DIR`、session 名)一律無效 —— 讀回來就是「使用者以為在跑 A、"
         "實際在跑 B」,而且完全無聲;GPU 與 llama-server 路徑的優先序是 argv > 檔案 > 預設;"
         "llama-server 真正被 exec 時的環境要剝掉三前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`;"
-        "主模型解析器沒有環境變數那條分支",
+        "主模型解析器沒有環境變數那條分支"
+        "；main 的 cache_ram 用同一套驗證與旗標",
         (
             "test_the_loader_ignores_every_legacy_override_variable",
             "test_gpu_and_llama_bin_come_from_the_deployment_file_then_argv",
             "test_the_server_environment_strips_gpu_selectors_and_llama_settings",
             "test_the_main_model_resolver_has_no_environment_branch",
+            "test_main_cache_ram_is_user_settable_with_the_same_validation_and_flag",
         ),
     ),
     "test_server_scripts.py": (
@@ -1676,7 +1717,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_knowledge_store.py": (
         "kb_cache 的 embeddings 身分驗證(逐列 chunk id / generation / 內容雜湊)與 fail-loud 重建；"
-        "KB 文件身分:同 basename、不同來源檔一律 fail-loud(靜默覆蓋 = 靜默錯答)",
+        "KB 文件身分:同 basename、不同來源檔一律 fail-loud(靜默覆蓋 = 靜默錯答)"
+        "；chunk 向量只取已驗證矩陣的列;BM25 索引快取命中逐位元相同、身分不符不沿用、不繞過 jieba、symlink／特殊檔 fail-loud、只有授權才發布",
         (
             "test_cache_that_cannot_be_rebuilt_fails_loud_instead_of_reusing_old_vectors",
             "test_tampered_cache_identity_never_produces_a_silent_query",
@@ -1687,6 +1729,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_reingesting_the_same_file_still_replaces_in_place",
             "test_removing_the_document_frees_the_name",
             "test_fresh_ingest_clears_previous_identities",
+            "test_rebuilt_kb_vectors_come_from_the_normalized_matrix_not_inline_values",
+            "test_merged_chunk_vector_is_the_average_of_its_member_rows",
+            "test_bm25_cache_hit_reproduces_every_index_and_query_bit_for_bit",
+            "test_bm25_cache_identity_change_is_never_reused",
+            "test_bm25_cache_never_bypasses_the_jieba_dependency",
+            "test_bm25_cache_file_that_is_not_a_regular_file_fails_loud",
+            "test_bm25_cache_io_refuses_a_symlinked_cache_dir",
+            "test_bm25_cache_is_published_only_when_authorized",
         ),
     ),
     "test_rag_retrieval.py": (
@@ -1734,7 +1784,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "客戶端的閘必須對轉換後實際送出的 payload 計數(含 assistant reasoning / reasoning_content),"
         "保留額必須等於本次 request 實送的 max_tokens;"
         "`prompt_tokens_processed`(真正評估的 token 數)只由 `timings.prompt_n` 填,"
-        "與 `actual_prompt_eval_count` 語意分離 —— 混在一起就沒有任何欄位能判 prefix 冷熱",
+        "與 `actual_prompt_eval_count` 語意分離 —— 混在一起就沒有任何欄位能判 prefix 冷熱"
+        "；KB 擴寫生成有界(上限＝保留額、撞上限丟棄、每次查詢有次數上限);溢位提示指名真正決定保留額的常數",
         (
             "test_measured_input_controls_the_gate_across_live_context_sizes",
             "test_invalid_measured_input_never_becomes_an_estimate",
@@ -1749,6 +1800,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_an_omitted_reserve_still_uses_the_internal_default",
             "test_the_context_gate_has_no_off_switch",
             "test_processed_prompt_tokens_are_recorded_separately_from_the_total",
+            "test_gated_completion_bounds_generation_with_the_reserved_budget",
+            "test_gated_completion_discards_output_that_hit_the_limit",
+            "test_multi_query_sends_at_most_the_configured_expansion_calls",
+            "test_overflow_hint_names_the_constant_that_sets_this_reserve",
         ),
     ),
     "test_evals.py": (
@@ -1816,6 +1871,34 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_delete_sessions_runs_without_the_removed_environment_parameter",
             "test_the_model_identity_is_built_inside_the_synthetic_project_block",
             "test_the_client_identity_is_stable_across_equivalent_synthetic_roots",
+        ),
+    ),
+    "test_code_rag_index.py": (
+        "code_rag fresh 掃描的 stat 指紋只在讀檔前後不變、時間戳早於掃描開始前 2 秒、且裝置的 ctime 可信時"
+        "才沿用內容 md5(同大小改寫、還原 mtime、原子替換、racy 新檔都必須重讀);NPZ 改不壓縮後"
+        "還原矩陣與 tolist 路徑逐位元相同、經同一套 md5／row_count 驗證載回、舊壓縮檔照樣可載,"
+        "lazy 分支把 NPZ 列轉回 Python float list",
+        (
+            "test_fresh_scan_reuses_md5_only_for_stable_unchanged_files",
+            "test_same_size_rewrite_with_restored_mtime_is_detected",
+            "test_racy_recent_file_is_reread_by_the_next_fresh_scan",
+            "test_atomic_replace_with_equal_size_and_mtime_is_detected",
+            "test_stat_fingerprint_is_trusted_only_on_change_time_filesystems",
+            "test_npz_restore_builds_the_same_matrix_bits_as_the_tolist_path",
+            "test_saved_npz_is_uncompressed_and_reloads_through_the_same_validation",
+            "test_previous_generation_compressed_npz_still_loads",
+            "test_lazy_build_turns_npz_rows_back_into_python_float_lists",
+        ),
+    ),
+    "test_code_rag_search.py": (
+        "code_rag 字面分數的倒排索引與逐筆參考實作逐位元相同(含預算在 build 後改變、增量 build、"
+        "lazy／dense 兩種 query_ranked);profile 沿用鍵涵蓋 _lexical_profile 讀到的全部欄位",
+        (
+            "test_lexical_postings_match_the_per_item_reference_bit_for_bit",
+            "test_lexical_budget_changes_after_build_retokenize_and_match_the_reference",
+            "test_incremental_build_tokenizes_only_the_new_symbols",
+            "test_query_ranked_results_equal_the_per_item_lexical_path",
+            "test_lexical_profile_reads_only_the_fields_of_its_reuse_key",
         ),
     ),
 }

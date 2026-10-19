@@ -1,4 +1,8 @@
-"""Real strict-query regressions: English numeric routing and explicit intent."""
+"""Real strict-query regressions: English numeric routing and explicit intent.
+
+Also the two-stage self-check contract: the check request extends the draft
+request verbatim, and both generations share one output limit with the gate.
+"""
 from __future__ import annotations
 
 import copy
@@ -7,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 import config
+import context_budget
 import knowledge
+import llama_client
 import utils
 from runtime_dependencies import DependencyError
 from tests._harness import import_mcp_module, tool_fn
@@ -221,3 +227,125 @@ def test_english_numeric_lexical_recall_still_requires_verification_and_groundin
     assert result["strict"] is True, result
     assert [item["figure_id"] for item in result["excluded_figures"]] == ["fig_reset_delay"]
     assert answers == []
+
+
+# A value no default uses: answer_with_self_check must read it at call time.
+STRICT_LIMIT = 1536
+
+
+def _stub_main_model(monkeypatch, replies):
+    """Real context gate and real stream loop; only the /completion stream is fake.
+
+    `replies` holds one (text, stop_type) per request. Returns the recorded
+    native_completion kwargs and (gate kwargs, returned usage) per gate call.
+    """
+    calls, gates = [], []
+    real_gate = context_budget.check_and_log
+
+    def gate(**kwargs):
+        usage = real_gate(**kwargs)
+        gates.append((kwargs, usage))
+        return usage
+
+    def native_completion(**kwargs):
+        calls.append(kwargs)
+        text, stop_type = replies[len(calls) - 1]
+        return iter([
+            {"content": text, "stop": False},
+            {"content": "", "stop": True, "stop_type": stop_type},
+        ])
+
+    monkeypatch.setattr(config, "require_main_model", lambda: "test-model")
+    monkeypatch.setattr(config, "N_CTX", 65536)
+    monkeypatch.setattr(config, "RESERVED_OUTPUT_TOKENS", STRICT_LIMIT)
+    monkeypatch.setattr(config, "CTX_METRICS_ENABLED", False)
+    monkeypatch.setattr(context_budget, "check_and_log", gate)
+    monkeypatch.setattr(llama_client, "native_completion", native_completion)
+    return calls, gates
+
+
+@pytest.mark.smoke
+def test_strict_self_check_extends_the_draft_request_under_one_output_limit(monkeypatch):
+    """The check request must start with the draft request plus the raw draft.
+
+    Rewording or reordering any earlier part makes the single-slot server
+    recompute all evidence from the fork point: answers stay correct, only
+    silently slower. A cap that differs from the gate reserve lets an admitted
+    prompt overflow the context mid-generation.
+    """
+    draft = "Warm reset delay is 37 ms [REF1].\n"
+    final = "Warm reset delay is 37 ms [REF1]. The watchdog timeout is 250 ms."
+    calls, gates = _stub_main_model(monkeypatch, [(draft, "word"), (final, "eos")])
+    checked = []
+
+    def claim_check(answer, knowledge_ctx):
+        checked.append((answer, knowledge_ctx))
+        return f"  checked: {answer}  "
+
+    monkeypatch.setattr(utils, "CLAIM_TO_EVIDENCE_ENABLED", True)
+    monkeypatch.setattr(utils, "validate_claim_to_evidence", claim_check)
+
+    answer = utils.answer_with_self_check(
+        ENGLISH_QUESTION, "專案路徑: /project", VERIFIED_CONTEXT,
+    )
+
+    draft_request, check_request = (call["prompt"] for call in calls)
+    assert draft_request.startswith(f"專案路徑: /project\n{VERIFIED_CONTEXT}\n")
+    assert draft_request.endswith("\n\n[draft]\n")
+    assert check_request.startswith(draft_request + draft + "\n[/draft]\n\n")
+    check_rules = check_request[len(draft_request + draft):]
+    assert "1. 逐句檢查：每句話是否能在 [REF] 內容裡找到明確根據" in check_rules
+    assert "2. 凡是答案中沒有標註來源的句子，一律視為不可靠" in check_rules
+    assert check_rules.endswith("- 不要解釋檢查過程，只輸出修正後的最終回答")
+    assert calls[0]["stop"] == ["[/draft]"]
+    assert "stop" not in calls[1]
+    assert [call["n_predict"] for call in calls] == [STRICT_LIMIT, STRICT_LIMIT]
+    assert [kwargs["prompt"] for kwargs, _ in gates] == [draft_request, check_request]
+    assert [kwargs["reserved_output_tokens"] for kwargs, _ in gates] == [STRICT_LIMIT] * 2
+    assert [usage.reserved_output_tokens for _, usage in gates] == [STRICT_LIMIT] * 2
+    # Claim-to-evidence runs on the final answer only, and its output is returned.
+    assert checked == [(final, VERIFIED_CONTEXT)]
+    assert answer == f"checked: {final}"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("stage", ["draft", "final"])
+def test_strict_output_limit_is_an_error_never_a_partial_or_unverified_answer(
+    monkeypatch, stage,
+):
+    """A capped generation is unfinished: no self-check of half a draft, and a
+    capped final never falls back to the unverified draft."""
+    draft = "Warm reset delay is 37 ms [REF1]."
+    replies = ([(draft, "limit")] if stage == "draft"
+               else [(draft, "word"), ("Warm reset delay is", "limit")])
+    calls, _gates = _stub_main_model(monkeypatch, replies)
+    checked = []
+    monkeypatch.setattr(utils, "CLAIM_TO_EVIDENCE_ENABLED", True)
+    monkeypatch.setattr(utils, "validate_claim_to_evidence",
+                        lambda answer, _ctx: checked.append(answer) or answer)
+
+    answer = utils.answer_with_self_check(ENGLISH_QUESTION, "", VERIFIED_CONTEXT)
+
+    label = "初稿" if stage == "draft" else "定稿"
+    assert answer == (
+        f"[ERROR] strict {label}達到輸出上限 {STRICT_LIMIT} tokens，未完成；請縮小問題。"
+    )
+    assert len(calls) == len(replies)
+    assert checked == []
+
+
+@pytest.mark.smoke
+def test_default_stream_call_stays_uncapped_with_the_internal_reserve(monkeypatch):
+    """Callers that pass no limit (agent.py) send exactly what they sent before.
+
+    They never read stop_type, so a default cap would silently cut long answers.
+    """
+    calls, gates = _stub_main_model(monkeypatch, [("ok", "eos")])
+
+    assert utils.call_llm_stream("plain prompt") == "ok"
+
+    assert "n_predict" not in calls[0] and "stop" not in calls[0]
+    gate_kwargs, usage = gates[0]
+    assert "reserved_output_tokens" not in gate_kwargs
+    assert usage.reserved_output_tokens == STRICT_LIMIT
+    assert usage.reserve_is_explicit is False

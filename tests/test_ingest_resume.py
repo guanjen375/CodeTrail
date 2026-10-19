@@ -300,6 +300,252 @@ def _check_journal_recovery_boundaries(tmp_path, monkeypatch):
         assert migrated.get("page/1", migrated.key("page", 1)) == {"text": "committed"}
 
 
+def _vector(text):
+    """Text-determined full-precision floats: a misplaced or rounded row shows."""
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return [int.from_bytes(digest[i:i + 4], "big") / 4294967311.0 - 0.5 for i in range(0, 32, 4)]
+
+
+def _bits(vectors):
+    return [[value.hex() for value in vector] for vector in vectors]
+
+
+def _embedding_chunks(tag=""):
+    """ctx chunks need their own gate text; plain chunks copy the retrieval vector."""
+    return [
+        {"source": "spec.pdf", "page": 1, "chunk_index": 0, "content": f"UART divider{tag}", "ctx": "Clock chapter"},
+        {"source": "spec.pdf", "page": 1, "chunk_index": 1, "content": f"DMA abort status{tag}"},
+        {"source": "spec.pdf", "page": 2, "chunk_index": 2, "content": f"UART divider{tag}", "ctx": "Clock chapter"},
+        {"source": "spec.pdf", "page": 2, "chunk_index": 3, "content": f"Watchdog kick{tag}", "ctx": "Timer chapter"},
+        {"source": "spec.pdf", "page": 3, "chunk_index": 4, "content": f"DMA abort status{tag}"},
+    ]
+
+
+def _sent_texts(chunks):
+    """Distinct embedding inputs in first-occurrence order (retrieval, then gate)."""
+    texts = []
+    for chunk in chunks:
+        for text in (RAG.context_signals.retrieval_embedding_input(chunk, use_ctx=True),
+                     RAG.context_signals.gate_embedding_input(chunk)):
+            if text not in texts:
+                texts.append(text)
+    return texts
+
+
+def _expected_bits(chunks, field):
+    if field == "embedding":
+        texts = [RAG.context_signals.retrieval_embedding_input(c, use_ctx=True) for c in chunks]
+    else:
+        texts = [RAG.context_signals.gate_embedding_input(c) for c in chunks]
+    return _bits([_vector(text) for text in texts])
+
+
+def _embedding_server(monkeypatch, slots):
+    """Synthetic embedding server: /slots answers and both request shapes, recorded."""
+    calls = {"probes": [], "single": [], "batches": []}
+    answers = iter(slots) if isinstance(slots, tuple) else None
+
+    def get_slots(url, **kwargs):
+        cancel = kwargs.get("cancel")
+        live = isinstance(cancel, RAG.llama_client.RequestCancellation) and not cancel.event.is_set()
+        calls["probes"].append((url, kwargs, live))
+        return next(answers) if answers is not None else slots
+
+    def embed_one(*, content, **_kwargs):
+        calls["single"].append(content)
+        return _vector(content)
+
+    def embed_batch(*, contents, **_kwargs):
+        calls["batches"].append(list(contents))
+        return [_vector(text) for text in contents]
+
+    monkeypatch.setattr(RAG.llama_client, "get_slots", get_slots)
+    monkeypatch.setattr(RAG.llama_client, "embed_one", embed_one)
+    monkeypatch.setattr(RAG.llama_client, "embed_batch", embed_batch)
+    return calls
+
+
+def _assert_probes(calls, count):
+    """One /slots probe per call: quiet, on its own live no-retry transport, closed after."""
+    probes = calls["probes"]
+    assert [url for url, _kwargs, _live in probes] == [RAG.LLAMA_EMBED_BASE_URL] * count
+    assert all(live and kwargs.get("quiet") is True for _url, kwargs, live in probes), probes
+    assert all(kwargs["cancel"].event.is_set() for _url, kwargs, _live in probes), "probe transport left open"
+    assert len({id(kwargs["cancel"]) for _url, kwargs, _live in probes}) == count
+
+
+def test_embedding_batches_match_the_per_text_path_bit_for_bit_and_in_order(tmp_path, monkeypatch):
+    """#9: batching changes requests and fsyncs only, never vectors or unit identity."""
+    monkeypatch.setattr(RAG.config_module, "EMBED_BATCH_SIZE", 2)
+    monkeypatch.setattr(RAG.config_module, "EMBED_BATCH_MAX_CHARS", 10_000)
+    texts = _sent_texts(_embedding_chunks())
+    assert len(texts) == 5, texts  # duplicates and gate copies are not new inputs
+    results = {}
+    for mode, slots in (("per_text", [{"id": 0}, {"id": 1}]), ("batched", [{"id": 0}])):
+        project = tmp_path / mode
+        project.mkdir()
+        path = source(project)
+        calls = _embedding_server(monkeypatch, slots)
+        with job(project, path) as running:
+            checkpointed = RAG.generate_embeddings(_embedding_chunks(), with_gate=True)
+        directory = project.joinpath(*running.parts)
+        units = {name: unit for name, unit in running.state["units"].items()
+                 if name.startswith("embedding/")}
+        payloads = {unit["payload_sha256"]: (directory / (unit["payload_sha256"] + ".json")).read_bytes()
+                    for unit in units.values()}
+        cached = RAG.generate_embeddings(_embedding_chunks(), cache_dir=project, with_gate=True)
+        cache = json.loads((project / RAG.EMBEDDING_CACHE_FILE).read_text(encoding="utf-8"))["cache"]
+        for chunks in (checkpointed, cached):
+            assert _bits([c["embedding"] for c in chunks]) == _expected_bits(chunks, "embedding")
+            assert _bits([c["embedding_gate"] for c in chunks]) == _expected_bits(chunks, "embedding_gate")
+        results[mode] = {"calls": calls, "units": units, "payloads": payloads, "cache": cache}
+
+    per_text, batched = results["per_text"], results["batched"]
+    for result in (per_text, batched):
+        _assert_probes(result["calls"], 2)
+    assert per_text["calls"]["batches"] == [] and per_text["calls"]["single"] == texts * 2
+    assert batched["calls"]["single"] == []
+    assert batched["calls"]["batches"] == [texts[0:2], texts[2:4], texts[4:5]] * 2
+    # A resume may cross paths: identical unit records, payload bytes and cache.
+    assert batched["units"] == per_text["units"] and len(batched["units"]) == len(texts)
+    assert {unit["state"] for unit in batched["units"].values()} == {"succeeded"}
+    assert batched["payloads"] == per_text["payloads"]
+    assert batched["cache"] == per_text["cache"] == {RAG._content_hash(t): _vector(t) for t in texts}
+
+    project = tmp_path / "batched"
+    with job(project, project / "spec.pdf"):
+        monkeypatch.setattr(RAG.llama_client, "get_slots", lambda *a, **k: pytest.fail("probe with nothing pending"))
+        monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **k: pytest.fail("lost batched embedding"))
+        monkeypatch.setattr(RAG.llama_client, "embed_batch", lambda **k: pytest.fail("lost batched embedding"))
+        resumed = RAG.generate_embeddings(_embedding_chunks(), with_gate=True)
+    assert _bits([c["embedding"] for c in resumed]) == _expected_bits(resumed, "embedding")
+    assert _bits([c["embedding_gate"] for c in resumed]) == _expected_bits(resumed, "embedding_gate")
+
+
+def test_embedding_batch_makes_payloads_durable_before_one_journal_head(tmp_path, monkeypatch):
+    """#9: per batch one running and one succeeded publication, payloads first."""
+    monkeypatch.setattr(RAG.config_module, "EMBED_BATCH_SIZE", 3)
+    monkeypatch.setattr(RAG.config_module, "EMBED_BATCH_MAX_CHARS", 10_000)
+
+    def chunks():
+        return [{"source": "spec.pdf", "page": 1, "chunk_index": index,
+                 "content": f"synthetic register paragraph {index}"} for index in range(6)]
+
+    _embedding_server(monkeypatch, [{"id": 0}])
+    events = []
+    real_batch = RAG.llama_client.embed_batch
+
+    def embed_batch(**kwargs):
+        events.append(("embed", len(kwargs["contents"])))
+        return real_batch(**kwargs)
+
+    monkeypatch.setattr(RAG.llama_client, "embed_batch", embed_batch)
+    path = source(tmp_path)
+    current = job(tmp_path, path).__enter__()
+    try:
+        # Neither the identity snapshot nor the lazy code_rag import is batch I/O.
+        current.model_identity("embedding")
+        import code_rag  # noqa: F401
+        _log_name, head_name = current._journal_names(current._journal_head)
+        real_fsync, real_replace = ic.os.fsync, ic.os.replace
+
+        def fsync(fd):
+            events.append(("fsync", "journal" if fd == current._journal_fd
+                           else "directory" if fd == current.fd else "file"))
+            return real_fsync(fd)
+
+        def replace(source_name, target, **kwargs):
+            events.append(("rename", "head" if target == head_name
+                           else "state" if target == "state.json" else "payload"))
+            return real_replace(source_name, target, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(ic.os, "fsync", fsync)
+            patch.setattr(ic.os, "replace", replace)
+            RAG.generate_embeddings(chunks())
+    finally:
+        # Simulate process loss: no __exit__ and therefore no final snapshot.
+        ic._ACTIVE.reset(current._token)
+        current._close()
+
+    publish = [("fsync", "journal"), ("fsync", "file"), ("rename", "head"), ("fsync", "directory")]
+    payloads = [("fsync", "file"), ("rename", "payload")] * 3 + [("fsync", "directory")]
+    assert events == (publish + [("embed", 3)] + payloads + publish) * 2, events
+
+    with job(tmp_path, path) as resumed:
+        names = [name for name in resumed.state["units"] if name.startswith("embedding/")]
+        assert len(names) == 6
+        assert {resumed.state["units"][name]["state"] for name in names} == {"succeeded"}
+        assert resumed._journal_head["sequence"] == 12  # each record kept its own link
+        monkeypatch.setattr(RAG.llama_client, "embed_batch", lambda **k: pytest.fail("lost durable batch"))
+        restored = RAG.generate_embeddings(chunks())
+    assert _bits([c["embedding"] for c in restored]) == _expected_bits(restored, "embedding")
+
+
+@pytest.mark.parametrize("failure", ["transport", "empty_row"])
+def test_embedding_batch_failure_resumes_without_recomputing_finished_batches(tmp_path, monkeypatch, failure):
+    """#9: a failed batch leaves only its own units running; no row of it is put."""
+    monkeypatch.setattr(RAG.config_module, "EMBED_BATCH_SIZE", 2)
+    monkeypatch.setattr(RAG.config_module, "EMBED_BATCH_MAX_CHARS", 10_000)
+
+    def chunks():
+        return [{"source": "spec.pdf", "page": 1, "chunk_index": index,
+                 "content": f"synthetic timing paragraph {index}"} for index in range(6)]
+
+    texts = _sent_texts(chunks())
+    calls = _embedding_server(monkeypatch, [{"id": 0}])
+    real_batch = RAG.llama_client.embed_batch
+
+    def flaky(**kwargs):
+        if len(calls["batches"]) == 1:  # the second batch
+            calls["batches"].append(list(kwargs["contents"]))
+            if failure == "transport":
+                raise ConnectionError("synthetic transport failure")
+            return [_vector(kwargs["contents"][0]), []]
+        return real_batch(**kwargs)
+
+    monkeypatch.setattr(RAG.llama_client, "embed_batch", flaky)
+    path = source(tmp_path)
+    attempted = chunks()
+    message = ("embedding server unreachable at" if failure == "transport"
+               else "embedding server returned an empty vector at")
+    with pytest.raises(RuntimeError, match=message):
+        with job(tmp_path, path):
+            RAG.generate_embeddings(attempted)
+    assert all("embedding" not in chunk for chunk in attempted)
+    assert calls["batches"] == [texts[0:2], texts[2:4]]
+
+    calls["batches"].clear()
+    monkeypatch.setattr(RAG.llama_client, "embed_batch", real_batch)
+    with job(tmp_path, path) as resumed:
+        states = [resumed.state["units"].get(
+            "embedding/" + hashlib.sha256(text.encode("utf-8")).hexdigest(), {}).get("state")
+            for text in texts]
+        assert states == ["succeeded", "succeeded", "running", "running", None, None]
+        restored = RAG.generate_embeddings(chunks())
+    assert calls["batches"] == [texts[2:4], texts[4:6]]
+    assert calls["single"] == []
+    assert _bits([c["embedding"] for c in restored]) == _expected_bits(restored, "embedding")
+
+
+@pytest.mark.parametrize("answer", [None, {"id": 0}, [], [{"id": 0}, {"id": 1}]],
+                         ids=["unavailable", "not_a_list", "no_slots", "two_slots"])
+def test_embedding_batches_only_when_a_fresh_slots_probe_finds_exactly_one_slot(tmp_path, monkeypatch, answer):
+    """#9: exactly one slot batches; neither a success nor a failure is reused."""
+    one = [{"id": 0}]
+    calls = _embedding_server(monkeypatch, (one, answer, one))
+    tags = (" first", " second", " third")
+    results = [RAG.generate_embeddings(_embedding_chunks(tag), cache_dir=tmp_path, with_gate=True)
+               for tag in tags]
+    _assert_probes(calls, 3)
+    assert calls["batches"] == [_sent_texts(_embedding_chunks(" first")),
+                                _sent_texts(_embedding_chunks(" third"))]
+    assert calls["single"] == _sent_texts(_embedding_chunks(" second"))
+    for chunks in results:
+        assert _bits([c["embedding"] for c in chunks]) == _expected_bits(chunks, "embedding")
+        assert _bits([c["embedding_gate"] for c in chunks]) == _expected_bits(chunks, "embedding_gate")
+
+
 def test_interruption_retains_only_atomically_completed_units(tmp_path):
     path = source(tmp_path)
     with pytest.raises(KeyboardInterrupt):

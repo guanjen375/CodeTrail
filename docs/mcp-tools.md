@@ -66,7 +66,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
 | 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
-| 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 選用即強制嚴格證據檢查，不因語言分類降級；弱證據拒答，可限定文件 |
+| 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 選用即強制嚴格證據檢查，不因語言分類降級；弱證據拒答，可限定文件；初稿與自檢延伸同一段請求，兩次輸出上限都是 `config.RESERVED_OUTPUT_TOKENS`，撞上限回 `[ERROR]`（不自檢半份初稿、不退回未驗證的初稿） |
 | 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動；非 git 專案回固定的跳過通知（`status: ok`，不是錯誤、不用重試） |
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git；非 git 專案同樣回跳過通知 |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
@@ -474,7 +474,7 @@ void led_toggle(void) {
 - 分析、解釋、推導或找原因時，先用 `code_rag_search(mode="context")` 一次取得 bounded evidence；不足才做精準 `grep_code` / `read_file`，同一 query 不重複。
 - 只想定位程式碼時，用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
 - 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次建置要在終端跑一次建立命令——沒建就查 graph 模式會明確報錯,**錯誤訊息就含完整可執行的那條命令**(實際 interpreter 與絕對路徑,直接複製貼上;semantic 不受影響);建好之後查詢自動偵測檔案變更做增量更新,安裝 tree-sitter grammar 或改 `config.H_LANG` 後會自動整體重建。graph 可用時先查 `neighbors`;`graph_status` 為 unavailable 時改用 `mode="context"` / `grep_code`,並把 caller coverage 標為不完整——不能因為沒看到呼叫者就推論沒有呼叫者。
-- 檔案變更偵測有一個 30 秒的快照窗(`config.CODE_RAG_REFRESH_TTL_SECONDS`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
+- 檔案變更偵測有一個 30 秒的快照窗(`config.CODE_RAG_REFRESH_TTL_SECONDS`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。快照過期後的重掃對小檔先比 stat 指紋(dev/inode/size/mtime/ctime):完全相同、而且時間戳早於那次掃描開始前 2 秒才沿用上次的內容 hash,其餘照舊讀內容;NFS、vfat/exFAT、FUSE/overlay/SMB 與非 Linux 平台一律讀內容。偵測語意不變(同大小改寫、還原 mtime、原子替換都看得到)。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
 - 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
 - 「哪些」「幾個」這類要全集的表格題用工具 `list_table_rows`，不要拿 `query_knowledge` 的 top-k 片段拼答案；回答時把 `complete`、被排除或跳過的表與無法判定的列一起講。單一格的值用 `query_table`。

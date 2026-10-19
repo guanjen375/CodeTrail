@@ -367,7 +367,9 @@ def _llm_error_message(e: Exception, model: str) -> str:
 
 
 def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
-                    source: str = "generate_stream") -> str:
+                    source: str = "generate_stream", *, n_predict: int = -1,
+                    stop: list[str] | None = None, finish: dict | None = None,
+                    reserve_name: str | None = None) -> str:
     """呼叫主 LLM(stream,走 llama-server /completion SSE)。
 
     改進：批次輸出減少 I/O 開銷，每累積一定字數或遇到換行時才 flush
@@ -377,11 +379,43 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
         temperature: 溫度參數
         num_ctx: Context 預算(只用於 budget 計算)
         source: 標記呼叫來源（寫入 telemetry，純 metadata）
+        n_predict: -1(預設)= 不設輸出上限，gate 與請求都和以前逐字相同。正整數 =
+            這一次生成的上限，**同一個數字**同時是 context gate 的保留額
+            (reserved_output_tokens)與實送的 n_predict —— 保留額比實送上限小，閘放行
+            的 prompt 仍可能在生成途中撐爆 ctx。其他值一律 ValueError(0 或負數若被
+            當成「不設上限」,呼叫端要的上限會無聲消失)。
+        stop: 停止字串清單(server 不回傳停止字串本身);None / 空清單 = 不送。
+        finish: 呼叫端提供的 dict;每次呼叫先清掉舊的 finish["stop_type"],串流最後
+            一個 chunk(`stop` 為 JSON true)的 `stop_type`("eos" / "word" / "limit" /
+            "none")再寫進去。gate 拒絕、或還沒收到最後一個 chunk 就傳輸失敗／串流
+            結束時沒有這個鍵。
+        reserve_name: 設了 n_predict 時,決定這個上限的常數名稱;gate 溢位訊息叫人
+            調小的就是它(沒給就指客戶端的常數,對內部呼叫是錯的)。
     """
     import time
 
+    if n_predict != -1 and (type(n_predict) is not int or n_predict <= 0):
+        raise ValueError(f"n_predict 只接受 -1 或正整數，得到 {n_predict!r}")
+    if stop is not None and (
+        isinstance(stop, str) or not all(isinstance(item, str) and item for item in stop)
+    ):
+        raise ValueError("stop 必須是非空字串的清單")
+    if finish is not None:
+        finish.pop("stop_type", None)  # 上一次呼叫留下的值不得被當成這一次的結果
+
     ctx = num_ctx if num_ctx is not None else _default_ctx_budget()
     model = config.require_main_model()
+
+    # 預設呼叫(agent.py 等)送出的 kwargs 必須與加入上限之前逐字相同。
+    gate_kwargs = {}
+    completion_kwargs = {}
+    if n_predict > 0:
+        gate_kwargs["reserved_output_tokens"] = n_predict
+        if reserve_name:
+            gate_kwargs["reserve_name"] = reserve_name
+        completion_kwargs["n_predict"] = n_predict
+    if stop:
+        completion_kwargs["stop"] = list(stop)
 
     try:
         usage = context_budget.check_and_log(
@@ -389,6 +423,7 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
             requested_num_ctx=ctx,
             prompt=prompt,
             model=model,
+            **gate_kwargs,
         )
     except context_budget.ContextOverflowError as exc:
         msg = str(exc)
@@ -408,6 +443,7 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
             min_p=config.CHAT_MIN_P,
             stream=True,
             timeout=600,
+            **completion_kwargs,
         )
 
         full_response = []
@@ -437,6 +473,8 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
                     buffer_chars = 0
                     last_flush = now
 
+            if finish is not None and chunk.get("stop") is True:
+                finish["stop_type"] = chunk.get("stop_type")
             context_budget.parse_usage_from_stream_chunk(chunk, usage)
 
         if buffer:
@@ -672,6 +710,16 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
     1. 第一次：正常回答（使用極低溫度）
     2. 第二次：自我檢查，刪除無根據的推測
 
+    兩次生成是**同一個序列的延伸**：初稿請求是 first_prompt + `[draft]` 開標記
+    (停在 `[/draft]`),自檢請求 = 初稿請求原文 + 初稿原文 + `[/draft]` + 自檢指示。
+    主 server 只有一個 slot,自檢請求因此從初稿請求留下的 KV 接續,證據與初稿不再
+    重算(DSV4 由初稿 prompt 尾端的 checkpoint 接續)。所以初稿請求一個字元都不能
+    在自檢請求裡被改寫,初稿也不得 strip 後才放進去。
+
+    兩次生成的上限都是 config.RESERVED_OUTPUT_TOKENS(= context gate 的保留額)。
+    撞上限(stop_type == "limit")就是沒寫完:初稿不拿去自檢半份、定稿不退回
+    未經自檢的初稿,一律回 [ERROR]。傳輸錯誤(定稿以 [ERROR] 開頭)仍照舊回初稿。
+
     Args:
         question: 使用者問題
         base_ctx: 基礎上下文（程式碼等）
@@ -679,6 +727,8 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
         binary_ctx: 二進位/ELF 上下文（[BIN]/[ELF]），優先級最高
     """
     print("[STRICT] 啟用嚴格模式 - 兩階段自我檢查")
+    # 呼叫當下讀(不做 import 期快照);兩次生成與錯誤訊息用同一個值。
+    output_limit = config.RESERVED_OUTPUT_TOKENS
 
     # 偵測是否有 BIN/ELF context
     has_binary = binary_ctx and ("[BIN]" in binary_ctx or "[ELF]" in binary_ctx)
@@ -714,28 +764,30 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
 - 若資料沒有提到，直接說「文件/檔案中沒有明確說明」
 
 請直接給出清楚的回答。"""
+    # 初稿寫在 [draft] 區塊裡、停在 [/draft]:自檢請求才能逐字延伸這一份請求。
+    draft_request = f"{first_prompt}\n\n[draft]\n"
 
     print("   [1/2] 生成初稿...")
-    print_ctx_usage(len(first_prompt))
+    print_ctx_usage(len(draft_request))
     print()
-    draft = call_llm_stream(first_prompt, temperature=STRICT_MODE_TEMPERATURE)
+    draft_finish: dict = {}
+    draft = call_llm_stream(
+        draft_request, temperature=STRICT_MODE_TEMPERATURE,
+        n_predict=output_limit, stop=["[/draft]"], finish=draft_finish,
+        reserve_name=context_budget.INTERNAL_RESERVE_ENV,
+    )
 
     if draft.startswith("[ERROR]"):
         return draft
+    if draft_finish.get("stop_type") == "limit":
+        return f"[ERROR] strict 初稿達到輸出上限 {output_limit} tokens，未完成；請縮小問題。"
 
     print("\n" + "-" * 40)
-    # 第二階段：自我檢查（溫度 0）
-    check_ctx = knowledge_ctx
-    if binary_ctx:
-        check_ctx = f"{binary_ctx}\n{knowledge_ctx}"
-
-    second_prompt = f"""{check_ctx}
-
-上面是你根據文件/檔案給出的初稿回答：
-
-[draft]
-{draft}
+    # 第二階段：自我檢查（溫度 0）。證據已在上方的初稿請求裡，不再重送一份。
+    second_prompt = f"""{draft_request}{draft}
 [/draft]
+
+上面 [draft] 區塊是你根據文件/檔案給出的初稿回答。
 
 請嚴格檢查並修正：
 {check_rule}
@@ -750,7 +802,15 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
     print("   [2/2] 自我檢查...")
     print_ctx_usage(len(second_prompt))
     print()
-    final = call_llm_stream(second_prompt, temperature=0.0)
+    final_finish: dict = {}
+    final = call_llm_stream(
+        second_prompt, temperature=0.0, n_predict=output_limit, finish=final_finish,
+        reserve_name=context_budget.INTERNAL_RESERVE_ENV,
+    )
+
+    # 撞上限的定稿沒寫完：回 [ERROR],不得走下面「退回初稿」那條傳輸錯誤路徑。
+    if final_finish.get("stop_type") == "limit":
+        return f"[ERROR] strict 定稿達到輸出上限 {output_limit} tokens，未完成；請縮小問題。"
 
     # P0 改進：Claim-to-Evidence 強制驗證
     if CLAIM_TO_EVIDENCE_ENABLED and not final.startswith("[ERROR]"):

@@ -30,6 +30,9 @@ context、RepeatGuard(鬼打牆打斷)、canonical 語意表示式。全部離�
   lexical lane 永遠看不到註解訊號;reranker 自行重組 passage,欄位集合與另外兩個消費者不一致。
   所以這裡不只驗「有沒有拿到 comments」,還驗上游儲存上限必須大於等於下游預算 —— 那才是
   洞 2 的真正病灶。
+- 2026-10-19 速度優化 #5:query_ranked 的 lexical 通道改走倒排索引(符號側斷詞只做一次)。
+  分數必須與逐筆 ``_token_match_score`` 逐位元相同、預算改了要重新斷詞、增量 build 只為新
+  symbol 斷詞 —— 任何一條漂掉都是無聲的名次變化。
 
 smoke:本檔不用 module 層 pytestmark,逐條標記。原 cjk_retrieval / repeat_guard /
 semantic_representation 是整檔 smoke,折進來後每一條各自帶 @pytest.mark.smoke;
@@ -45,6 +48,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import zlib
 from pathlib import Path
 
 import pytest
@@ -1635,3 +1639,290 @@ def test_render_truncates_from_the_tail_and_keeps_identity_fields():
     assert "calibration_load" in rendered
     assert "Exercise calibration fallback" in rendered
     assert rendered.count("X") < 5000
+
+
+# ── 速度優化 #5:lexical 通道走倒排索引,分數必須與逐筆參考實作逐位元相同 ──
+
+_LEXICAL_PADS = " ".join(f"pad{i:03d}" for i in range(120))
+
+
+def _lexical_fixture_items() -> list[dict]:
+    """刁鑽 fixture:大小寫重複的 token、exact symbol、path stem、parent、超過 identifier
+    上限才出現的 token、超過掃描字數才出現的 token、空 symbol / 空 path / 缺鍵、Unicode。
+    路徑一律 .py(或空):不讓 parser 依賴(tree-sitter)決定這些測試跑不跑。"""
+    return [
+        {"path": "src/uart_driver.py", "symbol": "UART_Init", "type": "function", "line": 3,
+         "signature": "def UART_Init(baud_rate: int) -> None",
+         "comments": "# Configure the UART baud divisor",
+         "context": "def UART_Init(baud_rate):\n    uart_set_baud(baud_rate)"},
+        {"path": "drv/Uart.py", "symbol": "uart_init", "type": "function", "line": 9,
+         "context": "def uart_init():\n    return UART_Init(115200)"},
+        {"path": "lib/empty.py", "symbol": "", "type": "global", "line": 1,
+         "context": "baud_rate_table = [0] * 4"},
+        {"path": "", "symbol": "dma_irq_handler", "type": "function", "line": 40,
+         "linkage": "internal", "condition": "if USE_DMA",
+         "context": "def dma_irq_handler():\n    if DMA_STATUS_ABORT:\n        watchdog_kick()"},
+        {"type": "macro", "line": 2, "context": "WATCHDOG_KICK = watchdog_kick"},
+        {"path": "src/watchdog.py", "symbol": "kick", "type": "method", "line": 7,
+         "parent": "WatchdogTimer", "docstring": "Kick the watchdog before the timeout.",
+         "type_hints": "(self) -> None",
+         "context": "def kick(self):\n    self._regs.kick = KICK_MAGIC"},
+        {"path": "src/padded.py", "symbol": "padded_fn", "type": "function", "line": 1,
+         "context": _LEXICAL_PADS + " late_identifier_token"},
+        {"path": "src/long_body.py", "symbol": "long_fn", "type": "function", "line": 1,
+         "context": "x" * 1500 + " truncated_scan_token"},
+        {"path": "src/ÜberTreiber.py", "symbol": "Straße_init", "type": "function", "line": 5,
+         "comments": "# 中文註解:初始化 uart", "context": "def Straße_init():\n    uart_init()"},
+        {"path": "src/hal/UARTRegs.py", "symbol": "UARTRegs", "type": "class", "line": 12,
+         "context": "class UARTRegs:\n    BAUD = 0x10"},
+    ]
+
+
+_LEXICAL_TOKEN_SETS = (
+    {"UART", "uart", "Uart", "baud", "init"},          # 大小寫重複:逐 token 計次
+    {"uart", "baud", "init"},
+    {"uart_init", "UART_INIT", "UARTRegs"},             # exact symbol(兩種大小寫都 exact)
+    {"kick", "watchdog", "WatchdogTimer", "KICK_MAGIC"},  # symbol / path stem / parent / context
+    {"late_identifier_token", "pad005"},                # identifier 上限
+    {"truncated_scan_token", "long"},                   # 掃描字數上限
+    {"straße_init", "Straße_init", "treiber", "中文註解"},  # Unicode
+    {"dma_irq_handler", "DMA_STATUS_ABORT", "watchdog_kick", "internal"},
+    {"", "id", "if"},                                   # 空字串(= 空 / 缺 symbol)、兩字元 token
+    {"nothing_matches_here"},
+    set(),
+)
+
+
+def _lexical_rag(tmp_path: Path) -> code_rag.CodeRAG:
+    rag = code_rag.CodeRAG(str(tmp_path))
+    rag.index = _lexical_fixture_items()
+    return rag
+
+
+def _hex_scores(scores) -> list[str]:
+    assert all(type(score) is float for score in scores)
+    return [score.hex() for score in scores]
+
+
+def _reference_lexical(rag, tokens) -> tuple[list[float], list[int]]:
+    """參考答案:query_ranked 原本的逐筆迴圈(每筆 _token_match_score + explicit 判定)。"""
+    lowered = {token.lower() for token in tokens}
+    scores, explicit = [], []
+    for position, item in enumerate(rag.index):
+        scores.append(rag._token_match_score(tokens, item))
+        symbol_lower = item.get("symbol", "").lower()
+        if symbol_lower and symbol_lower in lowered:
+            explicit.append(position)
+    return scores, explicit
+
+
+def _count_lexical_tokenization(monkeypatch, rag, key) -> list:
+    """記錄倒排索引為哪些 item 重新斷詞(_lexical_entry 只有建索引時會呼叫)。"""
+    calls: list = []
+    real_entry = rag._lexical_entry
+
+    def counting_entry(item, knobs, vocab):
+        calls.append(key(item, knobs))
+        return real_entry(item, knobs, vocab)
+
+    monkeypatch.setattr(rag, "_lexical_entry", counting_entry)
+    return calls
+
+
+@pytest.mark.smoke
+def test_lexical_postings_match_the_per_item_reference_bit_for_bit(tmp_path: Path):
+    """每一筆 kw_score 都與逐筆 _token_match_score 逐位元相同(比 float.hex,不是近似);
+    explicit_indices 與舊迴圈相同、依索引遞增。"""
+    rag = _lexical_rag(tmp_path)
+    token_sets = [
+        rag._extract_code_tokens(
+            "How does UART_Init call uart_set_baud for the Uart baud_rate in drv/Uart.py?"
+        ),
+        *_LEXICAL_TOKEN_SETS,
+    ]
+    seen: list[float] = []
+    for tokens in token_sets:
+        scores, explicit = rag._lexical_scores(tokens)
+        expected, expected_explicit = _reference_lexical(rag, tokens)
+        assert _hex_scores(scores) == _hex_scores(expected), sorted(tokens)
+        assert explicit == expected_explicit, sorted(tokens)
+        seen.extend(expected)
+
+    # 前提:fixture 真的走到各個分支,不是一片 0
+    assert 1.0 in seen and 0.0 in seen
+    assert any(0.0 < score < 1.0 for score in seen)
+    duplicated, folded = (_reference_lexical(rag, tokens)[0] for tokens in _LEXICAL_TOKEN_SETS[:2])
+    assert duplicated != folded, "前提:大小寫重複的 token 必須影響分數(逐 token 計次)"
+
+
+@pytest.mark.smoke
+def test_lexical_budget_changes_after_build_retokenize_and_match_the_reference(
+        monkeypatch, tmp_path: Path):
+    """Astra P3:profile 快取的有效性含兩個預算。建好索引之後把預算各自調高 / 調低,
+    分數必須等於未快取的逐筆路徑,而且真的重新斷詞(不是沿用舊預算的 token)。"""
+    rag = _lexical_rag(tmp_path)
+    tokens = {"late_identifier_token", "truncated_scan_token", "pad003", "uart", "watchdog_kick"}
+    tokenized = _count_lexical_tokenization(monkeypatch, rag, lambda item, knobs: knobs)
+
+    baseline = rag._lexical_scores(tokens)[0]
+    assert _hex_scores(baseline) == _hex_scores(_reference_lexical(rag, tokens)[0])
+    assert len(tokenized) == len(rag.index)
+    tokenized.clear()
+    rag._lexical_scores(tokens)
+    assert tokenized == [], "同一份 index、同一組預算:不得重新斷詞"
+
+    for name, (lower, higher) in (("CODE_RAG_LEXICAL_SCAN_MAX_CHARS", (40, 5000)),
+                                  ("CODE_RAG_LEXICAL_MAX_IDENTIFIERS", (2, 500))):
+        default = getattr(config, name)
+        results = {}
+        for value in (lower, higher, default):
+            monkeypatch.setattr(config, name, value)
+            tokenized.clear()
+            scores = rag._lexical_scores(tokens)[0]
+            assert _hex_scores(scores) == _hex_scores(_reference_lexical(rag, tokens)[0]), (
+                name, value)
+            assert len(tokenized) == len(rag.index), f"{name}={value}:預算改了就要全部重新斷詞"
+            results[value] = scores
+        assert results[lower] != results[default] != results[higher], (
+            f"前提:{name} 調高 / 調低都要改變分數,否則這條驗不到舊 profile 被沿用"
+        )
+
+
+@pytest.mark.smoke
+def test_incremental_build_tokenizes_only_the_new_symbols(monkeypatch, tmp_path: Path):
+    """build_index 每次都從磁碟重載 per-file cache,沒變的 symbol 重建後是新的 dict ——
+    profile 依詞彙內容沿用:增量 build 後只為新進來的 symbol 斷詞,刪檔不必重新斷詞,
+    已不在 index 的 profile 跟著丟掉;分數照樣等於逐筆版。"""
+    for i in range(3):
+        (tmp_path / f"mod_{i}.py").write_text(
+            "".join(f"def func_{i}_{j}():\n    return {j}\n\n" for j in range(3)),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(config, "CODE_RAG_REFRESH_TTL_SECONDS", 0)  # 每次查詢都 fresh 掃描
+    monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", False)
+    monkeypatch.setattr(code_rag, "USE_RERANKER", False)
+    rag = code_rag.CodeRAG(str(tmp_path))
+    monkeypatch.setattr(rag, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(rag, "_embed_texts_batched", lambda texts: [[1.0, 0.0]] * len(texts))
+    tokenized = _count_lexical_tokenization(monkeypatch, rag, lambda item, knobs: item["symbol"])
+
+    rag.query("func_0_1 helper", top_k=3)
+    assert len(rag.index) == 9
+    assert sorted(tokenized) == sorted(item["symbol"] for item in rag.index)
+
+    tokenized.clear()
+    (tmp_path / "mod_new.py").write_text(
+        "def brand_new_symbol():\n    return 1\n\ndef second_new_symbol():\n    return 2\n",
+        encoding="utf-8",
+    )
+    rag.query("brand_new_symbol func_1_2", top_k=3)
+    assert len(rag.index) == 11
+    assert sorted(tokenized) == ["brand_new_symbol", "second_new_symbol"]
+
+    tokens = rag._extract_code_tokens("brand_new_symbol func_1_2 second")
+    scores, explicit = rag._lexical_scores(tokens)
+    expected, expected_explicit = _reference_lexical(rag, tokens)
+    assert _hex_scores(scores) == _hex_scores(expected)
+    assert explicit == expected_explicit
+
+    tokenized.clear()
+    (tmp_path / "mod_2.py").unlink()
+    rag.query("func_0_1", top_k=3)
+    assert tokenized == []
+    assert len(rag._lexical_profiles[1]) == len(rag.index) == 8
+
+
+def _text_vector(text: str, dim: int = 8) -> list[float]:
+    """每段文字一個可辨識的單位向量(與 test_code_rag_index 的 _distinct_vec 同一做法)。"""
+    h = zlib.crc32(text.encode("utf-8"))
+    raw = [((h >> (3 * k)) & 7) + 1 for k in range(dim)]
+    norm = math.sqrt(sum(v * v for v in raw))
+    return [v / norm for v in raw]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("lazy", [False, True])
+def test_query_ranked_results_equal_the_per_item_lexical_path(monkeypatch, tmp_path: Path, lazy):
+    """「查詢結果完全一致」:同一份 index、同一題,倒排索引路徑與逐筆路徑的名次、combined /
+    final 分數(逐位元)、trace,以及 lazy 補 embedding 的順序(cand_set 由 explicit_indices
+    與 kw_scores 決定)都相同。"""
+    monkeypatch.setattr(code_rag, "USE_RERANKER", False)
+    question = "How does UART_Init call uart_init and watchdog_kick in dma_irq_handler?"
+    runs = []
+    for use_reference in (False, True):
+        rag = _lexical_rag(tmp_path)
+        if not lazy:
+            for item in rag.index:
+                item["embedding"] = _text_vector(code_rag.render_semantic_fields(item, 400))
+        rag._lazy_embed = lazy
+        rag._lazy_embed_top_k = 3
+        embedded: list[str] = []
+
+        def fake_embedding(text, embedded=embedded):
+            embedded.append(text)
+            return _text_vector(text)
+
+        monkeypatch.setattr(rag, "_get_embedding", fake_embedding)
+        if use_reference:
+            monkeypatch.setattr(rag, "_lexical_scores",
+                                lambda tokens, rag=rag: _reference_lexical(rag, tokens))
+        trace: dict = {}
+        ranked = rag.query_ranked(question, top_k=5, trace=trace)
+        position = {id(item): i for i, item in enumerate(rag.index)}
+        runs.append((
+            [(position[id(rc.item)], float(rc.combined_score).hex(), float(rc.final_score).hex(),
+              rc.rerank_score, rc.score_source) for rc in ranked],
+            trace,
+            embedded,
+        ))
+    assert runs[0][0], "前提:這題要有結果"
+    assert runs[0] == runs[1]
+
+
+@pytest.mark.smoke
+def test_lexical_profile_reads_only_the_fields_of_its_reuse_key(tmp_path: Path):
+    """profile 依 _lexical_content_key(CANONICAL_SEMANTIC_FIELDS 的原值)跨 build 沿用。
+    斷詞若讀了 key 以外的欄位,那個欄位改了而 key 沒變時就會無聲沿用舊 token。"""
+
+    class RecordingItem(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.read: set = set()
+
+        def get(self, key, default=None):
+            self.read.add(key)
+            return super().get(key, default)
+
+        def __getitem__(self, key):
+            self.read.add(key)
+            return super().__getitem__(key)
+
+        def __contains__(self, key):
+            self.read.add(key)
+            return super().__contains__(key)
+
+        def __iter__(self):
+            self.read.add("<iter>")
+            return super().__iter__()
+
+        def keys(self):
+            self.read.add("<keys>")
+            return super().keys()
+
+        def items(self):
+            self.read.add("<items>")
+            return super().items()
+
+        def values(self):
+            self.read.add("<values>")
+            return super().values()
+
+    item = RecordingItem({field: f"{field}_value {field.upper()}Token"
+                          for field in code_rag.CANONICAL_SEMANTIC_FIELDS})
+    item.update({"line": 3, "end_line": 9, "qualified_name": "q", "backend": "python-ast",
+                 "storage_class": "static", "build_state": "active", "embedding": [1.0, 0.0]})
+    rag = code_rag.CodeRAG(str(tmp_path))
+    rag._lexical_profile(item, (config.CODE_RAG_LEXICAL_SCAN_MAX_CHARS,
+                                config.CODE_RAG_LEXICAL_MAX_IDENTIFIERS))
+    assert item.read, "前提:記錄要真的收到存取"
+    assert item.read <= set(code_rag.CANONICAL_SEMANTIC_FIELDS), sorted(item.read)

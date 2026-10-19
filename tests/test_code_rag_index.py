@@ -27,6 +27,9 @@
   比 ``CODE_EXTENSIONS`` 還窄,連 ``.cc`` / ``.cxx`` / ``.pyi`` / ``.mk`` / ``.cmake`` /
   ``.tcl`` 這些既有格式都搜不到,而且沒有任何測試會因此變紅。同時鎖住 Level 1 的承諾邊界:
   新檔案類型只保證 grep / search 找得到,不保證進 dense symbol retrieval;宣稱過頭跟漏做一樣糟。
+- 2026-10-19 速度優化 #6 / #7:fresh 掃描的 stat 指紋(指紋沒變、時間戳早於 racy 視窗才沿用
+  md5;同大小改寫 + mtime 還原、換 inode、太新的檔都要重讀),以及 NPZ 還原不 tolist、存檔
+  不壓縮(dense 矩陣與舊路徑逐位元相同、lazy 列仍是純 Python float、舊的壓縮 NPZ 照常可載)。
 
 smoke:本檔不用 module 層 pytestmark,逐條標記。原 dense_cache 與 file_kind_policy 是整檔
 smoke,折進來後每一條各自帶 @pytest.mark.smoke;其餘照原本的逐條標記。
@@ -38,10 +41,13 @@ smoke,折進來後每一條各自帶 @pytest.mark.smoke;其餘照原本的逐條
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import math
 import os
 import sys
+import time
+import zipfile
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -216,7 +222,8 @@ def test_save_cache_failure_raises(monkeypatch, tmp_path):
     def broken_savez(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(code_rag.np, "savez_compressed", broken_savez)
+    # _save_cache 改用不壓縮的 np.savez(float32 向量壓不太動,壓縮只多付 CPU)
+    monkeypatch.setattr(code_rag.np, "savez", broken_savez)
     with pytest.raises(OSError, match="disk full"):
         rag._save_cache()
 
@@ -569,6 +576,199 @@ def test_large_file_size_change_changes_hash(tmp_path: Path):
 def test_missing_file_returns_empty_hash(tmp_path: Path):
     idx = _new_indexer(tmp_path)
     assert idx._compute_file_hash(tmp_path / "no_such_file.py") == ""
+
+
+# --------------------------------------------------------------------------
+# fresh 掃描的 stat 指紋(速度優化 #6):(dev, ino, size, mtime_ns, ctime_ns) 沒變、
+# 而且早就穩定的小檔才沿用上一次的內容 md5。漏偵測是無聲的 —— 索引照舊、答案過期,
+# 沒有任何錯誤訊息 —— 所以每一種「內容變了」都要逼出一次重讀。
+# --------------------------------------------------------------------------
+def _files_count_as_old(monkeypatch) -> None:
+    """測試裡改不回 ctime(建立 / 改寫 / utime 都把它設成「現在」):把 racy 截止點移到
+    一小時之後,等同這次掃描發生在檔案最後變動的一小時之後。"""
+    monkeypatch.setattr(code_rag, "_SCAN_RACY_WINDOW_NS", -3600 * 10**9)
+
+
+def _trust_device_of(monkeypatch, path: Path) -> None:
+    """不依賴測試機 /tmp 掛的是哪種檔案系統:把 path 所在裝置當成 ctime 可信的裝置。
+    白名單本身由 test_stat_fingerprint_is_trusted_only_on_change_time_filesystems 守。"""
+    device = os.stat(path).st_dev
+    monkeypatch.setattr(code_rag, "_ctime_trusted_devices", lambda: frozenset({device}))
+
+
+def _count_content_reads(monkeypatch) -> list[str]:
+    """記錄真的去讀內容(compute_file_hash)的檔名。"""
+    reads: list[str] = []
+    real = code_rag.compute_file_hash
+
+    def counting(filepath, max_bytes=code_rag.CONTENT_HASH_MAX_BYTES):
+        reads.append(Path(filepath).name)
+        return real(filepath, max_bytes)
+
+    monkeypatch.setattr(code_rag, "compute_file_hash", counting)
+    return reads
+
+
+def _fresh_scan_hashes(rag: CodeRAG) -> dict[str, str]:
+    return {rel: info["hash"] for rel, info in rag._scan_code_files(force_refresh=True).items()}
+
+
+def _rewrite_keeping_size_and_mtime(path: Path, data: bytes) -> None:
+    """同大小改寫再把 mtime 改回去(rsync -t / cp -p / touch -r 的效果),只剩 ctime 不同。
+    ctime 有粒度,同一個 tick 內改寫看不出來,所以重做到它前進為止(上限 5 秒)。"""
+    before = os.stat(path)
+    assert len(data) == before.st_size
+    deadline = time.monotonic() + 5.0
+    while True:
+        path.write_bytes(data)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = os.stat(path)
+        if after.st_ctime_ns != before.st_ctime_ns or time.monotonic() > deadline:
+            break
+        time.sleep(0.01)
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino, before.st_size, before.st_mtime_ns)
+    if after.st_ctime_ns == before.st_ctime_ns:
+        # production 不會信任這種檔案系統(_CTIME_TRUSTED_FILESYSTEMS);這裡只是測試機的
+        # tmp 剛好掛在上面,前提不成立就不是這條要驗的東西。
+        pytest.skip("tmp 所在的檔案系統改寫後 ctime 不前進")
+
+
+_POSIX_STAT_FINGERPRINT = pytest.mark.skipif(
+    os.name != "posix", reason="stat 指紋依賴 POSIX 的 ctime 語意(Windows 的 st_ctime 是建立時間)"
+)
+
+
+@pytest.mark.smoke
+@_POSIX_STAT_FINGERPRINT
+def test_fresh_scan_reuses_md5_only_for_stable_unchanged_files(monkeypatch, tmp_path: Path):
+    """穩定舊檔第二次 fresh 掃描不讀內容,沿用的 hash 與 compute_file_hash 逐字相同;
+    每次 fresh 掃描後只留這次走訪到的路徑。"""
+    (tmp_path / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+    _files_count_as_old(monkeypatch)
+    _trust_device_of(monkeypatch, tmp_path)
+    reads = _count_content_reads(monkeypatch)
+    rag = CodeRAG(str(tmp_path))
+
+    first = _fresh_scan_hashes(rag)
+    assert sorted(reads) == ["a.py", "b.py"]
+    assert first["a.py"] == hashlib.md5((tmp_path / "a.py").read_bytes()).hexdigest()
+
+    reads.clear()
+    assert _fresh_scan_hashes(rag) == first
+    assert reads == [], "stat 指紋沒變的穩定舊檔,第二次 fresh 掃描不該再讀內容"
+
+    (tmp_path / "b.py").unlink()
+    assert set(_fresh_scan_hashes(rag)) == {"a.py"}
+    assert set(rag._hash_memo) == {"a.py"}, "刪掉的檔不得留在指紋表裡"
+
+
+@pytest.mark.smoke
+@_POSIX_STAT_FINGERPRINT
+def test_same_size_rewrite_with_restored_mtime_is_detected(monkeypatch, tmp_path: Path):
+    """size、mtime、inode 全部一樣,只有 ctime 變了 —— 仍必須重讀(指紋要含 ctime)。"""
+    target = tmp_path / "a.py"
+    target.write_bytes(b"def a():\n    return 1\n")
+    _files_count_as_old(monkeypatch)
+    _trust_device_of(monkeypatch, tmp_path)
+    rag = CodeRAG(str(tmp_path))
+    old_hash = _fresh_scan_hashes(rag)["a.py"]
+    assert "a.py" in rag._hash_memo, "前提:這個檔必須已經進 stat 指紋表"
+
+    _rewrite_keeping_size_and_mtime(target, b"def a():\n    return 2\n")
+    reads = _count_content_reads(monkeypatch)
+    new_hash = _fresh_scan_hashes(rag)["a.py"]
+    assert reads == ["a.py"]
+    assert new_hash == hashlib.md5(target.read_bytes()).hexdigest()
+    assert new_hash != old_hash
+
+
+@pytest.mark.smoke
+def test_racy_recent_file_is_reread_by_the_next_fresh_scan(monkeypatch, tmp_path: Path):
+    """時間戳落在 racy 視窗內的檔不記指紋:同一個時間戳內的第二次改寫(size 不變)
+    stat 看不出來,只有讀內容看得出來。"""
+    assert code_rag._SCAN_RACY_WINDOW_NS >= 2 * 10**9, (
+        "racy 視窗只能放大;縮小會讓粗粒度時間戳下的同 tick 改寫被 stat 指紋蓋掉"
+    )
+    target = tmp_path / "a.py"
+    target.write_bytes(b"def a():\n    return 1\n")
+    # 視窗放大到 10 分鐘:剛寫好的檔一定在視窗內,不受測試機負載(停頓)影響。裝置設成
+    # 可信任:否則指紋表本來就不會記,這條就驗不到 racy 規則。
+    monkeypatch.setattr(code_rag, "_SCAN_RACY_WINDOW_NS", 600 * 10**9)
+    _trust_device_of(monkeypatch, tmp_path)
+    reads = _count_content_reads(monkeypatch)
+    rag = CodeRAG(str(tmp_path))
+
+    first = _fresh_scan_hashes(rag)
+    assert "a.py" not in rag._hash_memo
+    reads.clear()
+    assert _fresh_scan_hashes(rag) == first
+    assert reads == ["a.py"], "時間戳太新的檔,下一次 fresh 掃描必須照舊讀內容"
+
+
+@pytest.mark.smoke
+@_POSIX_STAT_FINGERPRINT
+def test_atomic_replace_with_equal_size_and_mtime_is_detected(monkeypatch, tmp_path: Path):
+    """編輯器的原子寫入(暫存檔 + rename)換 inode;size 與 mtime 都一樣也要重讀。"""
+    target = tmp_path / "a.py"
+    target.write_bytes(b"def a():\n    return 1\n")
+    _files_count_as_old(monkeypatch)
+    _trust_device_of(monkeypatch, tmp_path)
+    rag = CodeRAG(str(tmp_path))
+    old_hash = _fresh_scan_hashes(rag)["a.py"]
+    assert "a.py" in rag._hash_memo, "前提:這個檔必須已經進 stat 指紋表"
+
+    before = os.stat(target)
+    staged = tmp_path / "a.py.swap"
+    staged.write_bytes(b"def a():\n    return 9\n")
+    os.utime(staged, ns=(before.st_atime_ns, before.st_mtime_ns))
+    os.replace(staged, target)
+    after = os.stat(target)
+    assert after.st_ino != before.st_ino
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+    reads = _count_content_reads(monkeypatch)
+    new_hash = _fresh_scan_hashes(rag)["a.py"]
+    assert reads == ["a.py"]
+    assert new_hash == hashlib.md5(target.read_bytes()).hexdigest()
+    assert new_hash != old_hash
+
+
+@pytest.mark.smoke
+@_POSIX_STAT_FINGERPRINT
+def test_stat_fingerprint_is_trusted_only_on_change_time_filesystems(monkeypatch, tmp_path: Path):
+    """stat 指紋的前提是檔案系統如實維護 ctime、stat 不回快取的舊值。vfat / exFAT(ctime
+    跟著 mtime 被 touch -r 改回去)、NFS(屬性快取)、FUSE / overlay / SMB 都不成立 ——
+    那些裝置上命中舊指紋就是無聲的過期索引,所以只能照舊每次讀內容。"""
+    mountinfo = "\n".join([
+        "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw",
+        "23 22 0:47 / /tmp rw,nosuid,nodev shared:2 - tmpfs tmpfs rw,size=8g",
+        "24 22 8:33 / /srv/xfs rw,relatime - xfs /dev/sdc1 rw",
+        "25 22 0:52 /@home /home rw,relatime shared:3 - btrfs /dev/sdd1 rw,subvol=/@home",
+        "30 22 0:60 / /mnt/nfs rw,relatime shared:9 - nfs4 server:/export rw,vers=4.2",
+        "31 22 8:17 / /media/usb rw,relatime - vfat /dev/sdb1 rw,fmask=0022",
+        "32 22 8:18 / /media/ex rw,relatime - exfat /dev/sdb2 rw",
+        "33 22 0:61 / /mnt/sshfs rw - fuse.sshfs host:/ rw,user_id=1000",
+        "34 22 0:62 / /var/lib/docker/overlay2/x/merged rw - overlay overlay rw,lowerdir=/l",
+        "35 22 0:63 / /mnt/smb rw - cifs //host/share rw",
+        "this line has no separator",
+        "36 22 notadevice / /broken rw - ext4 /dev/sdz rw",
+    ])
+    assert code_rag._parse_ctime_trusted_devices(mountinfo) == {
+        os.makedev(8, 2), os.makedev(0, 47), os.makedev(8, 33), os.makedev(0, 52),
+    }
+
+    # 檔案不在可信任的裝置上:就算時間戳早就穩定,每次 fresh 掃描都要讀內容,也不記指紋
+    (tmp_path / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    _files_count_as_old(monkeypatch)
+    monkeypatch.setattr(code_rag, "_ctime_trusted_devices", lambda: frozenset())
+    reads = _count_content_reads(monkeypatch)
+    rag = CodeRAG(str(tmp_path))
+    first = _fresh_scan_hashes(rag)
+    assert _fresh_scan_hashes(rag) == first
+    assert reads == ["a.py", "a.py"]
+    assert rag._hash_memo == {}
 
 
 # --------------------------------------------------------------------------
@@ -1074,6 +1274,134 @@ def test_npz_restore_keeps_one_row_per_symbol_when_keys_collide(monkeypatch, tmp
     assert got[1] == pytest.approx(rows[1]), (
         "第 1 筆被同鍵的第 0 筆覆蓋 —— key 查表把兩個不同符號壓成同一個向量"
     )
+
+
+# ============================================================
+# 速度優化 #7:NPZ 還原不 tolist(float32 view)、build 一次 stack、存檔不壓縮。
+# 換的只是做法:dense 矩陣必須與舊路徑逐位元相同,lazy 分支仍是純 Python float。
+# ============================================================
+def _tolist_path_matrix(rows):
+    """舊路徑:每列先 tolist 成 Python float,再 np.array(float32) + 同一個 L2 normalize。"""
+    import numpy as np
+
+    plain = [row.tolist() if isinstance(row, np.ndarray) else row for row in rows]
+    matrix = np.array(plain, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms > 0, norms, 1.0)
+    return matrix / norms
+
+
+@pytest.mark.smoke
+def test_npz_restore_builds_the_same_matrix_bits_as_the_tolist_path(monkeypatch, tmp_path):
+    """沒變的檔用 NPZ 還原的 float32 view、新檔用 backfill 的 Python list,混在一起
+    stack 出來的 dense 矩陣必須與「全部 tolist 再轉回來」的舊路徑逐位元相同。"""
+    import numpy as np
+
+    root = _make_dense_repo(tmp_path)
+    seed = _rag_distinct(monkeypatch, root)
+    seed.build_index(verbose=False)
+    seed._materialize_dense_index()
+    (root / "mod_new.py").write_text(
+        "def only_one_new_symbol():\n    return 1\n", encoding="utf-8"
+    )
+
+    reloaded = _rag_distinct(monkeypatch, root)
+    reloaded.build_index(verbose=False)
+    assert reloaded._lazy_embed is False and reloaded.embeddings is not None
+    rows = [row for cached in reloaded._file_cache.values() for row in cached["embeddings"]]
+    assert len(rows) == len(reloaded.index)
+    assert any(isinstance(row, np.ndarray) for row in rows), "前提:沒變的檔要走 NPZ view"
+    assert any(isinstance(row, list) for row in rows), "前提:新檔要走 backfill 的 list"
+
+    expected = _tolist_path_matrix(rows)
+    assert reloaded.embeddings.dtype == expected.dtype
+    assert reloaded.embeddings.shape == expected.shape
+    assert reloaded.embeddings.tobytes() == expected.tobytes()
+
+
+@pytest.mark.smoke
+def test_saved_npz_is_uncompressed_and_reloads_through_the_same_validation(monkeypatch, tmp_path):
+    """存檔改 np.savez:成員是 ZIP_STORED,md5 / row_count 照舊寫進 meta,載回來的列
+    與存進去的矩陣逐位元相同。"""
+    import numpy as np
+
+    root = _make_dense_repo(tmp_path)
+    seed = _dense_seed(monkeypatch, root)
+    with zipfile.ZipFile(seed.cache_emb_file) as archive:
+        members = archive.infolist()
+    assert members and all(info.compress_type == zipfile.ZIP_STORED for info in members)
+
+    meta = json.loads(seed.cache_meta_file.read_text(encoding="utf-8"))
+    assert meta["npz_md5"] == hashlib.md5(seed.cache_emb_file.read_bytes()).hexdigest()
+    assert meta["row_count"] == len(seed.index)
+
+    restored = _rag(monkeypatch, root)._load_file_cache()
+    assert restored, "同一套驗證(schema / identity / md5 / row_count)要放行"
+    rows = [row for cached in restored.values() for row in cached["embeddings"]]
+    assert np.array(rows, dtype=np.float32).tobytes() == seed.embeddings.tobytes()
+
+
+@pytest.mark.smoke
+def test_previous_generation_compressed_npz_still_loads(monkeypatch, tmp_path):
+    """舊版存的是 savez_compressed:換存檔格式不得讓既有 cache 失效(大樹重建要 55 分鐘)。"""
+    import numpy as np
+
+    root = _make_dense_repo(tmp_path)
+    seed = _rag_distinct(monkeypatch, root)
+    seed.build_index(verbose=False)
+    seed._materialize_dense_index()
+    stored = seed.embeddings.copy()
+    np.savez_compressed(seed.cache_emb_file, embeddings=stored)
+    with zipfile.ZipFile(seed.cache_emb_file) as archive:
+        assert all(info.compress_type == zipfile.ZIP_DEFLATED for info in archive.infolist())
+    meta = json.loads(seed.cache_meta_file.read_text(encoding="utf-8"))
+    meta["npz_md5"] = hashlib.md5(seed.cache_emb_file.read_bytes()).hexdigest()
+    seed.cache_meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    legacy = _rag_distinct(monkeypatch, root)
+    legacy.build_index(verbose=False)
+    assert legacy._lazy_embed is False and legacy.embeddings is not None
+    assert legacy.embeddings.tobytes() == _tolist_path_matrix(list(stored)).tobytes()
+
+
+@pytest.mark.smoke
+def test_lazy_build_turns_npz_rows_back_into_python_float_lists(monkeypatch, tmp_path):
+    """lazy 分支逐列以純 Python float64 計分,存檔時還會把 per-file cache 寫成 JSON。
+    NPZ 還原的 float32 view 留到這裡的話:Python float 乘 np.float32 會變成 float32
+    運算,分數無聲改變;寫 JSON 則直接失敗。"""
+    import numpy as np
+
+    root = _make_dense_repo(tmp_path)
+    seed = _rag_distinct(monkeypatch, root)          # lazy 門檻 1
+    seed.build_index(verbose=False)
+    seed._materialize_dense_index()                  # dense,向量進 .npz
+    with np.load(seed.cache_emb_file) as data:
+        stored = data["embeddings"].tolist()
+    stored_by_key = {(item["path"], item["symbol"], item["line"]): row
+                     for item, row in zip(seed.index, stored)}
+
+    (root / "mod_new.py").write_text(
+        "def new_symbol_a():\n    return 1\n\ndef new_symbol_b():\n    return 2\n",
+        encoding="utf-8",
+    )
+    second = _rag_distinct(monkeypatch, root)        # 缺 2 個向量 > 門檻 1 → lazy
+    second.build_index(verbose=False)
+    assert second._lazy_embed is True and second.embeddings is None
+
+    carried = [item for item in second.index if "embedding" in item]
+    assert len(carried) == len(seed.index), "前提:沒變的檔帶著 NPZ 還原的向量進 lazy"
+    for item in carried:
+        vector = item["embedding"]
+        assert type(vector) is list and all(type(value) is float for value in vector)
+        assert vector == stored_by_key[(item["path"], item["symbol"], item["line"])]
+    for cached in second._file_cache.values():
+        assert not any(isinstance(row, np.ndarray) for row in cached["embeddings"])
+
+    meta = json.loads(second.cache_meta_file.read_text(encoding="utf-8"))
+    assert meta["npz_md5"] is None, "lazy 存檔走 JSON,不寫 .npz"
+    persisted = [row for cached in meta["file_cache"].values()
+                 for row in cached["embeddings"] if row]
+    assert sorted(map(tuple, persisted)) == sorted(map(tuple, stored))
 
 
 # ── 原 test_index_scope.py:索引範圍(成員資格 / 三態剪枝 / Layer C loader / 快取遷移 / index_stats) ──
@@ -2047,11 +2375,12 @@ def test_dense_rebuild_backfills_lazy_embedding_holes(tree, monkeypatch, clean_s
     assert calls, "空洞應該被補算"
 
     # 快取要被修好,否則重啟又炸一次
+    # (loader 從 .npz 還原的列是 float32 ndarray view,不能拿來做 truthiness → 看長度)
     persisted = _persisted_embeddings(rag)
     assert persisted, "持久化的快取讀不回來"
     holes_left = [
         rel for rel, entry in persisted.items()
-        for emb in entry["embeddings"] if not emb
+        for emb in entry["embeddings"] if len(emb) == 0
     ]
     assert not holes_left, f"快取仍留著空 embedding: {sorted(set(holes_left))}"
 
@@ -2225,7 +2554,7 @@ def test_backfill_failure_leaves_no_partial_index(tree, monkeypatch, clean_scan_
     assert persisted, "持久化的快取讀不回來"
     assert not [
         rel for rel, entry in persisted.items()
-        for emb in entry["embeddings"] if not emb
+        for emb in entry["embeddings"] if len(emb) == 0
     ]
 
 

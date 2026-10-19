@@ -211,7 +211,11 @@ def _read(fd, name):
         os.close(handle)
 
 
-def _atomic(fd, name, data):
+def _install(fd, name, data):
+    """Write one private file to a fresh temporary name, fsync it, rename it.
+
+    The rename becomes durable only after the caller fsyncs the directory.
+    """
     if len(data) > MAX_BYTES:
         raise CheckpointError("checkpoint exceeds its own bounded reader")
     try:
@@ -235,11 +239,31 @@ def _atomic(fd, name, data):
             remaining = remaining[count:]
         os.fsync(handle)
         os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
-        os.fsync(fd)
     finally:
         os.close(handle)
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temporary, dir_fd=fd)
+
+
+def _atomic(fd, name, data):
+    _install(fd, name, data)
+    os.fsync(fd)
+
+
+def _atomic_many(fd, items):
+    """Durably install several files with one directory fsync.
+
+    Each file still goes temporary -> write -> fsync -> rename exactly like
+    _atomic; the directory is fsynced once after the last rename. Nothing may
+    reference these files before this returns.
+    """
+    items = list(items)
+    if any(len(data) > MAX_BYTES for _name, data in items):
+        raise CheckpointError("checkpoint exceeds its own bounded reader")
+    for name, data in items:
+        _install(fd, name, data)
+    if items:
+        os.fsync(fd)
 
 
 def source_identity(path, root):
@@ -532,8 +556,24 @@ class IngestJob:
 
     def _store_unit(self, name, unit):
         """Publish an O(1)-sized unit delta after its payload is durable."""
-        self._validate_unit(name, unit)
-        if name not in self.state["units"] and len(self.state["units"]) >= MAX_UNITS:
+        self._store_units([(name, unit)])
+
+    def _store_units(self, entries):
+        """Publish ordered unit deltas with one journal fsync and one head.
+
+        Every record keeps its own sequence, previous link and checksum, so
+        replay reads them exactly like consecutive single-unit publications.
+        Payloads referenced by these units must already be durable.
+        """
+        entries = list(entries)
+        if not entries:
+            return
+        added = set()
+        for name, unit in entries:
+            self._validate_unit(name, unit)
+            if name not in self.state["units"]:
+                added.add(name)
+        if len(self.state["units"]) + len(added) > MAX_UNITS:
             raise CheckpointError("too many checkpoint units")
         head = self._journal_head
         log_name, head_name = self._journal_names(head)
@@ -542,12 +582,18 @@ class IngestJob:
         if ((info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)
                 or info.st_size != head["offset"] or _decode(_read(self.fd, head_name)) != head):
             raise CheckpointError("checkpoint journal changed outside the active runner")
-        record = {"sequence": head["sequence"] + 1, "previous": head["digest"],
-                  "name": name, "unit": unit}
-        checksum = digest(record)
-        raw = _bytes({"record": record, "sha256": checksum}) + b"\n"
-        if len(raw) > MAX_BYTES or head["offset"] + len(raw) > MAX_JOURNAL_BYTES:
-            raise CheckpointError("checkpoint journal exceeds its bounded reader")
+        sequence, checksum, lines, size = head["sequence"], head["digest"], [], 0
+        for name, unit in entries:
+            record = {"sequence": sequence + 1, "previous": checksum,
+                      "name": name, "unit": unit}
+            checksum = digest(record)
+            line = _bytes({"record": record, "sha256": checksum}) + b"\n"
+            size += len(line)
+            if len(line) > MAX_BYTES or head["offset"] + size > MAX_JOURNAL_BYTES:
+                raise CheckpointError("checkpoint journal exceeds its bounded reader")
+            lines.append(line)
+            sequence = record["sequence"]
+        raw = b"".join(lines)
         os.lseek(self._journal_fd, head["offset"], os.SEEK_SET)
         remaining = memoryview(raw)
         while remaining:
@@ -556,7 +602,7 @@ class IngestJob:
                 raise CheckpointError("short checkpoint journal write")
             remaining = remaining[count:]
         os.fsync(self._journal_fd)
-        published = {**head, "sequence": record["sequence"],
+        published = {**head, "sequence": sequence,
                      "offset": head["offset"] + len(raw), "digest": checksum}
         try:
             _atomic(self.fd, head_name, _bytes(published))
@@ -573,9 +619,10 @@ class IngestJob:
         # This order is interruption-safe: a snapshot must never advance its
         # watermark beyond units already installed in memory. If interrupted
         # before these assignments, recovery still reads the published delta.
-        self.state["units"][name] = unit
+        for name, unit in entries:
+            self.state["units"][name] = unit
         self._journal_head = published
-        if name.startswith("document/"):
+        if any(name.startswith("document/") for name, _unit in entries):
             self._flush()
 
     def _flush(self):
@@ -648,16 +695,39 @@ class IngestJob:
         return envelope["payload"]
 
     def start(self, name, fingerprint, *, page=0):
-        self._store_unit(name, {"state": "running", "fingerprint": fingerprint, "page": page})
+        self.start_many([(name, fingerprint)], page=page)
 
-    def put(self, name, fingerprint, payload, *, state="succeeded", page=0, reasons=()):
+    def start_many(self, entries, *, page=0):
+        """start() for several (name, fingerprint) units in one publication."""
+        self._store_units([(name, {"state": "running", "fingerprint": fingerprint, "page": page})
+                           for name, fingerprint in entries])
+
+    @staticmethod
+    def _prepared(name, fingerprint, payload, *, state, page, reasons):
+        """The payload file and unit record that put() and put_many() store."""
         if state not in _STATES:
             raise CheckpointError("invalid checkpoint state")
         raw = _bytes({"schema": UNIT_SCHEMA, "name": name, "fingerprint": fingerprint, "payload": payload})
         checksum = hashlib.sha256(raw).hexdigest()
-        _atomic(self.fd, checksum + ".json", raw)
-        self._store_unit(name, {"state": state, "fingerprint": fingerprint,
+        return (checksum + ".json", raw), (name, {"state": state, "fingerprint": fingerprint,
             "payload_sha256": checksum, "page": page, "reasons": list(reasons)})
+
+    def put(self, name, fingerprint, payload, *, state="succeeded", page=0, reasons=()):
+        (file_name, raw), unit = self._prepared(name, fingerprint, payload,
+                                                state=state, page=page, reasons=reasons)
+        _atomic(self.fd, file_name, raw)
+        self._store_unit(*unit)
+
+    def put_many(self, entries, *, page=0):
+        """put() for several (name, fingerprint, payload) succeeded units.
+
+        Every payload file is durable before the single journal publication
+        that references them.
+        """
+        prepared = [self._prepared(name, fingerprint, payload, state="succeeded", page=page, reasons=())
+                    for name, fingerprint, payload in entries]
+        _atomic_many(self.fd, [item for item, _unit in prepared])
+        self._store_units([unit for _item, unit in prepared])
 
     def fail(self, name, fingerprint, error, *, page=0):
         self._store_unit(name, {"state": "failed", "fingerprint": fingerprint,

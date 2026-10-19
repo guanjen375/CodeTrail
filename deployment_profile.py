@@ -81,6 +81,9 @@ _ROLE_PARAMETERS = {
         "threads",
         "fit",
         "fit_target",
+        # host RAM 的 prompt cache 上限(--cache-ram,與附屬服務同一驗證);省略 = llama.cpp
+        # 自己的預設(b10276 是 8192 MiB)。只給使用者手設:set_config 不寫,重跑保留使用者的值。
+        "cache_ram",
     },
     "embedding": _COMMON_PARAMETERS | {"embedding", "pooling", "cache_ram"},
     "reranker": _COMMON_PARAMETERS | {"embedding", "pooling", "reranking", "cache_ram"},

@@ -817,7 +817,9 @@ def test_gate_vectors_are_never_attached_to_chunks(tmp_path: Path):
 
     assert kb._gate_embeddings is not None
     assert all("embedding_gate" not in chunk for chunk in kb.chunks)
-    assert all(chunk.get("embedding") for chunk in kb.chunks)
+    # retrieval 向量用到才經 _chunk_vector 取 NPZ 對應列（不是 gate 列，也不掛回 chunk）
+    assert all("embedding" not in chunk for chunk in kb.chunks)
+    assert [kb._chunk_vector(chunk) for chunk in kb.chunks] == [[1.0, 0.0], [0.0, 1.0]]
 
 
 def test_remove_document_keeps_both_matrices_in_sync(tmp_path: Path, monkeypatch):

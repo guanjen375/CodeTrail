@@ -611,3 +611,141 @@ def test_headless_resumption_compacts_before_send_and_recovers_without_retry(
     if overflow:
         assert client_events.event_part(events[-1])["reason"] == "error"
         assert sum(event["type"] == "compaction" for event in events) == 2
+
+
+# ── 速度優化 #4:parallel tool call 能力進 EngineOptions 的兩條路 ──
+
+
+@pytest.mark.smoke
+def test_parallel_tool_calls_reach_engine_options_from_one_observation(tmp_path, monkeypatch):
+    """互動路徑取 preflight 觀測到的值,而且只認真的 True(替身沒有這個欄位 → False);
+    headless 沒有 preflight,`observe_main_server` 一次 /props 同時交出 n_ctx 與能力。
+
+    少接一條路,那個入口就靜默永遠不送 `parallel_tool_calls`;多觀測一次,兩個值就可能
+    出自不同時刻的 server。
+    """
+    import gpu_safety
+
+    args = codetrail_chat.build_parser().parse_args([])
+    for value, expected in ((True, True), ("true", False), (1, False), (False, False)):
+        preflight = types.SimpleNamespace(model="m", n_ctx=8192, parallel_tool_calls=value)
+        options = codetrail_chat._engine_options(tmp_path, args, preflight)
+        assert options.parallel_tool_calls is expected, value
+    legacy = types.SimpleNamespace(model="m", n_ctx=8192)
+    assert codetrail_chat._engine_options(tmp_path, args, legacy).parallel_tool_calls is False
+
+    queried: list[str] = []
+
+    def query(url):
+        queried.append(url)
+        return gpu_safety.ServerInfo(
+            base_url=url, n_ctx=65536,
+            raw_props={"chat_template_caps": {"supports_parallel_tool_calls": True}},
+        )
+
+    monkeypatch.setattr(gpu_safety, "query_server_info", query)
+    headless = codetrail_chat.build_parser().parse_args(["run", "--model", "m", "hi"])
+    options = codetrail_chat._engine_options(tmp_path, headless)
+    assert (options.n_ctx, options.parallel_tool_calls) == (65536, True)
+    assert queried == [codetrail_chat.config.LLAMA_BASE_URL]
+
+
+# ── 速度優化 #8:主 MCP 的第一次 spawn 只在互動啟動、憑 preflight 證據免重複探測 ──
+
+
+@pytest.mark.smoke
+def test_only_command_chat_hands_the_aux_preflight_evidence_to_the_main_mcp(tmp_path, monkeypatch):
+    """`command_chat` 只在 preflight 記下 `aux_preflight_passed` 時交 `aux_preflight_done=True`,
+    `_build` 也只在被要求時才把這個 kwarg 交給 `shared_client`(否則呼叫形狀與以前相同)。
+
+    憑證據而不是寫死:任何沒有真的通過附屬探測的啟動,主 MCP 都照常探測 —— 多帶一處
+    就是一個沒人探測過附屬 server 的 session,缺 reranker 要到第一個 RAG 問題才炸。
+    """
+    import client_config
+    import client_preflight
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(client_config, "apply_to_config", lambda *_a, **_k: None)
+    root = tmp_path / "project"
+    root.mkdir()
+    shared: list[dict] = []
+
+    def fake_shared(_root, **kwargs):
+        shared.append(dict(kwargs))
+        return _FakeMcpClient()
+
+    monkeypatch.setattr(client_mcp, "shared_client", fake_shared)
+    checks = types.SimpleNamespace(model="m", n_ctx=131072)
+    interactive = codetrail_chat.build_parser().parse_args([])
+    codetrail_chat._build(root, interactive, persist=False, preflight=checks, aux_preflight_done=True)
+    assert shared[-1]["aux_preflight_done"] is True
+    for value in (False, "true", 1):
+        codetrail_chat._build(root, interactive, persist=False, preflight=checks,
+                              aux_preflight_done=value)
+        assert "aux_preflight_done" not in shared[-1], value
+    codetrail_chat._build(root, interactive, persist=False, preflight=checks)
+    assert "aux_preflight_done" not in shared[-1]
+
+    built: list[dict] = []
+
+    def build(*_args, **kwargs):
+        built.append(kwargs)
+        engine = types.SimpleNamespace(
+            tool_specs=(),
+            options=types.SimpleNamespace(policy=types.SimpleNamespace(name="interactive")),
+        )
+        return types.SimpleNamespace(close=lambda: None), engine
+
+    settings = client_config.ClientSettings(path=tmp_path / "client.json")
+    monkeypatch.setattr(codetrail_chat, "_build", build)
+    monkeypatch.setattr(codetrail_chat, "_has_tty", lambda: True)
+    monkeypatch.setattr(codetrail_chat, "_resolve_root", lambda _raw: root)
+    monkeypatch.setattr(codetrail_chat, "_settings", lambda *_a, **_k: settings)
+    monkeypatch.setattr(
+        codetrail_chat, "_compactor", lambda *_a, **_k: types.SimpleNamespace(mode="manual")
+    )
+    monkeypatch.setattr(
+        codetrail_chat.client_app, "CodeTrailApp",
+        lambda *_a, **_k: types.SimpleNamespace(run=lambda: 0),
+    )
+    for passed in (True, False):
+        monkeypatch.setattr(
+            client_preflight, "run",
+            lambda run_root, _passed=passed: client_preflight.Preflight(
+                root=run_root, model="m", n_ctx=4096, aux_preflight_passed=_passed
+            ),
+        )
+        assert codetrail_chat.command_chat(codetrail_chat.build_parser().parse_args([])) == 0
+        assert built[-1]["aux_preflight_done"] is passed
+
+
+@pytest.mark.smoke
+def test_headless_run_never_lets_the_mcp_skip_the_aux_probe(
+    tmp_path, monkeypatch, capsys, live_main_context
+):
+    """headless `run`(canary model lane / eval / session replay 走的路)不帶 `aux_preflight_done`:
+    它沒有跑 preflight 的附屬探測,MCP 必須自己探測。"""
+    import client_config
+    import llama_client
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    # 這條只看交給 shared_client 的 kwargs;不讓 readonly 那一輪改到行程全域的 config。
+    monkeypatch.setattr(client_config, "apply_to_config", lambda *_a, **_k: None)
+    root = tmp_path / "project"
+    root.mkdir()
+    shared: list[dict] = []
+
+    def fake_shared(_root, **kwargs):
+        shared.append(dict(kwargs))
+        return _ReadonlyFakeMcpClient() if kwargs.get("readonly") else _FakeMcpClient()
+
+    monkeypatch.setattr(client_mcp, "shared_client", fake_shared)
+    monkeypatch.setattr(
+        llama_client, "chat_completions",
+        lambda **_k: iter([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]),
+    )
+    monkeypatch.setattr(codetrail_chat.config, "require_main_model", lambda: "m")
+    for extra in ([], ["--policy", "readonly"]):
+        assert codetrail_chat.main(["run", "--root", str(root), *extra, "hi"]) == 0
+        capsys.readouterr()
+        assert shared and "aux_preflight_done" not in shared[-1], shared[-1]

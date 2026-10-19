@@ -530,3 +530,175 @@ def test_the_canary_child_environment_is_stripped(monkeypatch, tmp_path):
     leaked = [k for k in seen["env"] if k.startswith(("AICODE_", "AI_CODE_", "CODETRAIL_"))]
     assert not leaked, leaked
     assert "PATH" in seen["env"]
+
+
+# ── 速度優化 #4:parallel tool call 能力與 n_ctx 出自同一次 /props 觀測 ──
+
+
+@pytest.mark.smoke
+def test_parallel_tool_calls_follow_only_a_json_true_capability(monkeypatch, tmp_path):
+    """`chat_template_caps.supports_parallel_tool_calls` 只有 JSON true 才算支援。
+
+    True 會讓每個帶工具的聊天請求明送 `parallel_tool_calls`。對模板宣告不了並行呼叫的
+    server 送它是靜默的錯(同一則 assistant 出現模板渲染不了的多個 call),而
+    `bool("false")`、`bool(1)` 都是 True —— 字串、數字、缺欄、舊版 server 沒有 caps
+    一律當作不支援。n_ctx 與能力出自**同一次** /props 觀測,n_ctx 的拒絕契約不變。
+    """
+    import types
+
+    import gpu_safety
+    import llama_client
+
+    cases = [
+        ({"supports_parallel_tool_calls": True}, True),
+        ({"supports_parallel_tool_calls": "true"}, False),
+        ({"supports_parallel_tool_calls": 1}, False),
+        ({"supports_parallel_tool_calls": False}, False),
+        ({"supports_tools": True}, False),
+        (["supports_parallel_tool_calls"], False),
+        (None, False),
+    ]
+    for caps, expected in cases:
+        props = {"default_generation_settings": {"n_ctx": 8192}}
+        if caps is not None:
+            props["chat_template_caps"] = caps
+        fetched: list[str] = []
+        monkeypatch.setattr(
+            llama_client, "get_props",
+            lambda url, _props=props, _fetched=fetched: (_fetched.append(url), _props)[1],
+        )
+        observed = client_preflight.observe_main_server("http://127.0.0.1:65535")
+        assert observed == client_preflight.MainServerInfo(
+            n_ctx=8192, parallel_tool_calls=expected
+        ), caps
+        assert fetched == ["http://127.0.0.1:65535"], "n_ctx 與能力必須出自同一次 /props"
+
+    # preflight 那一條:同一次觀測同時填進 n_ctx 與 parallel_tool_calls。
+    assert client_preflight.Preflight(root=tmp_path).parallel_tool_calls is False
+    monkeypatch.setattr(
+        llama_client, "get_props",
+        lambda url: {
+            "default_generation_settings": {"n_ctx": 4096},
+            "chat_template_caps": {"supports_parallel_tool_calls": True},
+        },
+    )
+    result = client_preflight.Preflight(root=tmp_path)
+    profile = types.SimpleNamespace(
+        service=lambda role: types.SimpleNamespace(base_url="http://127.0.0.1:65535")
+    )
+    assert client_preflight.observe_n_ctx(result, profile) == 4096
+    assert (result.n_ctx, result.parallel_tool_calls) == (4096, True)
+
+    # 沒有 raw_props 的觀測(測試替身、舊形狀)一律 False;沒有 live n_ctx 照舊拒絕。
+    monkeypatch.setattr(
+        gpu_safety, "query_server_info", lambda *_a: types.SimpleNamespace(n_ctx=2048)
+    )
+    assert client_preflight.observe_main_server("x") == client_preflight.MainServerInfo(2048, False)
+    monkeypatch.setattr(gpu_safety, "query_server_info", lambda *_a: None)
+    with pytest.raises(client_preflight.PreflightError, match="n_ctx"):
+        client_preflight.observe_main_server("x")
+
+
+# ── 速度優化 #8:附屬探測只在同一次啟動流程內、憑證據免重複 ──
+
+
+def _aux_checks(ok_vl: bool) -> list:
+    from scripts import required_model_servers_check as required
+
+    return [
+        required.ServerCheck("embedding", "http://127.0.0.1:65534", True, "ok"),
+        required.ServerCheck("reranker", "http://127.0.0.1:65533", True, "ok"),
+        required.ServerCheck("VL", "http://127.0.0.1:65532", ok_vl, "ok" if ok_vl else "down"),
+    ]
+
+
+@pytest.mark.smoke
+def test_aux_preflight_evidence_reaches_the_canary_protocol_lane_only_after_it_passed(
+    monkeypatch, tmp_path
+):
+    """canary 協定 lane 的 MCP 免重複探測,唯一根據是**這一次** preflight 的探測真的通過。
+
+    證據由 `check_required_servers` 自己記下(`aux_preflight_passed`):沒跑、或有一個
+    附屬 server 沒過,canary 拿到的就是 False → 照常探測。把它寫死成 True 的話,任何
+    跳過附屬探測的呼叫順序都會變成一個沒人探測過附屬 server 的啟動,而且完全無聲。
+    """
+    from scripts import required_model_servers_check as required
+    from scripts import tool_call_canary
+
+    handed: list[dict] = []
+    monkeypatch.setattr(
+        tool_call_canary, "run_all", lambda **kwargs: (handed.append(kwargs), 0)[1]
+    )
+
+    class _Profile:
+        def service(self, role):
+            return type("S", (), {"base_url": "http://127.0.0.1:65535"})()
+
+    client_preflight.check_tool_health(client_preflight.Preflight(root=tmp_path, model="m"), _Profile())
+    assert handed[-1]["aux_preflight_done"] is False
+
+    failed = client_preflight.Preflight(root=tmp_path, model="m")
+    monkeypatch.setattr(required, "run_checks", lambda: _aux_checks(False))
+    with pytest.raises(client_preflight.PreflightError):
+        client_preflight.check_required_servers(failed)
+    assert failed.aux_preflight_passed is False
+
+    passed = client_preflight.Preflight(root=tmp_path, model="m")
+    monkeypatch.setattr(required, "run_checks", lambda: _aux_checks(True))
+    client_preflight.check_required_servers(passed)
+    assert passed.aux_preflight_passed is True
+    client_preflight.check_tool_health(passed, _Profile())
+    assert handed[-1]["aux_preflight_done"] is True
+
+
+@pytest.mark.smoke
+def test_the_canary_hands_aux_preflight_done_to_the_protocol_lane_only_when_true(
+    monkeypatch, tmp_path
+):
+    """`run_all` 只在真的 True 時才把旗標交給 `run_protocol_check`;其餘情況的呼叫形狀
+    與以前逐字相同(`tests/test_doctor.py` 的替身是嚴格的兩參數 `lambda root, timeout:`)。
+    協定 lane 的 McpClient 收到同一個值:canary CLI 與 doctor 不帶 → server 照常探測。
+    """
+    from scripts import tool_call_canary
+
+    real_check = tool_call_canary.run_protocol_check
+    calls: list[dict] = []
+
+    def strict(root, timeout):
+        calls.append({})
+        raise tool_call_canary.CanaryError("stop after the protocol lane")
+
+    common = dict(
+        root=tmp_path, env={}, explicit_model="", base_url="http://127.0.0.1:65535", force=True
+    )
+    monkeypatch.setattr(tool_call_canary, "run_protocol_check", strict)
+    for flag in ({}, {"aux_preflight_done": False}, {"aux_preflight_done": "true"},
+                 {"aux_preflight_done": 1}):
+        assert tool_call_canary.run_all(**common, **flag) == 2
+    assert calls == [{}, {}, {}, {}]
+
+    def flexible(*, root, timeout, **kwargs):
+        calls.append(kwargs)
+        raise tool_call_canary.CanaryError("stop after the protocol lane")
+
+    monkeypatch.setattr(tool_call_canary, "run_protocol_check", flexible)
+    assert tool_call_canary.run_all(**common, aux_preflight_done=True) == 2
+    assert calls[-1] == {"aux_preflight_done": True}
+
+    built: list[dict] = []
+
+    class _Client:
+        def __init__(self, root, **kwargs):
+            built.append(kwargs)
+
+        def tools(self):
+            raise tool_call_canary.client_mcp.McpClientError("offline")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(tool_call_canary.client_mcp, "McpClient", _Client)
+    for kwargs, expected in (({}, False), ({"aux_preflight_done": True}, True)):
+        with pytest.raises(tool_call_canary.CanaryError):
+            real_check(root=tmp_path, timeout=5, **kwargs)
+        assert built[-1]["aux_preflight_done"] is expected

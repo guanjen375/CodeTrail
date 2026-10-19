@@ -51,9 +51,19 @@ class CountedEngine:
         return self.input_tokens if history is None else self.replacement_tokens
 
     def count_input_tokens(self, messages, **_kwargs):
-        transcript = messages[-1]["content"]
-        # Each marker represents a dense token block from a different real turn.
-        return 512 + transcript.count("FULL_BLOCK_") * self.unit_tokens
+        # Every real user turn in the request is a dense token block. Scan all
+        # messages: the summarised view sits between the system prompt and the
+        # trailing instruction, whose bounded excerpt stays within the base.
+        blocks = sum(
+            1 for message in messages
+            if message.get("role") == "user"
+            and str(message.get("content") or "").startswith("FULL_BLOCK_")
+        )
+        return 512 + blocks * self.unit_tokens
+
+    def summary_payload(self, view, instruction):
+        return ([{"role": "system", "content": "SYSTEM"}] + copy.deepcopy(list(view))
+                + [{"role": "user", "content": instruction}])
 
     def prune_for_summary(self, messages):
         assert messages == self.messages[:len(messages)]
@@ -101,12 +111,13 @@ def test_an_already_oversized_summary_is_batched_without_losing_turns(tmp_path):
     outcome = compactor.compact(manual=True)
     assert outcome.status == "compacted", outcome
     assert len(engine.requests) >= 2
-    transcripts = [request[-1]["content"] for request in engine.requests]
+    # Each request is [system] + whole turns of the view + [instruction].
+    views = [request[1:-1] for request in engine.requests]
     for index in range(3):
-        assert sum(text.count(f"FULL_BLOCK_{index}:") for text in transcripts) == 1
-        assert sum(text.count(f"ANSWER_{index}:") for text in transcripts) == 1
-    assert all("FULL_BLOCK_3:" not in text for text in transcripts)
-    assert all(_summary() in request[0]["content"] for request in engine.requests[1:])
+        assert sum(m["content"].startswith(f"FULL_BLOCK_{index}:") for view in views for m in view) == 1
+        assert sum(m["content"].startswith(f"ANSWER_{index}:") for view in views for m in view) == 1
+    assert all("FULL_BLOCK_3:" not in str(request) for request in engine.requests)
+    assert all(_summary() in request[-1]["content"] for request in engine.requests[1:])
     assert engine.replaced[-2:] == original[-2:]
     assert cc.read_stopped({"HOME": str(tmp_path)}) == {}
 

@@ -168,6 +168,9 @@ class ReviewJob:
                 n_ctx = self.interactive_engine.options.n_ctx
                 if type(n_ctx) is not int or n_ctx <= 0:
                     raise client_engine.EngineError("審查需要主模型已觀測的 live n_ctx。")
+                # 刻意不傳 aux_preflight_done:/review 的 MCP 不是這次啟動流程的第一次
+                # spawn,距離 preflight 的附屬探測可能已經很久 —— 照常探測(只繼承
+                # 「明確要求跳過」的 skip,不繼承「剛探測過」這種一次性的證據)。
                 client = client_mcp.McpClient(
                     snapshot.root, readonly=True, n_ctx=n_ctx, build_commands=False,
                     restart_on_cancel=False,

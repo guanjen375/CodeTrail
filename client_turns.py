@@ -28,8 +28,10 @@
 與 ``_cancelled``,所以 ``busy`` 不會因為它變成 True(那會擋掉使用者的下一題與
 ``/new``),``cancel()`` 對它也是 no-op ——閒置時回 True 就是把「已中斷」顯示給一個
 根本沒有在跑的回合。真正的准入(policy、模型鎖、server 忙不忙)全在 engine 那端。
-每一次真的跑完的預熱都經建構時給的 ``on_prime(reason, outcome)`` 回到 UI,**不分是誰
-排的**:壓縮換掉歷史之後那一次是這裡自己排的、沒有每次呼叫的 ``on_done``,少了這條
+一輪收尾後這裡自己排的有兩種,都在回合鎖放掉之後、各一次:壓縮換掉歷史(``compaction``),
+以及 think on 的訊息回合成功收尾(``turn``:下一輪會剝掉這一輪的 reasoning,prefix 在這一輪
+第一則 assistant 就分岔)。每一次真的跑完的預熱都經建構時給的 ``on_prime(reason, outcome)``
+回到 UI,**不分是誰排的**:這裡自己排的那幾次沒有每次呼叫的 ``on_done``,少了這條
 回呼那一次的結果就直接被丟掉,``/status`` 會停在上一次的 ``sent``。
 """
 from __future__ import annotations
@@ -790,10 +792,15 @@ class TurnCoordinator:
         # 壓縮換掉了歷史:下一輪要送的 prefix 已經不是剛剛送過的那一份,server 那邊
         # 的 prompt cache 對它是冷的。排在 `finally` 裡的話,預熱會在這一輪的回合鎖
         # **內**等模型鎖,使用者的下一題連 `start_turn` 都排不進來。
+        # think on 同理:下一輪剝掉這一輪的 reasoning,prefix 在這一輪第一則 assistant
+        # 就分岔。成功收尾、沒有接續佇列、沒有壓縮換歷史時才排這一次(只認真的 True;
+        # 沒有 options 的舊替身不排),同樣在回合鎖外。
         if successful and self._start_next_queued(target):
             return
         if compacted:
             self.prime_in_background("compaction")
+        elif successful and getattr(getattr(self.engine, "options", None), "thinking", None) is True:
+            self.prime_in_background("turn")
 
     def _run_compaction(self, target: str) -> None:
         compacted = False
@@ -879,7 +886,8 @@ class TurnCoordinator:
         先交給建構時的 ``on_prime(reason, outcome)``,再交給這一次呼叫自己的 ``on_done``
         (可選)。兩邊都在預熱那條執行緒上被呼叫、各自吞例外(UI 正在收尾時搬運會以
         ``CancelledError`` 這種 BaseException 結束),一邊炸了另一邊照樣要到。壓縮換掉
-        歷史之後那一次是這裡自己排的、沒有 ``on_done``,只靠 ``on_prime`` 回到 UI。
+        歷史之後、think on 回合成功收尾之後那兩種是這裡自己排的、沒有 ``on_done``,
+        只靠 ``on_prime`` 回到 UI。
         """
         prime = getattr(self.engine, "prime_prompt_cache", None)
         if not callable(prime) or self.busy:

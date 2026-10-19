@@ -832,6 +832,24 @@ QUERY_SYMBOL_PATTERN = r'[A-Z][A-Z0-9_]{2,}'
 # 保留原始符號（不要被斷詞打散）
 QUERY_PRESERVE_SYMBOLS = True
 
+# 擴寫生成的界線。主模型只有一個 slot，每一次擴寫都會把對話擠出 slot；原生 /completion
+# 沒有聊天模板，不設 stop 時模型答完第一行還會一路續寫到 EOS／逾時，而擴寫要的只有第一行。
+# n_predict 同時是 context gate 的保留額（實送上限＝保留額），撞上限的輸出視同過長丟棄。
+KB_EXPANSION_MAX_TOKENS = 64
+KB_EXPANSION_STOP = ("\n",)
+# 每次 query 實際送出的擴寫生成次數上限（另受 MULTI_QUERY_COUNT 限制，取小者）。
+KB_EXPANSION_MAX_CALLS = 2
+if not (  # pragma: no cover - import guard
+    type(KB_EXPANSION_MAX_TOKENS) is int and KB_EXPANSION_MAX_TOKENS > 0
+    and type(KB_EXPANSION_MAX_CALLS) is int and KB_EXPANSION_MAX_CALLS > 0
+    and isinstance(KB_EXPANSION_STOP, tuple) and len(KB_EXPANSION_STOP) > 0
+    and all(isinstance(item, str) and item for item in KB_EXPANSION_STOP)
+):
+    raise ValueError(
+        "KB_EXPANSION_MAX_TOKENS / KB_EXPANSION_MAX_CALLS must be positive ints and "
+        "KB_EXPANSION_STOP a non-empty tuple of non-empty strings"
+    )
+
 # ============================================================
 # Patch 驗證策略設定(apply_patch 套用後的自動驗證)
 # ============================================================

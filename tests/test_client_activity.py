@@ -306,7 +306,9 @@ def test_activity_callback_failure_preserves_gate_payload_and_history(activity_e
         result = engine.complete(payload, source="compaction")
         assert engine.messages == before and engine.store.read(engine.session_id) == stored
         assert requests[0]["messages"] == payload
-        assert requests[0].get("tools") is None
+        # 摘要請求帶對話同一份 tools 並實送 tool_choice=none,前綴才對得上對話。
+        assert gates[0]["tools"] == requests[0]["tools"] == engine.openai_tools()
+        assert requests[0]["tool_choice"] == "none"
     else:
         result = engine.send("question", on_event=events.append)
         assert engine.messages[:2] == before

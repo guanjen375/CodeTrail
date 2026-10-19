@@ -50,10 +50,12 @@ regression:npz 向量沒掛回 chunk → 相似度全 0。
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +69,7 @@ import RAG
 from knowledge import KnowledgeBase
 from knowledge_store import DocumentIdentityConflict, KnowledgeStoreError
 from RAG import load_knowledge_base, save_knowledge_base
+from runtime_dependencies import DependencyError
 
 # numpy 未裝就整份 skip(AGENTS.md §4:離線/缺套件要 graceful skip,不是 collect error)
 np = pytest.importorskip("numpy")
@@ -671,7 +674,8 @@ def _write_cache(tmp_path: Path, payload: dict) -> None:
 def _vectors(kb_path: Path) -> list[list[float]]:
     kb = KnowledgeBase(str(kb_path))
     assert kb.loaded, kb.load_error
-    return [list(chunk["embedding"]) for chunk in kb.chunks]
+    # 向量用到才從已驗證矩陣取（不再整份掛回 chunk）；讀點一律經 _chunk_vector。
+    return [kb._chunk_vector(chunk) for chunk in kb.chunks]
 
 
 # ==========================================================================
@@ -688,7 +692,7 @@ def test_fresh_ingest_into_an_empty_kb_is_immediately_queryable(tmp_path: Path, 
 
     kb = KnowledgeBase(str(kb_path))
     assert kb.loaded, kb.load_error
-    assert kb.chunks and all(chunk.get("embedding") for chunk in kb.chunks)
+    assert kb.chunks and all(kb._chunk_vector(chunk) for chunk in kb.chunks)
     assert _cache_files(tmp_path), "向量必須落在隱藏 cache 目錄"
     assert not _legacy_npz(tmp_path).exists(), "舊位置的 companion NPZ 不該再出現"
 
@@ -944,7 +948,7 @@ def test_a_fully_verifiable_legacy_npz_is_migrated_not_rebuilt(tmp_path: Path, m
     kb = KnowledgeBase(str(kb_path))
 
     assert kb.loaded, kb.load_error
-    assert [list(c["embedding"]) for c in kb.chunks] == [[1.0, 0.0], [0.0, 1.0]]
+    assert [kb._chunk_vector(c) for c in kb.chunks] == [[1.0, 0.0], [0.0, 1.0]]
     assert _cache_files(tmp_path), "驗過的舊 NPZ 要遷移到隱藏 cache"
     assert not _legacy_npz(tmp_path).exists(), "遷移完要把使用者看得到的那份收掉"
 
@@ -1774,8 +1778,8 @@ def test_save_empty_knowledge_base_removes_stale_npz(tmp_path):
 
 # --------------------------------------------------------------------------
 # 併自 tests/test_npz_embedding_attach.py(P0-5):
-# 從 .npz 載入 embeddings 後必須把向量掛回每個 chunk,否則下游 MMR /
-# 污染控制 / 信心分數都會拿到空向量,相似度全當 0。
+# 從 .npz 載入 embeddings 後每個 chunk 都必須取得向量(現在經 _chunk_vector 用到才
+# 從已驗證矩陣取),否則下游 MMR / 污染控制 / 信心分數都會拿到空向量,相似度全當 0。
 # --------------------------------------------------------------------------
 # smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression(P0-5):npz 向量沒掛回 chunk → 相似度全 0。
@@ -1826,22 +1830,253 @@ def test_npz_load_attaches_embeddings_to_chunks(tmp_path: Path):
     assert kb._embeddings is not None
     assert kb._embeddings.shape == (4, 8)
 
-    # 關鍵：每個 chunk 都要拿到非空 embedding，且與 .npz 對應列一致
+    # 關鍵：每個 chunk 都要取得非空向量，且與 .npz 對應列一致。向量用到才經
+    # _chunk_vector 從已驗證矩陣取，不再整份掛回 chunk（下游讀點同樣只經它）。
     for i, chunk in enumerate(kb.chunks):
-        emb = chunk.get("embedding")
-        assert emb, f"chunk {i} 載入 .npz 後 embedding 仍是空的（P0-5 回歸）"
+        emb = kb._chunk_vector(chunk)
+        assert emb, f"chunk {i} 載入 .npz 後取不到向量（P0-5 回歸）"
         assert len(emb) == 8
         assert emb == pytest.approx(rng[i].tolist(), rel=1e-5)
+        assert "embedding" not in chunk
 
 
 def test_npz_attached_embeddings_drive_nonzero_similarity(tmp_path: Path):
-    """回填後，用 chunk["embedding"] 算 cosine 應該拿到非零分數（不再全 0）。"""
+    """載入後，用 _chunk_vector 取得的向量算 cosine 應該拿到非零分數（不再全 0）。"""
     json_path, rng = _build_kb_files(tmp_path, n=3, dim=8)
     kb = KnowledgeBase(str(json_path))
 
     # 直接用某個 chunk 自己的向量當 query，cosine 應接近 1（而非 0）
-    q = kb.chunks[1]["embedding"]
-    sims = [kb._cosine_similarity(q, c["embedding"]) for c in kb.chunks]
+    q = kb._chunk_vector(kb.chunks[1])
+    sims = [kb._cosine_similarity(q, kb._chunk_vector(c)) for c in kb.chunks]
     assert max(sims) == pytest.approx(1.0, abs=1e-4)
     # 自我相似度必須是最高的那個
     assert sims.index(max(sims)) == 1
+
+
+# ── 速度優化 #8:chunk 向量用到才取已驗證矩陣的列,BM25 三套索引以 kb_cache 安全 IO 快取 ──
+# 兩件事的失敗模式都是靜默錯答:讀到重算留下的未正規化 inline 向量、或沿用身分不符的
+# lexical 索引,查詢照樣回答,只是分數錯了。
+def test_rebuilt_kb_vectors_come_from_the_normalized_matrix_not_inline_values(
+    tmp_path: Path, monkeypatch
+):
+    """重算路徑(kb_cache.rebuild → RAG.generate_embeddings)會在原 chunk 留下未正規化的向量;
+    查詢端拿到的必須是已驗證的正規化矩陣列,inline 值要在接上矩陣時移除。"""
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    for path in _cache_files(tmp_path):
+        path.unlink()
+
+    kb = KnowledgeBase(str(kb_path))
+
+    assert kb.loaded, kb.load_error
+    for row, chunk in enumerate(kb.chunks):
+        assert "embedding" not in chunk and "embedding_gate" not in chunk
+        raw = _vec(RAG.context_signals.retrieval_embedding_input(chunk, use_ctx=True))
+        norm = (raw[0] ** 2 + raw[1] ** 2) ** 0.5
+        vector = kb._chunk_vector(chunk)
+        assert vector == kb._embeddings[row].tolist()
+        assert vector == pytest.approx([raw[0] / norm, raw[1] / norm], rel=1e-5)
+        assert vector != pytest.approx(raw), "讀到的是重算留下的未正規化 inline 向量"
+
+
+def test_merged_chunk_vector_is_the_average_of_its_member_rows(tmp_path: Path, monkeypatch):
+    """合併 chunk 用自己在合併時算出的成員平均;成員向量從矩陣列取(inline 已移除)。"""
+    kb = KnowledgeBase(str(tmp_path / "missing.json"))
+    kb.chunks = [{"source": "spec.md", "page": 1, "chunk_index": index, "section": "",
+                  "content": f"member {index} " * 8, "embedding": [9.0, 9.0]}
+                 for index in range(2)]
+    kb._index_chunks()
+    rows = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    kb._attach_matrices(kb_cache.Matrices(rows, None, "cache", None))
+    monkeypatch.setattr(knowledge, "KNOWLEDGE_MERGE_ADJACENT", True)
+
+    assert all("embedding" not in chunk for chunk in kb.chunks)
+    assert [kb._chunk_vector(chunk) for chunk in kb.chunks] == [[1.0, 0.0], [0.0, 1.0]]
+    (merged,) = kb._merge_adjacent_chunks(list(kb.chunks))
+    assert merged["member_chunk_idx"] == [0, 1]
+    assert kb._chunk_vector(merged) == [0.5, 0.5]
+
+
+def _bm25_cache_file(kb_path: Path) -> Path:
+    return kb_cache.cache_dir(kb_path) / kb_cache.BM25_FILENAME
+
+
+def _bm25_kb(tmp_path: Path, monkeypatch, *, ctx: str = "生成的 UART 補充說明 ctxsentinel") -> Path:
+    """三套 BM25 語料都在的 KB:ctx(gate 不是 retrieval 的別名)、兩個章節、中英混合(走 jieba)。"""
+    _stub_embed(monkeypatch)
+    chunks = [
+        {"source": "spec.md", "page": 1, "chunk_index": 0, "section": "UART 控制",
+         "heading_hierarchy": "UART 控制", "section_index": 0, "ctx": ctx,
+         "content": "UART 鮑率暫存器 BAUD_DIV 設定為 115200，位址 0x4000_0100。"},
+        {"source": "spec.md", "page": 1, "chunk_index": 1, "section": "UART 控制",
+         "heading_hierarchy": "UART 控制", "section_index": 0,
+         "content": "韌體中斷控制器在初始化流程中清除 IRQ_PENDING 旗標。"},
+        {"source": "spec.md", "page": 2, "chunk_index": 2, "section": "DMA 傳輸",
+         "heading_hierarchy": "DMA 傳輸", "section_index": 1,
+         "content": "DMA channel abort sets DMA_STATUS_ABORT and calls the callback."},
+    ]
+    return _save(tmp_path, chunks)
+
+
+def _bm25_shape(index):
+    """一套索引的完整形狀:term 順序、每個 term 的 (doc, tf) 順序與型別、doc_lens、avg、idf。"""
+    if index is None:
+        return None
+    postings = [
+        (term, type(docs), [(doc, type(doc), tf, type(tf)) for doc, tf in docs.items()])
+        for term, docs in index.index.items()
+    ]
+    return (postings, [(length, type(length)) for length in index.doc_lens],
+            (index.avg_doc_len, type(index.avg_doc_len)), sorted(index.idf.items()))
+
+
+def test_bm25_cache_hit_reproduces_every_index_and_query_bit_for_bit(tmp_path: Path, monkeypatch):
+    kb_path = _bm25_kb(tmp_path, monkeypatch)
+    built = KnowledgeBase(str(kb_path), publish_bm25_cache=True)
+    assert built.loaded, built.load_error
+    cache = _bm25_cache_file(kb_path)
+    assert cache.is_file(), "授權的載入要把建好的索引發布出去"
+    assert built._bm25_gate is not built._bm25 and built._section_bm25 is not None
+    published = (cache.read_bytes(), cache.stat().st_mtime_ns)
+
+    def no_tokenizing(_self, _documents):
+        raise AssertionError("快取命中不得重新斷詞")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KnowledgeBase, "_build_bm25_text_index", no_tokenizing)
+        cached = KnowledgeBase(str(kb_path), publish_bm25_cache=True)
+
+    assert cached.loaded, cached.load_error
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == published, "命中不得改寫快取"
+    for name in ("_bm25", "_bm25_gate", "_section_bm25"):
+        assert _bm25_shape(getattr(cached, name)) == _bm25_shape(getattr(built, name)), name
+    assert (cached._bm25_gate is cached._bm25) == (built._bm25_gate is built._bm25)
+
+    monkeypatch.setattr(knowledge, "USE_RERANKER", False)
+    for kb in (built, cached):
+        monkeypatch.setattr(kb, "_get_embedding", lambda _text: [1.0, 0.5])
+        monkeypatch.setattr(kb, "_should_expand_query", lambda *_a, **_k: False)
+    question = "ctxsentinel UART 鮑率 0x4000_0100 DMA_STATUS_ABORT"
+    for use_ctx in (True, False):
+        monkeypatch.setattr(config, "KB_CONTEXT_USE", use_ctx)
+        scores = [
+            [(c.chunk_idx, c.rrf_score, c.retrieval_score, c.gate_score, c.retrieval_bm25,
+              c.gate_bm25, c.section_rrf_score) for c in kb._hybrid_search(question)]
+            for kb in (built, cached)
+        ]
+        assert scores[0] and scores[0] == scores[1]
+        assert built.query(question) == cached.query(question)
+
+
+@pytest.mark.parametrize("change", ["corpus", "tokenizer_version", "jieba_version",
+                                    "jieba_dictionary"])
+def test_bm25_cache_identity_change_is_never_reused(tmp_path: Path, monkeypatch, change):
+    kb_path = _bm25_kb(tmp_path, monkeypatch)
+    assert KnowledgeBase(str(kb_path), publish_bm25_cache=True).loaded
+    stale = _bm25_cache_file(kb_path).read_bytes()
+    real_jieba = knowledge.jieba
+    if change == "corpus":
+        # 只改 ctx:retrieval 語料變了,gate 與章節語料逐字相同。
+        kb_path = _bm25_kb(tmp_path, monkeypatch, ctx="改寫後的補充說明 freshsentinel")
+    elif change == "tokenizer_version":
+        monkeypatch.setattr(knowledge, "BM25_TOKENIZER_VERSION",
+                            knowledge.BM25_TOKENIZER_VERSION + 1)
+    elif change == "jieba_version":
+        monkeypatch.setattr(knowledge, "jieba", SimpleNamespace(
+            cut=real_jieba.cut, __version__=real_jieba.__version__ + ".other",
+            dt=real_jieba.dt))
+    else:
+        monkeypatch.setattr(knowledge, "jieba", SimpleNamespace(
+            cut=real_jieba.cut, __version__=real_jieba.__version__,
+            dt=SimpleNamespace(get_dict_file=lambda: io.BytesIO(b"another dictionary 1 n\n"))))
+    rebuilt = []
+    real_build = KnowledgeBase._build_bm25_text_index
+    monkeypatch.setattr(KnowledgeBase, "_build_bm25_text_index",
+                        lambda self, documents: rebuilt.append(1) or real_build(self, documents))
+
+    kb = KnowledgeBase(str(kb_path))
+
+    assert kb.loaded, kb.load_error
+    assert len(rebuilt) == 3, "身分不符的快取不得沿用:三套索引都要在記憶體重建"
+    assert _bm25_cache_file(kb_path).read_bytes() == stale, "沒有授權的載入不得改寫快取"
+    if change == "corpus":
+        assert "freshsentinel" in kb._bm25.index and "ctxsentinel" not in kb._bm25.index
+
+
+def test_bm25_cache_never_bypasses_the_jieba_dependency(tmp_path: Path, monkeypatch):
+    kb_path = _bm25_kb(tmp_path, monkeypatch)
+    assert KnowledgeBase(str(kb_path), publish_bm25_cache=True).loaded
+    assert _bm25_cache_file(kb_path).is_file()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(knowledge, "HAS_JIEBA", False)
+        with pytest.raises(DependencyError, match="jieba"):
+            KnowledgeBase(str(kb_path), publish_bm25_cache=True)
+
+    # 命中省掉的是載入時重新斷詞,不是依賴:查詢端斷詞失敗照樣 fail-loud,不會變成零結果。
+    cached = KnowledgeBase(str(kb_path))
+    assert cached.loaded, cached.load_error
+    monkeypatch.setattr(cached, "_get_embedding", lambda _text: [1.0, 0.5])
+    monkeypatch.setattr(cached, "_should_expand_query", lambda *_a, **_k: False)
+
+    def broken_cut(*_args, **_kwargs):
+        raise OSError("dictionary is unreadable")
+
+    real_jieba = knowledge.jieba
+    monkeypatch.setattr(knowledge, "jieba", SimpleNamespace(
+        cut=broken_cut, __version__=real_jieba.__version__, dt=real_jieba.dt))
+    with pytest.raises(DependencyError, match="jieba"):
+        cached.query("UART 鮑率怎麼設定")
+
+
+@pytest.mark.parametrize(("kind", "reason"), [("symlink", "symlink"), ("fifo", "不是一般檔案")])
+def test_bm25_cache_file_that_is_not_a_regular_file_fails_loud(
+    tmp_path: Path, monkeypatch, kind, reason
+):
+    kb_path = _bm25_kb(tmp_path, monkeypatch)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    planted = outside / "planted.npz"
+    planted.write_bytes(b"outside the cache tree")
+    cache = _bm25_cache_file(kb_path)
+    if kind == "symlink":
+        cache.symlink_to(planted)
+    else:
+        os.mkfifo(cache)   # 開來讀會卡住載入:必須在 open 之前就拒絕
+
+    for publish in (False, True):
+        with pytest.raises(KnowledgeStoreError, match=rf"bm25\.npz.*{reason}"):
+            KnowledgeBase(str(kb_path), publish_bm25_cache=publish)
+    assert planted.read_bytes() == b"outside the cache tree"
+    assert [path.name for path in outside.iterdir()] == ["planted.npz"]
+
+
+def test_bm25_cache_io_refuses_a_symlinked_cache_dir(tmp_path: Path, monkeypatch):
+    kb_path = _bm25_kb(tmp_path, monkeypatch)
+    metadata = json.loads(kb_path.read_text(encoding="utf-8"))["metadata"]
+    cache_root = tmp_path / ".codetrail" / "cache"
+    outside = tmp_path / "outside-cache"
+    shutil.move(str(cache_root), str(outside))
+    cache_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(KnowledgeStoreError, match="symlink"):
+        kb_cache.read_bm25(kb_path)
+    with pytest.raises(KnowledgeStoreError, match="symlink"):
+        kb_cache.publish_bm25(kb_path, {"identity": np.zeros(1, dtype=np.uint8)}, metadata)
+    assert list(outside.rglob(kb_cache.BM25_FILENAME)) == []
+
+
+@pytest.mark.parametrize(("publish", "allow_rebuild"), [(False, True), (True, False)])
+def test_bm25_cache_is_published_only_when_authorized(
+    tmp_path: Path, monkeypatch, publish, allow_rebuild
+):
+    """readonly MCP(publish=False)與離線體檢(allow_rebuild=False)載入 KB 不得在專案內新增檔案。"""
+    kb_path = _bm25_kb(tmp_path, monkeypatch)
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+
+    kb = KnowledgeBase(str(kb_path), allow_rebuild=allow_rebuild, publish_bm25_cache=publish)
+
+    assert kb.loaded, kb.load_error
+    assert kb._bm25 is not None and kb._bm25_gate is not None and kb._section_bm25 is not None
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
+    assert not _bm25_cache_file(kb_path).exists()

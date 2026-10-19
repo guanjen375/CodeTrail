@@ -703,3 +703,64 @@ def test_child_environment_isolated_from_parent_and_previous_calls(monkeypatch):
     following = process_env.child_env()
     assert all(name not in following for name in settings)
     assert following["LANG"] == "C"
+
+
+# ── 速度優化 #8:`--aux-preflight-done` 只給第一次 spawn ──
+
+
+@pytest.mark.smoke
+def test_aux_preflight_done_reaches_only_the_first_spawn(tmp_path, monkeypatch):
+    """`--aux-preflight-done` 是一次性的:只有第一次 spawn 的 argv 帶它。
+
+    它關掉的是 server 的附屬 server 硬閘,唯一根據是「aicode 的 preflight 剛在這次啟動
+    流程內探測過」。取消逾時的重建、restart、第一次啟動失敗後的再 start 可能發生在很久
+    之後 —— 附屬 server 早就可能不在了,沿用旗標等於靜默拿掉硬閘。建構時固定的 `_argv`
+    (每次 spawn 都沿用的那一份)不得含它;shared_client 原樣轉交;只認真的 True。
+    """
+    spawned: list[list[str]] = []
+    refused: list[list[str]] = []
+    real_popen = client_mcp.process_env.popen
+
+    def recording_popen(command, **kwargs):
+        spawned.append(list(command))
+        # 真的完成 handshake(stub 不看 argv);記下的是 client 要交給 server 的那一份。
+        return real_popen([sys.executable, str(STUB)], **kwargs)
+
+    def refuse(command, **_kwargs):
+        refused.append(list(command))
+        raise OSError("tests never spawn a real server here")
+
+    monkeypatch.setattr(client_mcp.process_env, "popen", recording_popen)
+    client_mcp.reset_shared_clients()
+    try:
+        client = client_mcp.shared_client(
+            tmp_path, n_ctx=32768, aux_preflight_done=True,
+            cancel_grace=1.0, terminate_grace=2.0, start_timeout=30.0,
+        )
+        base = list(client._argv)  # noqa: SLF001
+        assert base == client_mcp.McpClient(tmp_path, n_ctx=32768)._argv  # noqa: SLF001
+        client.start()
+        assert spawned == [[*base, "--aux-preflight-done"]] and client.generation == 1
+        # handshake 成功之後的每一次 spawn:只記 argv,不再真的起 server。
+        monkeypatch.setattr(client_mcp.process_env, "popen", refuse)
+        client._escalate("cancellation grace expired")  # noqa: SLF001 - 取消逾時的重建
+        with pytest.raises(client_mcp.McpUnavailableError):
+            client.restart()
+        assert refused == [base, base]
+    finally:
+        client_mcp.reset_shared_clients()
+
+    refused.clear()
+    retried = client_mcp.McpClient(tmp_path, aux_preflight_done=True)
+    for _ in range(2):
+        with pytest.raises(client_mcp.McpUnavailableError):
+            retried.start()
+    assert refused == [[*retried._argv, "--aux-preflight-done"], list(retried._argv)]  # noqa: SLF001
+    retried.close()
+    for value in ("true", 1, False):
+        refused.clear()
+        loose = client_mcp.McpClient(tmp_path, aux_preflight_done=value)
+        with pytest.raises(client_mcp.McpUnavailableError):
+            loose.start()
+        assert refused == [list(loose._argv)], value  # noqa: SLF001
+        loose.close()

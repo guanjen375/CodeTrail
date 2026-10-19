@@ -66,6 +66,7 @@ from tests._set_config_harness import (
     run,
     sparse,
     sparse_dense_gguf,
+    sparse_gguf,
     sparse_layered_moe_gguf,
     smt_cpu_sysfs,
     sparse_moe_gguf,
@@ -927,6 +928,40 @@ def test_interactive_prompt_accepts_typed_n_cpu_moe(tmp_path):
     assert parameters["n_cpu_moe"] == 3
     assert "cpu_moe" not in parameters
 
+@pytest.mark.smoke
+def test_main_cpu_moe_question_deducts_the_ubatch_buffer_in_mib(tmp_path):
+    """主模型那題真的帶上 -ub 2048 的 compute buffer 估計(接線漏了推薦值會無聲地少扣),
+    提示用 MiB(不丟 GiB 給使用者);寫出的 main 是 -b 2048 -ub 2048。
+
+    同 moe_models_needing_cpu_moe 的 26 GiB(10 層 × 2 GiB experts + 6 GiB dense),只是
+    dense 裡切出 1 GiB 的 output.weight(n_embd 4096、n_vocab 129280)讓維度讀得到:
+    GPU 2 free 15000 MiB 扣 2294 MiB → 推薦 7-10(不扣是 6-10)。
+    """
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    main_dir = models / "big-chat"
+    for shard in list(main_dir.glob("*.gguf")):
+        shard.unlink()
+    sparse_gguf(main_dir / "big-moe-ud-q4_k_xl.gguf", [
+        *((f"blk.{index}.ffn_up_exps.weight", (1,), 2 * GIB) for index in range(10)),
+        ("blk.0.attn_q.weight", (1,), 5 * GIB),
+        ("output.weight", (4096, 129280), 1 * GIB),
+    ])
+
+    # main、main GPU 2、ctx、CPU-MoE 3 層、DSpark off、embed GPU、reranker、reranker GPU、
+    # reranker ctx、VL GPU、壓縮模式、摘要確認。
+    proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
+               stdin="1\n2\n65536\n3\noff\n2\n1\n2\n8192\n2\n1\n\n")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "推薦數值:7-10" in proc.stdout
+    assert "推薦數值已扣除" in proc.stdout
+    assert "2294 MiB" in proc.stdout
+    assert "GiB" not in proc.stdout
+    main = read_deployment(tmp_path)["services"]["main"]
+    assert main["parameters"]["n_cpu_moe"] == 3
+    assert (main["batch"], main["ubatch"]) == (2048, 2048)
+
 def test_interactive_n_cpu_moe_over_max_index_means_full_cpu_moe(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = moe_models_needing_cpu_moe(tmp_path)
@@ -1266,6 +1301,47 @@ def test_split_gguf_sums_same_layer_across_shards(tmp_path):
     assert layout.expert_layer_bytes == ((3, 3 * sc.GIB), (4, 1 * sc.GIB))
 
 
+@pytest.mark.smoke
+def test_gguf_vocab_and_embedding_dims_come_from_output_weight(tmp_path):
+    """主模型 CPU-MoE 的 compute buffer 估計靠 n_vocab / n_embd:讀錯或漏讀都是無聲的
+    (推薦區間只是少扣一塊,不會報錯)。output.weight 優先(dims[0]=n_embd、dims[1]=n_vocab),
+    tied embedding 沒有它才用 token_embd.weight;split GGUF 取第一個有值的 shard ——
+    大模型的 output.weight 常在後面幾片。兩個都沒有 = 0(推薦值不扣)。"""
+    both = tmp_path / "both.gguf"
+    sparse_gguf(both, [
+        ("token_embd.weight", (1024, 32000), sc.MIB),
+        ("blk.0.ffn_up_exps.weight", (1,), sc.MIB),
+        ("output.weight", (4096, 129280), sc.MIB),
+    ])
+    layout = sc.inspect_model_layout(sc.ModelCandidate(both, both.stat().st_size, 1))
+    assert (layout.vocab_size, layout.embedding_length) == (129280, 4096)
+
+    tied = tmp_path / "tied.gguf"
+    sparse_gguf(tied, [
+        ("token_embd.weight", (2048, 50000), sc.MIB),
+        ("blk.0.attn_q.weight", (1,), sc.MIB),
+    ])
+    layout = sc.inspect_model_layout(sc.ModelCandidate(tied, tied.stat().st_size, 1))
+    assert (layout.vocab_size, layout.embedding_length) == (50000, 2048)
+
+    first = tmp_path / "split-dims-00001-of-00002.gguf"
+    second = tmp_path / "split-dims-00002-of-00002.gguf"
+    _write_metadata_only_gguf(first)
+    sparse_gguf(second, [
+        ("blk.0.ffn_up_exps.weight", (1,), sc.MIB),
+        ("output.weight", (6144, 154880), sc.MIB),
+    ])
+    layout = sc.inspect_model_layout(
+        sc.ModelCandidate(first, first.stat().st_size + second.stat().st_size, 2)
+    )
+    assert (layout.vocab_size, layout.embedding_length) == (154880, 6144)
+
+    plain = tmp_path / "plain.gguf"
+    _write_moe_gguf(plain, expert_bytes=sc.GIB, dense_bytes=sc.GIB)
+    layout = sc.inspect_model_layout(sc.ModelCandidate(plain, plain.stat().st_size, 1))
+    assert (layout.vocab_size, layout.embedding_length) == (0, 0)
+
+
 def test_build_main_parameters_full_cpu_moe(tmp_path):
     plan = _build_plan(tmp_path, cpu_moe=True)
 
@@ -1277,7 +1353,8 @@ def test_build_main_parameters_full_cpu_moe(tmp_path):
     assert parameters["gpu_layers"] == 99
     assert parameters["fit"] == "off"
     assert "n_cpu_moe" not in parameters
-    assert (batch, ubatch) == (2048, 512)
+    # CPU-MoE 的 -ub = batch(RAM 端 experts 每個 ubatch 搬上 GPU 一次,ubatch 大搬得少)
+    assert (batch, ubatch) == (2048, 2048)
     assert any("expert tensors 固定在 RAM" in note for note in plan.notes)
 
 
@@ -1296,7 +1373,8 @@ def test_build_main_parameters_partial_n_cpu_moe(tmp_path):
     assert "cpu_moe" not in parameters
     assert parameters["gpu_layers"] == 99
     assert parameters["fit"] == "off"
-    assert (batch, ubatch) == (2048, 512)
+    # 部分 offload(--n-cpu-moe N)一樣是 CPU-MoE → -ub = batch
+    assert (batch, ubatch) == (2048, 2048)
     assert any("前 7 層" in note for note in plan.notes)
 
 
@@ -1329,6 +1407,36 @@ def test_build_main_parameters_normal_mode_points_to_nvidia_smi(tmp_path):
         plan.main.candidate, plan.ctx, plan.threads, False, False, no_fit_notes,
     )
     assert "fit" not in no_fit
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("cpu_moe", "n_cpu_moe", "ctx", "expected"),
+    [
+        pytest.param(True, None, 65536, (2048, 2048), id="full-cpu-moe"),
+        pytest.param(True, 7, 65536, (2048, 2048), id="partial-n-cpu-moe"),
+        pytest.param(True, None, 1024, (1024, 1024), id="full-cpu-moe-small-ctx"),
+        pytest.param(True, 7, 1536, (1536, 1536), id="partial-n-cpu-moe-small-ctx"),
+        pytest.param(False, None, 65536, (2048, 512), id="normal"),
+        pytest.param(False, None, 1024, (1024, 512), id="normal-small-ctx"),
+    ],
+)
+def test_cpu_moe_main_ubatch_equals_batch_and_clamps_to_small_ctx(
+    tmp_path, cpu_moe, n_cpu_moe, ctx, expected
+):
+    """主模型套 CPU-MoE(含 --n-cpu-moe N)時 -ub = -b = min(2048, ctx);其他維持 -ub 512。
+
+    沒寫對是無聲的:schema 照樣通過、server 照樣啟動,只是 RAM 端 experts 每 512 token
+    就整批搬上 GPU 一次(prefill 慢好幾倍)。小 ctx 必須夾限,ubatch ≤ batch ≤ ctx。
+    """
+    candidate = sc.ModelCandidate(path=tmp_path / "main.gguf", total_bytes=GIB, shards=1)
+
+    _, batch, ubatch = sc.build_main_parameters(
+        candidate, ctx, None, True, cpu_moe, [], n_cpu_moe=n_cpu_moe,
+    )
+
+    assert (batch, ubatch) == expected
+    assert ubatch <= batch <= ctx
 
 
 _FULL_CAPS = {"fit": True, "cpu_moe": True, "n_cpu_moe": True}
@@ -1464,6 +1572,35 @@ def test_vl_recommendation_subtracts_the_fit_target_it_reserves():
     assert sc.cpu_moe_recommendation(layout, gpu, sc.VL_FIT_TARGET_MIB) == "8-10"
     # 保留量大到連 dense 都放不下 → 退回「全部移到 RAM」並註明可能仍放不下
     assert sc.cpu_moe_recommendation(layout, gpu, 15000).startswith("10(")
+
+
+@pytest.mark.smoke
+def test_main_ubatch_buffer_estimate_lifts_only_the_offloaded_recommendation():
+    """主模型套 CPU-MoE 時 -ub 拉到 2048,compute buffer 跟著變大;推薦下界要扣掉估計值,
+    否則照推薦值填就可能啟動即 OOM,而工具不會有任何訊息。
+
+    估計 = ceil(Δub × 4 × (n_vocab + 64 × n_embd) / MiB),Δub 取實際寫入的兩個 -ub
+    (小 ctx 會夾限);GGUF 讀不到維度 = 0(不扣,題目提示另外明講)。只有 N ≥ 1 真的套
+    CPU-MoE 才有這塊 buffer:N = 0 仍是 -ub 512,權重放得進就照舊推薦 0。
+    """
+    dims = {"vocab_size": 129280, "embedding_length": 4096}       # DeepSeek-V4-Flash 的維度
+    layers = tuple((index, 2 * sc.GIB) for index in range(10))      # 10 層 × 2 GiB experts
+    layout = sc.ModelLayout(tensor_bytes=26 * sc.GIB, expert_bytes=20 * sc.GIB,
+                            expert_layer_bytes=layers, **dims)
+    unknown = sc.ModelLayout(tensor_bytes=26 * sc.GIB, expert_bytes=20 * sc.GIB,
+                             expert_layer_bytes=layers)
+
+    assert sc.cpu_moe_ubatch_reserve_mib(layout, 65536) == 2294   # 1536 × 4 × 391424 B
+    assert sc.cpu_moe_ubatch_reserve_mib(layout, 1024) == 765     # 小 ctx:-ub 1024 對 512
+    assert sc.cpu_moe_ubatch_reserve_mib(unknown, 65536) == 0
+    assert sc.cpu_moe_ubatch_reserve_mib(None, 65536) == 0
+
+    tight = sc.Gpu(1, "tight", 16384, 15000, "GPU-tight")           # free 14.6 GiB
+    assert sc.cpu_moe_recommendation(layout, tight) == "6-10"
+    assert sc.cpu_moe_recommendation(layout, tight, cpu_moe_reserve_mib=2294) == "7-10"
+    # 26 GiB 權重放得進 27000 MiB:0 檔不扣 -ub 2048 的 buffer(否則會錯推 1-10)
+    roomy = sc.Gpu(0, "roomy", 32768, 27000, "GPU-roomy")
+    assert sc.cpu_moe_recommendation(layout, roomy, cpu_moe_reserve_mib=2294).startswith("0(")
 
 
 def test_cpu_moe_question_is_skipped_for_dense_and_unparsable(tmp_path, monkeypatch, capsys):
@@ -1915,6 +2052,31 @@ def test_rerun_preserves_hand_added_sampling_params_and_warns_on_dropped(tmp_pat
     assert parameters["no_mmap"] is True
     assert "n_cpu_moe" not in parameters
     assert "custom_flag" not in parameters
+
+@pytest.mark.smoke
+def test_rerun_preserves_a_hand_set_main_cache_ram(tmp_path):
+    """main 的 cache_ram(host RAM prompt cache 上限)只由使用者手設:set_config 不寫,
+    重跑必須原樣保留。以前它被當成工具管理鍵,重跑就無聲消失,server 退回 llama.cpp 預設。
+    embedding / reranker 的 cache_ram 仍由工具固定寫 0。"""
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
+               "--models-dir", str(models)).returncode == 0
+    deployment_path = tmp_path / "home" / ".config/codetrail/deployment.json"
+    config = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert "cache_ram" not in config["services"]["main"]["parameters"]   # 工具不主動寫 main 的值
+    config["services"]["main"]["parameters"]["cache_ram"] = 16384
+    deployment_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    rerun = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    assert "保留你手動加在 deployment.json 的 main 參數:cache_ram=16384" in rerun.stdout
+    assert "已捨棄:cache_ram" not in rerun.stdout
+    services = read_deployment(tmp_path)["services"]
+    assert services["main"]["parameters"]["cache_ram"] == 16384
+    assert services["embedding"]["parameters"]["cache_ram"] == 0
+    assert services["reranker"]["parameters"]["cache_ram"] == 0
 
 @pytest.mark.smoke
 def test_generated_start_sh_rejects_removed_commands_before_dispatch(tmp_path):

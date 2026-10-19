@@ -313,7 +313,7 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
   - 四個 role 共用：`gpu_layers`、`flash_attention`、`no_mmap`、`parallel`。
   - main：另有 `jinja`、`temperature`、`top_p`、`top_k`、`min_p`、
     `presence_penalty`、`cache_type_k`、`cache_type_v`、`cpu_moe`、`n_cpu_moe`、
-    `threads`、`fit`、`fit_target`。
+    `threads`、`fit`、`fit_target`、`cache_ram`。
   - embedding：另有固定角色旗標 `embedding` / `pooling` 與 `cache_ram`。
   - reranker：另有固定角色旗標 `embedding` / `pooling` / `reranking` 與
     `cache_ram`。
@@ -347,16 +347,30 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
   (下界 = 權重剛好放得進該 role 所選 GPU 目前 free VRAM 的層數,上界 = 全部移到
   RAM),例如 `推薦數值:38-43`。估算只含 GGUF 權重 storage(未計 KV cache /
   compute buffer / 共卡的附屬服務),是起點而非保證,也不限制輸入);
+  主模型那題另扣 CPU-MoE 時 `-ub` 加大多出的 compute buffer 估計
+  `4 × Δubatch × (n_vocab + 64 × n_embd)` bytes(維度取自 GGUF 的 `output.weight`,沒有才用
+  `token_embd.weight`;Δubatch 用實際寫進設定的兩個 `-ub`,小 ctx 會夾限),只影響 N≥1 的推薦
+  (N=0 走一般 `-ub`,沒有這塊 buffer);題目以 MiB 顯示扣了多少,讀不到維度就不扣並明講。
+  係數以三顆本機模型的 `llama-fit-params` 試算校準,是估計值、不是任意模型的上界;
+  VL 那題算法不變(仍扣 fit-target 3072 MiB);
   四個角色固定 `-np 1`,VL 使用 `-ngl auto --fit on --fit-target 3072`
   (VL 的啟動機制)。層數的值完全由使用者輸入(互動題或
   `--n-cpu-moe N` / `--vl-n-cpu-moe N` 旗標),工具只驗證 0-1024 範圍:
   `0` = 不 offload(不寫任何 CPU-MoE 鍵)、`N` = `n_cpu_moe: N`、
   輸入超過最大 blk 編號(或 build 不支援 `--n-cpu-moe`)→ `cpu_moe: true`。
   放不放得下 VRAM 以啟動後 `nvidia-smi` 實測為準。
+  主模型的 `batch` / `ubatch`:一般是 `min(2048, ctx)` / `min(512, batch)`;套 CPU-MoE
+  (`cpu_moe` 或 `n_cpu_moe`)時 `batch = ubatch = min(2048, ctx)`。留在 RAM 的 experts 每個
+  ubatch 都要整批搬上 GPU 算一次,ubatch 越大,長 prompt 的 prefill 搬運趟數越少;代價是
+  compute buffer 變大(上面那段扣除)。既有部署要重跑 `./set_config.sh`(或手改
+  `services.main.ubatch`)並重啟 main 才生效;重啟後 canary 與 figure_verify 的快取會因
+  deployment 雜湊改變失效一次。
 - embedding 與 reranker 另支援 `cache_ram`(整數 `0..262144` MiB，映射為
   `--cache-ram N`)；內建與 `set_config.sh` 預設都固定為 `0`。這兩種非生成服務的
   prompt cache 無法重用，保留預設 8192 MiB 上限只會讓不同輸入逐步累積 host RAM。
-  main 與 VL 不接受這個 profile key，main 的生成 prompt cache 保持原行為。
+  main 可以手設同一個鍵(驗證與 `--cache-ram` 映射相同):省略就是 llama.cpp 自己的預設
+  (b10276 為 8192 MiB);`set_config.sh` 不寫它,重跑保留使用者的值。這個上限同時容納
+  prompt cache 與 context checkpoint,沒有實測不要宣稱某個值一定夠。VL 不接受這個 key。
   `set_config.sh` 會先探測 build 是否支援 `--cache-ram`，舊 build 直接 fail-loud，
   不會靜默省略安全預設；也不另暴露可能互相矛盾的 `cache_idle_slots`。
 - `no_mmap`(→ `--no-mmap`)屬**使用者領域**,`set_config.sh` 從不自動決定:代價是啟動時要把整份
@@ -570,7 +584,7 @@ CodeTrail 的每項操作只使用選定的主要實作。必要套件、工具�
 | `set_config` 偵測主模型 thinking 控制 | Jinja2；安裝 `requirements.txt`。只解析所選 GGUF 的模板 AST，不執行模板；缺少 parser 直接拒絕設定，不改用文字比對。無法確認模板能力時明列不支援，並寫入 `thinking_kwarg: null`。 |
 | 已啟用的 [DSpark](#dspark) | 配對的本地 draft GGUF（含完整 shards）與支援 `draft-dspark` 的 llama-server。設定與啟動驗證相依性；啟動、host readiness 與 strict status 必須由 `/slots` 確認真正啟用，缺席／失敗不退回普通解碼後宣稱成功。關閉不要求 draft 或 DSpark binary 能力。 |
 | RAG / Code RAG 向量運算、MMR、KB ingest | NumPy；安裝 `requirements.txt`。缺少或壞掉的套件不會被當成 cache 損壞，也不改用另一套運算。 |
-| 中文 BM25 | jieba；安裝 `requirements.txt`。不改用逐字分詞。 |
+| 中文 BM25 | jieba；安裝 `requirements.txt`。不改用逐字分詞。BM25 索引快取（`bm25.npz`，與向量 cache 同目錄、同一套 dir-fd／`O_NOFOLLOW` 防線）命中前也先驗 jieba；身分（schema、分詞規則版本、jieba 版本與辭典 sha256、三套語料雜湊）不符就在記憶體重建；只有非 readonly 的 MCP 會寫它。改 `_tokenize_for_bm25` 的規則必須把 `BM25_TOKENIZER_VERSION` 加 1。 |
 | Python / C / C++ 解析 | Python 用 stdlib `ast`；C/C++ 用 requirements 釘版的 tree-sitter 與 grammar，缺席或 ABI 不相容即報錯。 |
 | JavaScript / TypeScript / Go / Rust 解析 | 使用 tree-sitter，需自行安裝與本 repo tree-sitter 相容的 `tree-sitter-javascript` / `tree-sitter-typescript` / `tree-sitter-go` / `tree-sitter-rust` grammar。doctor 列出可用狀態；缺席時不改用 regex。 |
 | 其他受支援的 Ctags 語言 | Universal Ctags 必須啟用且包含該語言。缺少執行檔、JSON 能力或語言支援就報錯；不改用 regex。未定義 AST/Ctags backend 的副檔名仍使用其原有通用文字表示。 |
@@ -578,7 +592,7 @@ CodeTrail 的每項操作只使用選定的主要實作。必要套件、工具�
 | `run_lint` | 使用 `config.LINT_COMMANDS` 對該副檔名、模式指定的唯一命令（如 Python 的 ruff、C/C++ 的 clang-format）。缺席或失敗就報錯。專案語言工具需另備，CodeTrail 部署本身不需 Node。 |
 | ELF 分析 / ingest | pyelftools；需要反組譯時必須能執行選定的 objdump，有 C++ mangled symbol 時需要 c++filt。不改用 readelf / Capstone；跨架構 objdump 請在 `client.json` 明確指定。 |
 | 專用 reranking | 專用 reranker 服務。缺席、逾時、HTTP 或回應格式錯誤即報錯，不改用 embedding 排序或主模型。 |
-| 已啟用的 query expansion / multi-query | 設定正確且可用的模型服務；服務或協定失敗會傳出錯誤。模型合法地未產生額外查詢仍是有效資料結果。 |
+| 已啟用的 query expansion / multi-query | 設定正確且可用的模型服務；服務或協定失敗會傳出錯誤。模型合法地未產生額外查詢仍是有效資料結果。每次擴寫的輸出上限是 `config.KB_EXPANSION_MAX_TOKENS`（同時是 gate 保留額）、遇 `config.KB_EXPANSION_STOP` 停止；撞上限視同過長而丟棄，每次查詢最多送 `config.KB_EXPANSION_MAX_CALLS` 次擴寫請求。 |
 | TUI / headless `run` | 主 server `/props` 必須回正整數 n_ctx；同值交給 Engine 與 MCP。取不到就拒絕啟動回合，不改用設定檔估值。 |
 | 聊天容量檢查與自動壓縮 | 主 llama-server 必須支援 `/v1/chat/completions/input_tokens`，接受完整 chat payload 並回非負整數 `input_tokens`。每次容量決策重新計算 system、工具 schema、reasoning 與模板標記；端點缺席、逾時、HTTP 或格式錯誤會中止該次操作，修復服務後可重試。需升級到支援此端點的 server；不退回字元估算，也不發生成／prefill 作計數探針。 |
 | 明確要求容器隔離的評測 | `auto` 只選 Podman；若明確選 Docker，必須可讀 uid/gid 並傳入容器。缺少指定 runtime 或容器模組即報錯，不改在 host 執行。 |
@@ -1233,8 +1247,15 @@ journaled 寫入 → best-effort rollback。
 
 主聊天 `/think` 每次啟動 off；能力只來自 GGUF Jinja AST 實際偵測的
 `services.main.thinking_kwarg`。每一步快照一次，計數／生成共用 extra；
-`enable_thinking` 與 `thinking` 一律送相同 JSON boolean。摘要、review、prime、canary、
-RAG 等內部生成固定 off。`show_reasoning` 只改顯示，`keep_historical_reasoning` 只改送模轉換。
+`enable_thinking` 與 `thinking` 一律送相同 JSON boolean。摘要、review、canary、RAG 等內部生成
+固定 off；prime 用與下一輪相同的 thinking 快照（與歷史在同一個臨界區取得，計數與 POST 共用），
+所以 think on 也預熱。`show_reasoning` 只改顯示，`keep_historical_reasoning` 只改送模轉換。
+
+主 server `/props` 的 `chat_template_caps.supports_parallel_tool_calls` 只有 JSON true 時，
+每個 model step 的計數與生成共用的 extra 才明送 `parallel_tool_calls: true`（舊版 llama-server
+預設每則訊息只准一個 tool call）。這個能力與 live n_ctx 出自同一次 `/props` 觀測：TUI 由
+preflight 的 `observe_n_ctx`，headless 由 `observe_main_server`；字串、數字、缺欄或舊版 server
+沒有 caps 一律視為不支援。/review 引擎繼承同一個值；prime 與壓縮摘要不帶這個鍵。
 
 新增主模型 call site 在呼叫當下使用 `config.require_main_model()`，不取 import-time snapshot。
 聊天沿用 `Engine.count_input_tokens()`，將同份 payload 的計數與實送輸出保留額交給 gate。
@@ -1263,16 +1284,24 @@ reasoning 剝除；heal 補的 tool result 緊接宣告 assistant 群組的既�
 | 介面 | 不可放寬的契約 |
 |---|---|
 | `next_turn_prefix()` | 下一輪 payload 的同一份轉換，佔位 user 不落檔也不送出 |
-| `prime_prompt_cache()` | interactive／thinking off 才可；零 session／history／事件寫入，非阻塞取共用模型鎖後快照、slots、計數、gate，再送 `max_tokens=1`，保留額也是 1 |
+| `prime_prompt_cache()` | interactive 才可，計數與 POST 用下一輪同一個 thinking 快照；零 session／history／事件寫入，非阻塞取共用模型鎖後快照、slots、計數、gate，再送 `max_tokens=1`，保留額也是 1 |
 | `abort_prime()` | 先作廢世代／Event，shutdown 已登記 socket 再放鎖；取消後才連上的 socket 先關閉，不能補送 HTTP |
 | `http_cancel.RequestCancellation` | 專用 transport，涵蓋 headers 前／DNS／connect／TLS；並行取消等待 shutdown，保留 TLS 驗證，不改共用 session／pool |
 | `prepare_idle()` | codetrail 接續歷史超門檻時先可取消壓縮，完成收尾才排 prime；manual／off 不自動摘要 |
-| `prime_in_background()` | 不取回合鎖、不動取消狀態；每次 outcome 先 `on_prime` 再 `on_done` |
+| `prime_in_background()` | 不取回合鎖、不動取消狀態；每次 outcome 先 `on_prime` 再 `on_done`；協調器自己只在壓縮換掉歷史後與 think on 回合成功收尾後各排一次 |
 
 prime 只有終結 chunk 且帶 `timings.prompt_n` 才算 sent；EOF／no_timings 不寫 telemetry。
 new／adopt 切換期間不准舊 history 預熱，create／adopt 失敗恢復原准入；中止需在一秒內完成
-且模型鎖已放。主聊天 thinking on 跳過 prime，切換 thinking 先 abort 再作廢計數。
+且模型鎖已放。think on 時下一輪會剝掉上一輪的 reasoning，前綴從上一輪第一則 assistant 就分岔；
+所以訊息回合成功收尾（沒有接續佇列、沒有壓縮換掉歷史）後，協調器在回合鎖外排一次 prime
+（`/status` 觸發=turn），把那段重算搬到閒置時間。切換 thinking 先 abort 再作廢計數。
 
+摘要請求沿用對話前綴：對話 system＋同一份 tools（實送 `tool_choice=none`）＋與
+`next_turn_prefix()` 同一轉換的 head（固定剪枝、heal、以「下一則真實 user」為界剝 reasoning），
+任務說明、七條規則、狀態校正節錄與先前摘要放在最後一則 user 指示。第一批只在 head 結尾之後
+分岔，llama.cpp 由 head 結尾之前最近、仍保留的 context checkpoint 接續（舊回合的保留點間距
+超過 8192 token，最壞多重算約這麼多）；後續批次不共用前綴。新增的指示與節錄不帶工具參數與輸出，
+對話前綴本身含原有的工具呼叫。
 過大摘要按完整 user-turn 分批，每批精確 gate／七欄格式驗證，replacement 也驗容量；
 全部成功才先落檔再換記憶體。網路／計數故障可重試，空／reasoning-only／格式漂移等不可信
 產出才 durable 停用。最後未回答 user 逐字留 tail，取消回合不是可恢復待辦；詳見
@@ -1282,7 +1311,8 @@ new／adopt 切換期間不准舊 history 預熱，create／adopt 失敗恢復�
 串流及 MCP call，核准只回答一次且只接受真 bool；閒置取消回 False。取消不是答案，
 不得追加假 assistant final；必須送 `step_finish(reason=cancelled)`，並以 append-only 身分記錄
 綁定真實 user 與已接收 supplement。收斂只用本輪實際工具證據，最多一次，先 gate 再用
-`tool_choice=none` 請求；錯誤或再次工具宣告不能冒充答案。
+`tool_choice=none` 請求；短暫指示是請求尾端的一則 user（不改 system），請求因此延伸上一步、
+由上一步 prompt 尾端的 checkpoint 接續。錯誤或再次工具宣告不能冒充答案。
 <a id="index-scope"></a>
 
 ### 索引範圍與快取
@@ -1394,6 +1424,16 @@ schema 版本)寫進 `.code_rag_cache_meta.json`。
   return),整個 MCP process 會一路用缺 embedding 的索引降級下去。回歸鎖:
   `test_backfill_failure_leaves_no_partial_index`。
 - scope 熱重載是另案;改了設定要重啟 MCP server。
+- `.code_rag_cache_emb.npz` 以不壓縮的 `np.savez` 寫入(float32 尾數壓不太動,壓縮只多付寫入與
+  每次載入的 CPU);舊的壓縮檔照樣載入,md5 / row_count 驗證與格式無關。NPZ 還原的列是 float32
+  view,「有沒有向量」一律用 `_has_vector` 判斷;lazy 分支寫回 item / JSON 前轉回 Python list。
+- query 的字面分數走實例層倒排索引:profile 依「`_lexical_profile` 讀到的欄位內容 + 兩個
+  `CODE_RAG_LEXICAL_*` 預算」沿用,任一預算改了就全部重新斷詞;`_token_match_score` 保留為逐筆
+  參考實作,兩條路徑分數逐位元相同。
+- fresh 掃描對小檔記 stat 指紋(`_hash_memo`:dev/ino/size/mtime_ns/ctime_ns):讀檔前後指紋相同、
+  且 mtime / ctime 都早於本次掃描開始前 2 秒才記,下次指紋相同就沿用 md5(racy-git 規則)。
+  只信任 `/proc/self/mountinfo` 判定為 ctime 可信的本機檔案系統(ext2/3/4、xfs、btrfs、tmpfs、
+  f2fs、zfs、bcachefs),其他裝置每次讀內容;用 `stat` 而不是 `lstat`,因為索引經 symlink 讀的是目標檔。
 <a id="contextual-retrieval"></a>
 
 ### Contextual Retrieval 與 KB 對照
@@ -1878,6 +1918,9 @@ python3 scripts/session_eval.py bundle \
 - 不自動把 LLM-as-judge 分數當 promotion gate。
 - 不在同一個正式 session 中途混用模型。需要救援比較時 fork 成兩個分支，分開歸因。
 - `--skip-aux-preflight` 只適用保證不會用 Code-RAG／RAG／VL 的 suite；正常真實題不要跳。
+- MCP 的 `--aux-preflight-done` 只供 aicode 啟動流程內部使用：preflight 的附屬探測通過後，
+  交給 canary 協定 lane 與主 MCP 的第一次 spawn，避免同一次啟動重複探測。它不是 eval／replay
+  開關；headless `run`、/review、session_eval 都不帶。
 <a id="troubleshooting"></a>
 
 ## 故障排解
@@ -1972,7 +2015,9 @@ RAM 足夠才考慮在該 role `parameters` 加 `"no_mmap": true`，validate 後
 這會增加啟動時間與 RAM 占用，set_config 不替你決定，但會保留手動設定。
 先前量到的秒數不能當其他模型／硬體的效能保證。RAM 壓力要一起看 `free -g` 與 process RSS。
 
-主聊天 `/think` 預設 off；on 可能延長首字，且會跳過 prefix 預熱。
+主聊天 `/think` 預設 off；on 可能延長首字。think on 時下一輪會剝掉上一輪的 reasoning，
+所以每次回答完成後背景預熱一次（`/status` 觸發=turn）；預熱還沒跑完就送出下一題時，
+那一輪在模型鎖上等它，算好的 prefill 會被沿用。
 預熱只把 prefill 移到輸入問題的時間，不會加速硬體。`/status` 可看最近 prime outcome，
 不能將 no_timings／incomplete 當成已送。判 cache 熱度比較完整輸入與重算量，
 `timings.prompt_n` 不是完整 prompt token。換 system、工具 catalog、session 或規則也會改 prefix。
@@ -2196,7 +2241,8 @@ lease 是 `live` 而 incident 是 `promise_without_call` → 退出後
 | `grep_code` 只換 pattern，path/include/context 相同，完整結果的命中數、檔名／行號與內容都相同 | 三次相同觀察後 |
 
 不同的無命中查詢、截斷的 grep 結果不會因 pattern 近似就被合併。同批只要有新證據或狀態改變，
-便可繼續查證。判定停滯後，客戶端只再請模型整理一次答案（`tool_choice=none`），不再執行新工具。
+便可繼續查證。判定停滯後，客戶端只再請模型整理一次答案（`tool_choice=none`），不再執行新工具；
+整理指示接在請求尾端，前面與上一步的請求相同，server 不必整段重算。
 查無之後照 `next:` 改用另一種索引確認一次，是不同工具的新查詢，不算重複；把同一個查無的呼叫原樣
 重送才會被判定停滯。
 
@@ -2308,6 +2354,10 @@ python3 <CODETRAIL_REPO>/mcp_server.py --root "$PWD"
 
 - `[MCP][model-preflight] FAIL` → 對應的 embedding / reranker / VL server 沒 ready;
   先跑 `python3 <CODETRAIL_REPO>/scripts/required_model_servers_check.py`。
+- `[MCP] model-preflight 已由啟動它的 aicode 在本次啟動完成，不重複探測` → 正常:沿用
+  aicode preflight 剛跑完的同一道探測(只有啟動時第一次 spawn)。手動啟動、取消逾時後的重建
+  與 /review 都照常探測。附屬 server 若在 aicode 啟動後才停掉,要到第一個用到它的工具才
+  報錯;跑上面那支檢查或重開 aicode。
 - `ModuleNotFoundError` → 你用來啟動 `aicode` 的那顆 Python 缺依賴;用**同一顆
   Python** 安裝 `requirements.txt`,或重跑 `set_config.sh`。
 - `[FATAL] sandbox root ...` → 必須從具體 project 目錄走 `aicode`,不可把 `/` 或 `$HOME`
@@ -2538,7 +2588,7 @@ curl -s http://localhost:8083/health
 
 health OK 只是基本可達；VL、工具 calling、DSpark 與模型身分仍各自驗證。
 embedding／reranker 的 `cache_ram: 0` 是安全預設，不應因升級就刪掉；main 的生成 cache
-與這項 workaround 分開。缺 `--cache-ram` 需更新 build。
+與這項 workaround 分開：main 可手設 `cache_ram`，重跑 set_config 保留。缺 `--cache-ram` 需更新 build。
 
 短 embedding 成功、真實 ingest 卻回 `input ... too large`，查看 physical batch `-ub`。
 embedding 產生設定為 `-c/-b/-ub 8192`；reranker 用精靈必答的 buffer 同步三個值。

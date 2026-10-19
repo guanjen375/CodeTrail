@@ -114,6 +114,13 @@ class Preflight:
     root: Path
     model: str = ""
     n_ctx: int = 0
+    #: 主 server /props 的 ``chat_template_caps.supports_parallel_tool_calls`` 是 JSON true
+    #: 才為 True(:func:`observe_n_ctx` 與 n_ctx 取自同一次觀測)。
+    parallel_tool_calls: bool = False
+    #: :func:`check_required_servers` 在**這一次** preflight 裡實際探測過、而且三個附屬
+    #: server 全部通過才為 True。它是「免重複探測」的唯一證據:canary 協定 lane 與
+    #: 主 MCP 只有看到它才在第一次 spawn 帶 ``--aux-preflight-done``,沒有就照常探測。
+    aux_preflight_passed: bool = False
     #: 完整 transcript(``run()`` 收尾時填);語意與內容 = 使用者在終端看到的那一段。
     lines: list[str] = field(default_factory=list)
     #: 通過之後仍要進 TUI 的訊息,依實際發生順序:``note(keep=True)`` 的那幾則
@@ -235,8 +242,23 @@ def resolve_model(result: Preflight, profile: Any) -> str:
     return resolved.model
 
 
-def observe_main_n_ctx(base_url: str) -> int:
-    """TUI/headless 共用的安靜觀測；沒有 live n_ctx 就拒絕呼叫模型。"""
+@dataclass(frozen=True)
+class MainServerInfo:
+    """主 server ``/props`` 的**一次**觀測:live n_ctx 與 parallel tool call 能力。"""
+
+    n_ctx: int
+    parallel_tool_calls: bool
+
+
+def observe_main_server(base_url: str) -> MainServerInfo:
+    """TUI/headless 共用的安靜觀測:一次 ``/props`` 同時取 n_ctx 與 parallel tool call 能力。
+
+    n_ctx 沒有 live 值就拒絕呼叫模型(不拿 deployment main.ctx 代替)。parallel tool
+    call 只認 ``chat_template_caps.supports_parallel_tool_calls`` 是 **JSON true**:
+    ``bool("false")`` 是 True,欄位缺席、字串、1、舊版 server 沒有 caps 一律當作不支援
+    —— 對一個模板宣告不了的 server 明送 ``parallel_tool_calls`` 是靜默的錯,而少送只是
+    退回 server 自己的預設。
+    """
     import gpu_safety
 
     try:
@@ -252,15 +274,19 @@ def observe_main_n_ctx(base_url: str) -> int:
             "主 server /props 沒有有效的正整數 n_ctx；"
             "請啟動或修復 llama-server 後重試，不使用 deployment main.ctx 代替。"
         )
-    return observed
+    props = getattr(info, "raw_props", None) or {}
+    caps = props.get("chat_template_caps") if isinstance(props, dict) else None
+    parallel = isinstance(caps, dict) and caps.get("supports_parallel_tool_calls") is True
+    return MainServerInfo(n_ctx=observed, parallel_tool_calls=parallel)
 
 
 def observe_n_ctx(result: Preflight, profile: Any) -> int:
-    """主模型 n_ctx 只取 server /props 的實值。"""
-    observed = observe_main_n_ctx(profile.service("main").base_url)
-    result.note(f"n_ctx={observed}(來自主 server)")
-    result.n_ctx = observed
-    return observed
+    """主模型 n_ctx 只取 server /props 的實值;parallel tool call 能力取自同一次觀測。"""
+    server = observe_main_server(profile.service("main").base_url)
+    result.note(f"n_ctx={server.n_ctx}(來自主 server)")
+    result.n_ctx = server.n_ctx
+    result.parallel_tool_calls = server.parallel_tool_calls
+    return server.n_ctx
 
 
 def check_ctx_safety(result: Preflight, profile: Any, requested: int) -> None:
@@ -398,6 +424,10 @@ def check_required_servers(result: Preflight) -> None:
 
     比 doctor 嚴格:doctor 是診斷,這裡是啟動閘 —— 缺 reranker 的 session
     會在使用者問第一個 RAG 問題時才炸,而那時他已經在對話裡了。
+
+    通過時記下 ``aux_preflight_passed``:這次啟動流程內**第一次** spawn 的 MCP
+    (canary 協定 lane、主 MCP)跑的是同一份 ``run_checks()``、問的是同一份 profile,
+    憑這個證據才免重複探測。沒有通過就直接拒絕啟動,不會走到那兩個 spawn。
     """
     from scripts import required_model_servers_check as required
 
@@ -406,6 +436,7 @@ def check_required_servers(result: Preflight) -> None:
         result.note(line)
     if not all(check.ok for check in checks):
         raise PreflightError("附屬模型 server 尚未就緒(見上面的 model-preflight 行)。")
+    result.aux_preflight_passed = True
 
 
 def check_tool_health(result: Preflight, profile: Any) -> None:
@@ -417,6 +448,10 @@ def check_tool_health(result: Preflight, profile: Any) -> None:
     交給它的是 preflight 已經解析好的模型與 profile 的 endpoint —— canary 驗的
     必須就是等一下真的要跑的那一顆模型、真的要連的那一台 server。`env` 只是
     子行程要繼承的使用者環境與檔案位置(HOME / XDG_CACHE_HOME),不是設定來源。
+
+    協定 lane 的 MCP 是這次啟動流程內第一次 spawn 的 server:附屬探測剛在
+    :func:`check_required_servers` 通過(``aux_preflight_passed``)才免重複探測;
+    model lane 的 headless 子行程照常探測。
     """
     from scripts import tool_call_canary
 
@@ -430,6 +465,7 @@ def check_tool_health(result: Preflight, profile: Any) -> None:
         explicit_model=result.model,
         base_url=profile.service("main").base_url,
         force=False,
+        aux_preflight_done=result.aux_preflight_passed is True,
     )
     if exit_code != 0:
         raise PreflightError("工具健檢拒絕啟動(見上面的 tool-health 行)。")

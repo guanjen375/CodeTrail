@@ -243,7 +243,7 @@ def _run_process_with_heartbeat(
 
 
 def run_protocol_roundtrip(
-    *, root: Path, timeout: int
+    *, root: Path, timeout: int, aux_preflight_done: bool = False
 ) -> tuple[tuple[str, ...], bool, ProtocolEvidence]:
     """initialize → tools/list → list_dir,走客戶端真正用的那一條路。
 
@@ -255,8 +255,14 @@ def run_protocol_roundtrip(
     `process_env.STRIPPED_ENV_PREFIXES` 剛剝掉的那幾組原封不動加回去 ——
     包含核准後的 `run_command` 子行程會繼承的那些機密。client 本來就會繼承
     這個行程的環境,不需要我們再遞一次。
+
+    `aux_preflight_done`:只有 aicode 的 preflight 剛在同一次啟動流程內通過附屬
+    探測時才是 True;`McpClient` 只把它交給第一次 spawn(取消逾時的重建照常探測)。
+    canary CLI、doctor 不帶 → server 照常探測。
     """
-    client = client_mcp.McpClient(root, start_timeout=float(timeout))
+    client = client_mcp.McpClient(
+        root, start_timeout=float(timeout), aux_preflight_done=aux_preflight_done is True
+    )
     try:
         try:
             specs = client.tools()
@@ -289,10 +295,12 @@ def run_protocol_roundtrip(
         client.close()
 
 
-def run_protocol_check(*, root: Path, timeout: int) -> ProtocolEvidence:
+def run_protocol_check(
+    *, root: Path, timeout: int, aux_preflight_done: bool = False
+) -> ProtocolEvidence:
     try:
         names, list_dir_error, evidence = run_protocol_roundtrip(
-            root=root, timeout=timeout
+            root=root, timeout=timeout, aux_preflight_done=aux_preflight_done is True
         )
     except CanaryError:
         raise
@@ -1026,15 +1034,23 @@ def run_all(
     explicit_model: str,
     base_url: str,
     force: bool,
+    aux_preflight_done: bool = False,
 ) -> int:
     """`env` 只是**檔案位置**(HOME / XDG_CACHE_HOME)與子行程要繼承的使用者環境;
-    每一個設定值(模型、endpoint、逾時、TTL)都由參數或 `config.py` 常數決定。"""
+    每一個設定值(模型、endpoint、逾時、TTL)都由參數或 `config.py` 常數決定。
+
+    `aux_preflight_done=True` 只由 aicode 的 preflight 在附屬探測剛通過後傳入:協定
+    lane 的 MCP 因此免重複探測(model lane 的 headless 子行程照常探測)。只有 True
+    才把它交給 `run_protocol_check`,其餘情況的呼叫形狀與以前完全相同。"""
     mcp_timeout = TOOL_CANARY_MCP_TIMEOUT_SECONDS
     model_timeout = TOOL_CANARY_MODEL_TIMEOUT_SECONDS
     implicit_timeout = TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS
     ttl_seconds = TOOL_CANARY_TTL_SECONDS
+    protocol_kwargs = {"aux_preflight_done": True} if aux_preflight_done is True else {}
     try:
-        protocol_evidence = run_protocol_check(root=root, timeout=mcp_timeout)
+        protocol_evidence = run_protocol_check(
+            root=root, timeout=mcp_timeout, **protocol_kwargs
+        )
     except CanaryError as exc:
         return _handle_failure(str(exc))
 

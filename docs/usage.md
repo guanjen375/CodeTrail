@@ -133,8 +133,10 @@ Ctrl+P 不開啟任何指令面板，主題只能用 `/theme` 切換。
 只控制 reasoning 本文與歷史重播是否顯示，不改生成開關。舊 reasoning 是否送回模型
 仍由另一個鍵 `keep_historical_reasoning` 決定。
 
-摘要、審查、RAG 與其他內部生成一律關閉 thinking。主聊天開啟 thinking 時不做
-prompt cache 預熱；詳細延遲與快取診斷見 [常見問題](../developer.md#troubleshooting)。
+摘要、審查、RAG 與其他內部生成一律關閉 thinking。prompt cache 預熱用與下一輪相同的
+thinking 設定；開啟 thinking 時下一輪會剝掉上一輪的 reasoning，所以每次回答完成後會在背景
+預熱一次（`/status` 顯示觸發=turn）。詳細延遲與快取診斷見
+[常見問題](../developer.md#troubleshooting)。
 
 ### 等待回應與壓縮進度
 
@@ -829,7 +831,9 @@ CLI 明確指定根外文件時保留原生抽取流程，並顯示「不支援 
 
 checkpoint 存於 `<project>/.codetrail/ingest/doc-<來源相對路徑hash>/`，私有目錄 0700、檔案 0600；共用的 `.codetrail/` 可沿用同 owner 的 0775 目錄，但仍拒絕 world-write。所有私有讀寫沿 dir-fd 與 `O_NOFOLLOW`，拒絕 hardlink、錯誤 owner／權限與損壞內容。`runner.lock` 的 flock 覆蓋抽取、embedding 到 KB 提交，同文件只能有一個 runner。
 
-成功單元依序 fsync 產物、追加並 fsync 單元 journal，再原子發布小型 committed head；每筆 embedding 不重寫全份清單。`state.json` 在模型身分、候選計畫與文件階段邊界保存完整快照和 journal watermark。續跑及唯讀 `ingest-status` 從快照重播已發布增量，核對 checkpoint 身分、序號、offset 與 SHA-256 鏈；舊版 v1 快照可保留完成單元並升級到 v2，舊版 writer 會拒絕新格式。
+成功單元依序 fsync 產物、追加並 fsync 單元 journal，再原子發布小型 committed head；每筆 embedding 不重寫全份清單。
+
+embedding server 的 `/slots` 回報恰好 1 個 slot 時，未命中的 embedding 依 `EMBED_BATCH_SIZE`／`EMBED_BATCH_MAX_CHARS` 分批送 `/v1/embeddings`（每批 HTTP 逾時 300 秒）。每批先以一次 journal fsync 加一次 head 發布把該批單元標成 `running`；回應逐列驗證後，產物檔逐一 fsync 與 rename、目錄只 fsync 一次，再以一次 journal fsync 加一次 head 發布整批標成成功，每筆紀錄仍有自己的序號與 SHA-256 鏈。任一列不合格整批不提交；中斷或失敗後續跑只重算未提交的批。探測走不重試的專用連線，每次入庫呼叫都重新探測；`/slots` 取不到、被關閉、不是 list 或不是恰好 1 個 slot 時維持逐筆。兩條路徑的向量逐位元相同、單元身分相同，可以交叉續跑；embedding server 維持 `-np 1`（多 slot 併算會改變向量）。`state.json` 在模型身分、候選計畫與文件階段邊界保存完整快照和 journal watermark。續跑及唯讀 `ingest-status` 從快照重播已發布增量，核對 checkpoint 身分、序號、offset 與 SHA-256 鏈；舊版 v1 快照可保留完成單元並升級到 v2，舊版 writer 會拒絕新格式。
 
 head 之外的未發布尾端不能復用，只有取得 runner lock 的續跑會截去該尾端；status 不截斷、不建檔、不探測模型。head 發布失敗會回滾，連回滾也失敗則明示拒絕恢復，不能猜測成功。已提交 journal／head 缺失或損壞會拒絕，不退回舊快照重新抽取；程序中斷留下 `running` 不會被當成功。狀態與單一產物有 128 MiB 上限，journal 有 512 MiB 上限，來源 hash 有 1 GiB 上限，超過會明示拒絕。
 
@@ -899,6 +903,9 @@ figure retention 不清這個目錄，`fresh` 也不刪它。未引用的舊產�
   也不用來路不明的向量回答。
 - **舊版本的 `knowledge_emb.npz`** 會在下一次載入時處理掉：完整驗證通過就遷移進
   cache 再收掉，驗不過就直接淘汰並重建。不需要手動處理。
+- **同一個目錄還有 BM25 索引快取（`bm25.npz`）**，只為了加快 MCP 啟動。身分涵蓋分詞規則版本、
+  jieba 版本與辭典、所有語料文字；任何一項不符就在記憶體重建，結果與不用快取時逐位元相同。
+  一樣隨時可刪；readonly session 不寫它，也只寫進既有的向量 cache 目錄，不另外建目錄。
 
 ### 三件容易踩的事
 

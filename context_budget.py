@@ -74,6 +74,10 @@ class ContextUsage:
     #: 保留額是呼叫端明講的(客戶端 request),還是退回內部預設。
     #: 只影響 overflow 訊息要指哪一個 env,不進 JSONL 之外的任何判斷。
     reserve_is_explicit: bool = False
+    #: 呼叫端明講「這一次的保留額由哪個常數決定」時的名稱(例如 strict 的
+    #: config.RESERVED_OUTPUT_TOKENS、KB 擴寫的 config.KB_EXPANSION_MAX_TOKENS)。
+    #: 只給 overflow 訊息用,不寫進 JSONL(見 to_log_dict)。
+    reserve_name: str | None = None
     # When the gate refuses, we still want to log the attempt for visibility.
     error_type: str | None = None
     timestamp: float = field(default_factory=time.time)
@@ -85,6 +89,8 @@ class ContextUsage:
         """
         d = asdict(self)
         # trim_summary 是結構化 metadata(類型/長度/數量),不含原文。
+        # reserve_name 只給 overflow 訊息用;JSONL 欄位維持原樣。
+        d.pop("reserve_name", None)
         return d
 
 
@@ -248,6 +254,7 @@ def build_usage(
     reserved_output_tokens: int | None = None,
     measured_input_tokens: int | None = None,
     count_method: str | None = None,
+    reserve_name: str | None = None,
 ) -> ContextUsage:
     """Compute a ContextUsage snapshot for a pending request.
 
@@ -313,6 +320,7 @@ def build_usage(
         count_method=method,
         reserved_output_tokens=reserved,
         reserve_is_explicit=reserve_is_explicit,
+        reserve_name=reserve_name,
         estimated_total_tokens=est_total,
         utilization_pct=round(util * 100.0, 2),
         soft_warning=util >= soft and util < hard,
@@ -354,7 +362,11 @@ def _reserve_env_name(usage: ContextUsage) -> str:
 
     依「呼叫端有沒有自己帶保留額」判斷,不是比對數值:兩個常數剛好被設成同一
     個數字時,knowledge 路徑會被指去改客戶端的 env,照做也不會有任何改變。
+    呼叫端帶了 ``reserve_name``(自己的保留額來自另一個常數,例如 strict 與 KB 擴寫)
+    就指名那一個——指成客戶端的常數,照做同樣不會有任何改變。
     """
+    if usage.reserve_name:
+        return usage.reserve_name
     return CLIENT_RESERVE_ENV if usage.reserve_is_explicit else INTERNAL_RESERVE_ENV
 
 
@@ -602,6 +614,7 @@ def check_and_log(
     measured_input_tokens: int | None = None,
     count_method: str | None = None,
     emit: bool = True,
+    reserve_name: str | None = None,
 ) -> ContextUsage:
     """Compute usage, enforce the hard gate, emit CLI lines, log to JSONL.
 
@@ -621,6 +634,7 @@ def check_and_log(
         reserved_output_tokens=reserved_output_tokens,
         measured_input_tokens=measured_input_tokens,
         count_method=count_method,
+        reserve_name=reserve_name,
     )
     if emit:
         emit_pre_call_lines(usage)

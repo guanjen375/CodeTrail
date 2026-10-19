@@ -239,7 +239,12 @@ def test_inline_vectors_explicitly_disable_sections_without_embedding_calls(
         raise AssertionError("inline vectors may not trigger section preparation")
 
     monkeypatch.setattr(kb_cache, "prepare_sections", forbidden)
+    # Attaching matrices removed the chunks' inline vectors; this lane is defined
+    # by inline vectors, so put them back before switching to it.
+    for chunk in kb.chunks:
+        chunk["embedding"] = [0.8, 0.6]
     kb._precompute_embeddings()
+    assert kb._embeddings is not None
     candidates = kb._hybrid_search("controller", candidate_k=2)
 
     assert kb._section_embeddings is None and kb._section_nodes == ()

@@ -427,3 +427,23 @@ def test_review_cancels_headers_and_late_connect_before_releasing_model_slot(rev
         assert len(finals) == 1 and client_events.event_part(finals[0])["reason"] == "cancelled"
     finally:
         release.set()
+
+
+# ── 速度優化 #8:/review 的 MCP 照常探測附屬 server ──
+
+
+@pytest.mark.smoke
+def test_review_mcp_probes_aux_servers_even_after_an_aux_preflight_startup(review_setup):
+    """/review 的 MCP 不是這次啟動流程的第一次 spawn:照常探測附屬 server。
+
+    主 MCP 以 `aux_preflight_done=True` 起過也一樣 —— 那是一次性的證據,不像
+    `skip_aux_preflight`(明確要求跳過)可以繼承;繼承它等於讓審查 MCP 在不知多久之後
+    靜默略過硬閘。
+    """
+    main, _snapshot, clients, _counts, _requests = review_setup
+    main.mcp.aux_preflight_done = True
+    main.mcp._aux_preflight_done_once = True  # noqa: SLF001 - 模擬主 MCP 建構時的狀態
+    outcome, _progress = _run_job(main)
+    assert outcome.reason == "stop" and len(clients) == 1
+    assert clients[0].kwargs["readonly"] is True
+    assert "aux_preflight_done" not in clients[0].kwargs

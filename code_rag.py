@@ -16,6 +16,7 @@ import json
 import tempfile
 import time as _time
 import hashlib
+import operator
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -168,6 +169,79 @@ def compute_file_hash(filepath: Path, max_bytes: int = CONTENT_HASH_MAX_BYTES) -
         return hashlib.md5(f"{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()
     except OSError:
         return ""
+
+
+# fresh 掃描的 racy 視窗。stat 指紋沿用上一次的內容 md5(CodeRAG._fingerprinted_file_hash)
+# 只收「mtime 與 ctime 都早於這次掃描開始前 2 秒」的檔:檔案系統的時間戳有粒度
+# (kernel coarse clock 的 tick),同一個時間戳內再寫一次、size 又沒變的話,stat 完全
+# 看不出來,只有讀內容看得出來。時間戳太新的檔下一次 fresh 掃描照舊讀檔(git 的 racy-git
+# 規則)。哪些檔案系統的 ctime 可以信任見 _CTIME_TRUSTED_FILESYSTEMS。
+_SCAN_RACY_WINDOW_NS = 2_000_000_000
+
+# stat 指紋的前提:st_ctime 是檔案系統如實維護的「最後一次變動時間」(寫入、utime 都會把
+# 它推到現在),而且 stat 回的是當下的屬性。不是每個檔案系統都成立:vfat / exFAT 在 Linux
+# 上 ctime 跟著 mtime 走(touch -r 會一起改回去);NFS 的屬性快取讓 stat 最長 acregmax 秒
+# 都回舊值(讀內容則會經 close-to-open 重新驗證);FUSE / overlay / SMB / 9p 各有語意;
+# Windows 的 st_ctime 是建立時間。命中這些地方的舊指紋就是無聲的過期索引,所以只信任下面
+# 這些本機檔案系統的裝置(依 /proc/self/mountinfo 判定),其他裝置與讀不到 mountinfo 的
+# 平台一律照舊每次讀內容。
+_CTIME_TRUSTED_FILESYSTEMS = frozenset({
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "f2fs", "zfs", "bcachefs",
+})
+
+
+def _parse_ctime_trusted_devices(mountinfo: str) -> frozenset[int]:
+    """/proc/self/mountinfo 的內容 → 檔案系統類型在白名單裡的 st_dev 集合。
+
+    每行:mount ID、parent ID、major:minor、root、mount point、options、(optional
+    fields)、"-"、fstype、source、super options。欄位內的空白會被轉義成 ``\\040``,
+    所以 " - " 只會是分隔。格式不符的行略過(= 不信任)。
+    """
+    devices = set()
+    for line in mountinfo.splitlines():
+        head, separator, tail = line.partition(" - ")
+        if not separator:
+            continue
+        fields = head.split()
+        fstype = tail.split(" ", 1)[0]
+        if len(fields) < 5 or fstype not in _CTIME_TRUSTED_FILESYSTEMS:
+            continue
+        major, colon, minor = fields[2].partition(":")
+        if colon and major.isdigit() and minor.isdigit():
+            devices.add(os.makedev(int(major), int(minor)))
+    return frozenset(devices)
+
+
+def _ctime_trusted_devices() -> frozenset[int]:
+    """這一次 fresh 掃描可以信任 stat 指紋的裝置。讀不到 mountinfo 就是空集合(全部照舊讀內容)。"""
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as handle:
+            return _parse_ctime_trusted_devices(handle.read())
+    except OSError:
+        return frozenset()
+
+
+def _stat_fingerprint(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    """(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns)。
+
+    ctime 是這一組的關鍵:``touch -r`` / ``rsync -t`` / ``cp -p`` 能把 mtime 改回去,
+    ctime 卻一定是改寫當下;編輯器的原子寫入(暫存檔 + rename)則換 inode。
+    """
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _has_vector(row) -> bool:
+    """這一列是不是真的有向量(None / 長度 0 = 缺)。
+
+    NPZ 還原的列是 float32 ndarray view(_restore_embeddings_from_npz 不再 tolist),
+    ndarray 不能拿來做 truthiness —— 超過一個元素直接 ValueError,只有一個元素時則變成
+    「值是不是 0」。其他型別維持舊的 ``bool(row)`` 語意(list / None / 舊 cache 的佔位)。
+    """
+    if row is None:
+        return False
+    if np is not None and isinstance(row, np.ndarray):
+        return len(row) > 0
+    return bool(row)
 
 
 def _normalize_text_for_cache(text: str) -> str:
@@ -327,6 +401,62 @@ def lexical_scan_text(item: dict, max_chars: int) -> str:
     return render_semantic_fields(item, max_chars)
 
 
+# ============================================================
+# lexical 通道(字面匹配)的共用零件
+#
+# 逐筆參考實作 CodeRAG._token_match_score(eval 與測試直接呼叫)與 query_ranked 用的
+# 倒排索引(CodeRAG._lexical_scores)共用同一份斷詞(_lexical_profile)與同一個計分
+# 運算式(_lexical_score),兩條路的分數因此逐位元相同,不是「大致相同」。
+# ============================================================
+_LEXICAL_IDENTIFIER_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]{2,}')
+_LEXICAL_MISSING = object()
+
+
+def _lexical_knobs() -> tuple[int, int]:
+    """lexical scorer 的兩個預算。查詢當下從 config 讀(行程內可被改),不在 def 時 snapshot。"""
+    return (config.CODE_RAG_LEXICAL_SCAN_MAX_CHARS, config.CODE_RAG_LEXICAL_MAX_IDENTIFIERS)
+
+
+def _lexical_score(hits: int, context_hits: int, token_count: int,
+                   exact_symbol_match: bool) -> float:
+    """字面匹配分數的唯一運算式(兩條路都走這裡,運算順序因此不可能分岔)。"""
+    # 如果完全匹配 symbol，直接給高分
+    if exact_symbol_match:
+        return 1.0
+    # 計算最終分數：target_tokens 匹配優先，context 匹配作為補充
+    base_score = hits / token_count
+    context_bonus = context_hits / token_count * 0.3  # context 匹配只算 30% 權重
+    return min(1.0, base_score + context_bonus)
+
+
+def _lexical_content_key(item: dict) -> tuple | None:
+    """lexical profile 的內容身分:_lexical_profile 讀到的每個欄位原值。
+
+    profile 是「這些欄位 + 兩個預算」的純函式,所以內容相同就能沿用 profile。
+    不用 item 物件身分:build_index 每次都從磁碟重載 per-file cache(_load_cache),
+    沒變的檔重建後也是新的 dict,物件身分在增量 build 之後一定對不上。
+    欄位集合就是 CANONICAL_SEMANTIC_FIELDS;_lexical_profile 讀的欄位不得超出它
+    (tests/test_code_rag_search.py 以記錄存取的 dict 守住)。缺鍵與 None 分開記;
+    非 str 的值(不該出現)回 None = 不沿用,照常斷詞。
+    """
+    key = tuple(item.get(field, _LEXICAL_MISSING) for field in CANONICAL_SEMANTIC_FIELDS)
+    for value in key:
+        if value is not _LEXICAL_MISSING and value is not None and type(value) is not str:
+            return None
+    return key
+
+
+@dataclass(frozen=True, eq=False)
+class _LexicalIndex:
+    """lexical 通道的倒排索引。三組 postings 對同一個 item 互斥,對應逐筆計分的
+    if / elif / elif:symbol 完全相同 → target token → context token。"""
+    items: tuple            # 建索引時的 index 序列(查詢時逐一比對物件身分)
+    knobs: tuple            # 建索引時的 (scan_max_chars, max_identifiers)
+    exact: dict             # symbol_lower → [位置]
+    target: dict            # symbol / path stem 的 token(不含 symbol_lower)→ [位置]
+    context: dict           # canonical 欄位 identifier 的 token(不含 target 已有的)→ [位置]
+
+
 def index_slice_aligns(index: list, cursor: int, symbols: list) -> bool:
     """``index[cursor:cursor+len(symbols)]`` 是不是就是 ``symbols`` 本身。
 
@@ -474,7 +604,7 @@ class CodeRAG:
     快取優化 v3（增量更新）：
     - 每檔案獨立快取：file_hash -> symbols + embeddings
     - 只重建變更的檔案，大幅提升大型 repo 的速度
-    - embedding 使用 numpy .npz 二進位格式（壓縮率高）
+    - embedding 使用 numpy .npz 二進位格式（不壓縮：float32 向量壓縮率很低，壓縮只多付 CPU）
     """
 
     def __init__(self, folder: str, *, build_context=None):
@@ -500,6 +630,14 @@ class CodeRAG:
         self._indexed_file_hashes = None
         # 快取裡的 scope_fingerprint 是否與現在的規則一致(見 _load_file_cache)
         self._scope_fingerprint_ok = False
+        # fresh 掃描的 stat 指紋 → 內容 md5:{rel_path: (dev, ino, size, mtime_ns,
+        # ctime_ns, hash)}。只有 _scan_code_files 的 fresh 路徑讀寫(見
+        # _fingerprinted_file_hash);build_context 路徑不用它。
+        self._hash_memo: dict[str, tuple] = {}
+        # lexical 通道:profile 依 (詞彙內容, 兩個預算) 沿用 —— (knobs, {content_key:
+        # profile});倒排索引綁「index 的 item 序列 + 兩個預算」(見 _lexical_postings)。
+        self._lexical_profiles: tuple = (None, {})
+        self._lexical_index: _LexicalIndex | None = None
 
     def for_build_context(self, context):
         """Independent query view; never mutate the process-wide default target."""
@@ -529,6 +667,10 @@ class CodeRAG:
         TTL 快照(§5-3):TTL 內直接回快照的 {rel: {filepath, hash}} shallow
         copy —— 零 os.walk、零 compute_file_hash。快照過期 / TTL=0 /
         invalidate_scan_cache() 之後才 fresh 掃描。
+
+        fresh 掃描對小檔先比 stat 指紋:與上一次 fresh 掃描記下的相同就沿用那次的
+        內容 md5,不同才照舊讀檔(_fingerprinted_file_hash;hash 字串不變)。只在 ctime
+        語意可信的本機檔案系統上這麼做,其他裝置每次照舊讀內容。
         """
         ttl = int(getattr(config, "CODE_RAG_REFRESH_TTL_SECONDS", 30))
         if self.build_context is not None:
@@ -546,21 +688,78 @@ class CodeRAG:
                 return result
 
         result = {}
+        previous_memo = self._hash_memo
+        fresh_memo: dict[str, tuple] = {}
+        # racy 截止點以「本次掃描開始」為準:掃描途中才被改的檔,時間戳一定晚於它。
+        racy_cutoff_ns = _time.time_ns() - _SCAN_RACY_WINDOW_NS
+        trusted_devices = (_ctime_trusted_devices() if self.build_context is None
+                           else frozenset())
         for filepath, rel_path in walk_index_files(self.scope):
             # §5-5:無 parser 的檔案不入 symbol 掃描(grep/list_dir 不受影響)
             selected_code = (self.build_context is not None and
                              self.build_context.parser_language(rel_path) in ("c", "cpp"))
             if not file_kind_policy.enters_symbol_scan(rel_path) and not selected_code:
                 continue
-            file_hash = self._compute_file_hash(filepath)
+            if self.build_context is not None:
+                # build_context 的 hash 來自 import 時綁定的 dependencies,不走 stat 指紋
+                file_hash = self._compute_file_hash(filepath)
+            else:
+                file_hash = self._fingerprinted_file_hash(
+                    filepath, rel_path, previous_memo, fresh_memo, racy_cutoff_ns,
+                    trusted_devices,
+                )
             if file_hash:
                 result[rel_path] = {"filepath": filepath, "hash": file_hash}
 
+        if self.build_context is None:
+            # 只留這次走訪到、而且可沿用的路徑:刪掉 / 移出範圍 / 時間戳太新的檔都不殘留
+            self._hash_memo = fresh_memo
         _INDEX_SCAN_CACHE[cache_key] = {
             "entries": {rel_path: info["hash"] for rel_path, info in result.items()},
             "timestamp": _time.time(),
         }
         return result
+
+    def _fingerprinted_file_hash(self, filepath: Path, rel_path: str, previous: dict,
+                                 fresh: dict, racy_cutoff_ns: int,
+                                 trusted_devices: frozenset) -> str:
+        """fresh 掃描用的 _compute_file_hash:stat 指紋沒變就沿用上一次的內容 md5。
+
+        沒命中時照舊呼叫 _compute_file_hash(同一個 compute_file_hash,hash 字串完全
+        相同),前後各 stat 一次:讀檔期間指紋沒變(s1 == s2),而且 mtime / ctime 都早於
+        racy 截止點(本次掃描開始前 _SCAN_RACY_WINDOW_NS)才記進 ``fresh``;其他情況
+        下次 fresh 掃描照舊讀檔。檔案不在 ``trusted_devices``(ctime 語意可信的本機檔案
+        系統,見 _CTIME_TRUSTED_FILESYSTEMS)上就不沿用也不記,每次照舊讀內容。
+
+        用 stat(跟隨 symlink)而不是 lstat:索引收 root 內指向一般檔的 symlink
+        (index_scope 以 resolve + is_file 判定),內容是經 link 讀到的目標檔,指紋必須
+        是被讀的那個檔 —— lstat 看的是 link 自己,目標被改寫時它不變。
+        大檔(> CONTENT_HASH_MAX_BYTES)本來就只 stat、不讀內容,照舊走 _compute_file_hash。
+        """
+        try:
+            before = os.stat(filepath)
+        except OSError:
+            return self._compute_file_hash(filepath)
+        if before.st_dev not in trusted_devices:
+            return self._compute_file_hash(filepath)
+        fingerprint = _stat_fingerprint(before)
+        small = before.st_size <= self._CONTENT_HASH_MAX_BYTES
+        if small:
+            entry = previous.get(rel_path)
+            if entry is not None and entry[:5] == fingerprint:
+                fresh[rel_path] = entry
+                return entry[5]
+        file_hash = self._compute_file_hash(filepath)
+        if not small or not file_hash:
+            return file_hash
+        try:
+            after = os.stat(filepath)
+        except OSError:
+            return file_hash
+        if (_stat_fingerprint(after) == fingerprint
+                and max(before.st_mtime_ns, before.st_ctime_ns) < racy_cutoff_ns):
+            fresh[rel_path] = (*fingerprint, file_hash)
+        return file_hash
 
     def _scan_code_files_fresh(self) -> dict:
         """Fresh scan helper that keeps simple no-arg test/integration hooks compatible."""
@@ -699,7 +898,10 @@ class CodeRAG:
             print(f"[CODE_RAG] cache NPZ 形狀 {matrix.shape} 與 index {len(index)} 筆"
                   "不符,安全重建", file=sys.stderr)
             return False
-        rows = matrix.tolist()
+        # 每列是 matrix 的 view,不 tolist:dense build 的 np.array(..., float32) 直接拿回
+        # 同一份位元(以前 tolist 再轉回來,值相同但大樹上要多配一份 8 倍大的 Python
+        # float list)。lazy 分支要進 JSON / 純 Python 計分的列由 build_index 自己 tolist。
+        rows = list(matrix)
         cursor = 0
         for rel_path, cached in file_cache.items():
             symbols = cached.get("symbols", [])
@@ -741,6 +943,9 @@ class CodeRAG:
           npz_md5 / row_count)temp → os.replace。kill 在任一點,讀端都能用
           md5 / row_count 驗出撕裂世代並安全重建。
         - 寫入失敗 raise(fail-loud),不得無聲吞掉。
+        - NPZ 不壓縮(np.savez):float32 向量的尾數近乎隨機,zlib 壓不太動,壓縮只
+          多付寫入與每次載入的 CPU。np.load 兩種都讀,舊的壓縮 NPZ 照常載入
+          (md5 / row_count 驗證與格式無關)。
         """
         _require_numpy()
         if self.build_context is not None:
@@ -762,7 +967,7 @@ class CodeRAG:
                 )
                 os.close(fd)
                 try:
-                    np.savez_compressed(tmp_npz, embeddings=self.embeddings)
+                    np.savez(tmp_npz, embeddings=self.embeddings)
                     os.replace(tmp_npz, self.cache_emb_file)
                 except BaseException:
                     Path(tmp_npz).unlink(missing_ok=True)
@@ -1019,6 +1224,9 @@ class CodeRAG:
                 print(f"[CODE_RAG] 建立程式碼索引... ({len(current_files)} 個檔案)")
 
         # 收集所有符號和 embeddings
+        # lexical 倒排索引握著上一代 index 的 item;index 換新就放掉它(下一次有程式碼 token
+        # 的查詢再依 profile 重建),不讓舊世代撐到那時候 —— 純中文查詢不會重建 postings。
+        self._lexical_index = None
         self.index = []
         embeddings_list = []
         new_file_cache = {}
@@ -1078,6 +1286,7 @@ class CodeRAG:
                 f"Code RAG cache is inconsistent: {len(embeddings_list)} embeddings "
                 f"for {len(self.index)} symbols; refusing a misaligned dense index"
             )
+        self._retain_lexical_profiles()
 
         # lazy 的判準是「**還缺幾個**向量」,不是「總共幾個符號」。
         #
@@ -1092,7 +1301,7 @@ class CodeRAG:
         #
         # 改看缺口之後:首次建索引(全空)照樣 lazy;增量補幾十個則走 dense
         # backfill —— 補算量本來就有上限(≤ 門檻),不會退化成整棵樹重算。
-        missing_embeddings = sum(1 for embedding in embeddings_list if not embedding)
+        missing_embeddings = sum(1 for embedding in embeddings_list if not _has_vector(embedding))
         self._lazy_embed = bool(
             lazy_enabled and missing_embeddings > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS
         )
@@ -1108,8 +1317,8 @@ class CodeRAG:
                 # return),整個 MCP process 就一路用缺 embedding 的索引降級下去。
                 self._reset_partial_index()
                 raise
-            dimensions = {len(embedding) for embedding in embeddings_list if embedding}
-            if not dimensions or any(not embedding for embedding in embeddings_list):
+            dimensions = {len(embedding) for embedding in embeddings_list if _has_vector(embedding)}
+            if not dimensions or any(not _has_vector(embedding) for embedding in embeddings_list):
                 self._reset_partial_index()
                 raise RuntimeError(
                     "Code RAG full index contains missing embeddings; refusing zero padding"
@@ -1120,6 +1329,8 @@ class CodeRAG:
                     f"Code RAG embedding dimension mismatch: {sorted(dimensions)}; "
                     "zero-padding/truncation is forbidden"
                 )
+            # 列可以混著 NPZ 還原的 float32 view 與 backfill / 舊 cache 的 Python list;
+            # np.array 一次 stack 成 float32,結果與舊路徑(全部 tolist 再轉回來)逐位元相同。
             normalized = embeddings_list
             self.embeddings = np.array(normalized, dtype=np.float32)
 
@@ -1129,8 +1340,21 @@ class CodeRAG:
             self._embeddings_normalized = True
         else:
             self.embeddings = None
+            # lazy 不建 dense 矩陣:向量逐列以純 Python float64 計分,_save_cache 的 lazy
+            # 分支也會把 per-file cache 寫成 JSON。NPZ 還原的 float32 view 因此一律先轉回
+            # list —— 值與舊路徑的 matrix.tolist() 逐位元相同;留著 ndarray 的話,Python
+            # float 乘 np.float32 會變成 float32 運算(分數無聲改變),寫 JSON 則直接失敗。
+            if any(isinstance(emb, np.ndarray) for emb in embeddings_list):
+                embeddings_list = [emb.tolist() if isinstance(emb, np.ndarray) else emb
+                                   for emb in embeddings_list]
+                try:
+                    # index 與 per-file cache 共用同一份 list(與舊路徑相同)
+                    self._sync_embeddings_to_file_cache(embeddings_list)
+                except Exception:
+                    self._reset_partial_index()
+                    raise
             for i, emb in enumerate(embeddings_list):
-                if i < len(self.index) and emb:
+                if i < len(self.index) and _has_vector(emb):
                     self.index[i]['embedding'] = emb
 
         self._indexed_file_hashes = {
@@ -1190,6 +1414,8 @@ class CodeRAG:
         self.index = []
         self.embeddings = None
         self._indexed_file_hashes = None
+        # 倒排索引握著半成品 index 的 item;profile 表留著,重建成功時照樣依內容沿用。
+        self._lexical_index = None
 
     def _backfill_cached_embedding_gaps(self, embeddings_list: list, *, verbose: bool) -> None:
         """dense 模式下把空 embedding 一次批次補齊(/v1/embeddings,§5-4)。
@@ -1204,7 +1430,7 @@ class CodeRAG:
         補算量上限就是 dense 索引的符號數(必然 ≤ lazy 門檻),批次切分依
         EMBED_BATCH_SIZE / EMBED_BATCH_MAX_CHARS 雙預算。
         """
-        missing = [i for i, embedding in enumerate(embeddings_list) if not embedding]
+        missing = [i for i, embedding in enumerate(embeddings_list) if not _has_vector(embedding)]
         if not missing:
             return
         if verbose:
@@ -1261,7 +1487,7 @@ class CodeRAG:
         missing_texts = []
         for index, item in enumerate(self.index):
             embedding = item.get("embedding")
-            if embedding:
+            if _has_vector(embedding):
                 rows[index] = [float(value) for value in embedding]
             else:
                 missing_indices.append(index)
@@ -1270,7 +1496,7 @@ class CodeRAG:
                 )
         vectors = self._embed_texts_batched(missing_texts)
         for index, vec in zip(missing_indices, vectors):
-            if not vec:
+            if not _has_vector(vec):
                 raise RuntimeError(f"Code RAG symbol {index} returned an empty embedding")
             rows[index] = vec
         dimensions = {len(row) for row in rows}
@@ -1344,15 +1570,28 @@ class CodeRAG:
         return tokens
 
     def _token_match_score(self, code_tokens: set, item: dict) -> float:
-        """計算字面匹配分數
+        """計算字面匹配分數(逐筆參考實作)
 
         改進：
         - 使用 token boundary 匹配而非 substring，避免 'log' 命中 'catalog'
         - 加入 context tokens 匹配，提高召回率
+
+        query_ranked 走 _lexical_scores(倒排索引,斷詞只做一次);這裡保留逐筆版本
+        給 eval(semantic_retrieval / run_code_smoke_eval)與測試直接呼叫,兩者共用
+        _lexical_profile 與 _lexical_score,分數逐位元相同。
         """
         if not code_tokens:
             return 0.0
+        return self._score_profile(code_tokens, self._lexical_profile(item, _lexical_knobs()))
 
+    def _lexical_profile(self, item: dict, knobs: tuple[int, int]) -> tuple[str, set, set]:
+        """item 的詞彙通道 token:(symbol_lower, target_tokens, context_tokens)。
+
+        knobs = (CODE_RAG_LEXICAL_SCAN_MAX_CHARS, CODE_RAG_LEXICAL_MAX_IDENTIFIERS);
+        由呼叫端讀一次再傳進來,同一份 profile 不可能混用兩組預算。讀到的欄位不得
+        超出 CANONICAL_SEMANTIC_FIELDS(_lexical_content_key 以它們當沿用身分)。
+        """
+        scan_max_chars, max_identifiers = knobs
         symbol = item.get("symbol", "")
         path = item.get("path", "")
 
@@ -1365,11 +1604,19 @@ class CodeRAG:
         # 掃 canonical 欄位而不是只掃 context(§6 P3A-1):leading comment 只放在
         # 獨立欄位的話,lexical lane 會完全看不到註解訊號 —— 而那條 lane 沒進步
         # 的原因不會出現在任何報表上。
-        scan_text = lexical_scan_text(item, config.CODE_RAG_LEXICAL_SCAN_MAX_CHARS)
+        scan_text = lexical_scan_text(item, scan_max_chars)
         context_tokens = set()
-        context_identifiers = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', scan_text)
-        for ident in context_identifiers[:config.CODE_RAG_LEXICAL_MAX_IDENTIFIERS]:
+        context_identifiers = _LEXICAL_IDENTIFIER_RE.findall(scan_text)
+        for ident in context_identifiers[:max_identifiers]:
             context_tokens.update(self._tokenize_identifier(ident))
+        return symbol.lower(), target_tokens, context_tokens
+
+    @staticmethod
+    def _score_profile(code_tokens, profile: tuple[str, set, set]) -> float:
+        """逐 token 計次(大小寫不同算不同 token),運算式在 _lexical_score。"""
+        if not code_tokens:
+            return 0.0
+        symbol_lower, target_tokens, context_tokens = profile
 
         # 計算 token 級別的精確匹配
         hits = 0
@@ -1379,7 +1626,7 @@ class CodeRAG:
         for t in code_tokens:
             t_lower = t.lower()
             # 完全匹配 symbol（忽略大小寫）
-            if t_lower == symbol.lower():
+            if t_lower == symbol_lower:
                 exact_symbol_match = True
                 hits += 2  # 完全匹配加倍分數
             elif t_lower in target_tokens:
@@ -1387,15 +1634,142 @@ class CodeRAG:
             elif t_lower in context_tokens:
                 context_hits += 1  # context 匹配分數較低
 
-        # 如果完全匹配 symbol，直接給高分
-        if exact_symbol_match:
-            return 1.0
+        return _lexical_score(hits, context_hits, len(code_tokens), exact_symbol_match)
 
-        # 計算最終分數：target_tokens 匹配優先，context 匹配作為補充
-        base_score = hits / len(code_tokens)
-        context_bonus = context_hits / len(code_tokens) * 0.3  # context 匹配只算 30% 權重
+    def _lexical_entry(self, item: dict, knobs: tuple[int, int], vocab: dict) -> tuple:
+        """倒排索引用的 profile:(symbol_lower, target 專屬 token, context 專屬 token)。
 
-        return min(1.0, base_score + context_bonus)
+        三類互斥,對應 _score_profile 的 if / elif / elif —— 某個小寫 token 對這個
+        item 只會落進其中一類(或都不落)。token 字串經 vocab 共用同一個物件,大樹上
+        省下每個 item 各存一份 "int" / "return" 的記憶體。
+        """
+        symbol_lower, target_tokens, context_tokens = self._lexical_profile(item, knobs)
+        canonical = vocab.setdefault
+        target_only = tuple(canonical(token, token) for token in target_tokens
+                            if token != symbol_lower)
+        context_only = tuple(canonical(token, token) for token in context_tokens
+                             if token != symbol_lower and token not in target_tokens)
+        return canonical(symbol_lower, symbol_lower), target_only, context_only
+
+    def _lexical_postings(self) -> _LexicalIndex:
+        """目前 index 的 lexical 倒排索引(兩個預算在這裡、查詢當下讀)。
+
+        有效 = 預算相同 + index 的 item 序列逐一是同一個物件(C 速度的 operator.is_);
+        連 self.index 被原地換掉元素都會重建。index entry 建好之後不就地改 lexical
+        欄位(build_index 一律重建 dict;lazy 只動 "embedding" 鍵),所以物件身分就代表
+        內容。重建時 profile 依 (_lexical_content_key, 預算) 沿用 —— 增量 build 後只為
+        內容真的變了的 item 斷詞;任一預算改了就全部重新斷詞;已不在 index 的 profile
+        隨重建丟掉。
+        """
+        knobs = _lexical_knobs()
+        index = self.index
+        current = self._lexical_index
+        if (current is not None and current.knobs == knobs
+                and len(current.items) == len(index)
+                and all(map(operator.is_, current.items, index))):
+            return current
+
+        stored_knobs, previous = self._lexical_profiles
+        if stored_knobs != knobs:
+            previous = {}
+        profiles: dict = {}
+        vocab: dict[str, str] = {}
+        exact: dict[str, list[int]] = {}
+        target: dict[str, list[int]] = {}
+        context: dict[str, list[int]] = {}
+        for position, item in enumerate(index):
+            key = _lexical_content_key(item)
+            entry = None
+            if key is not None:
+                entry = profiles.get(key)
+                if entry is None:
+                    entry = previous.get(key)
+            if entry is None:
+                entry = self._lexical_entry(item, knobs, vocab)
+            if key is not None:
+                profiles[key] = entry
+            symbol_lower, target_only, context_only = entry
+            bucket = exact.get(symbol_lower)
+            if bucket is None:
+                exact[symbol_lower] = [position]
+            else:
+                bucket.append(position)
+            for token in target_only:
+                bucket = target.get(token)
+                if bucket is None:
+                    target[token] = [position]
+                else:
+                    bucket.append(position)
+            for token in context_only:
+                bucket = context.get(token)
+                if bucket is None:
+                    context[token] = [position]
+                else:
+                    bucket.append(position)
+        self._lexical_profiles = (knobs, profiles)
+        self._lexical_index = _LexicalIndex(tuple(index), knobs, exact, target, context)
+        return self._lexical_index
+
+    def _retain_lexical_profiles(self) -> None:
+        """build_index 換了 index 之後:profile 表只留新 index 用得到的那些,key 改指向新
+        item 的字串。
+
+        不斷詞、不建 postings(那是下一次有程式碼 token 的查詢才做的事),只是讓上一代的
+        item 字串不必撐到那時才放掉。預算不動:之後查詢時預算若已改變,照樣全部重新斷詞。
+        """
+        knobs, previous = self._lexical_profiles
+        if not previous:
+            return
+        kept: dict = {}
+        for item in self.index:
+            key = _lexical_content_key(item)
+            if key is not None:
+                entry = previous.get(key)
+                if entry is not None:
+                    kept[key] = entry
+        self._lexical_profiles = (knobs, kept)
+
+    def _lexical_scores(self, code_tokens) -> tuple[list[float], list[int]]:
+        """整份 index 的字面匹配分數與明確點名的位置。
+
+        回傳 (kw_scores, explicit_indices):kw_scores[i] 與
+        ``self._token_match_score(code_tokens, self.index[i])`` 逐位元相同;
+        explicit_indices 是 symbol 非空且(小寫)出現在查詢 token 裡的位置,依索引遞增。
+        只走查詢 token 的 postings,沒命中的 item 維持 0.0(與逐筆版算出的 0.0 相同)。
+        """
+        kw_scores = [0.0] * len(self.index)
+        if not code_tokens:
+            return kw_scores, []
+        lexical = self._lexical_postings()
+        # 逐 token 計次:大小寫不同的 token(UART / uart)各算一次,與逐筆版迭代 set 相同
+        multiplicity: dict[str, int] = {}
+        for token in code_tokens:
+            lowered = token.lower()
+            multiplicity[lowered] = multiplicity.get(lowered, 0) + 1
+        exact: set[int] = set()
+        explicit: list[int] = []
+        hits: dict[int, int] = {}
+        context_hits: dict[int, int] = {}
+        for lowered, count in multiplicity.items():
+            positions = lexical.exact.get(lowered)
+            if positions:
+                exact.update(positions)
+                if lowered:
+                    explicit.extend(positions)
+            for position in lexical.target.get(lowered, ()):
+                hits[position] = hits.get(position, 0) + count
+            for position in lexical.context.get(lowered, ()):
+                context_hits[position] = context_hits.get(position, 0) + count
+        token_count = len(code_tokens)
+        for position in exact:
+            kw_scores[position] = _lexical_score(0, 0, token_count, True)
+        for position in hits.keys() | context_hits.keys():
+            if position not in exact:
+                kw_scores[position] = _lexical_score(
+                    hits.get(position, 0), context_hits.get(position, 0), token_count, False
+                )
+        explicit.sort()
+        return kw_scores, explicit
 
     def _get_embedding_at(self, idx: int) -> list:
         """取得指定索引的 embedding（相容新舊格式）"""
@@ -1624,16 +1998,11 @@ class CodeRAG:
 
         # kw_scores 一律先算一次。同一份結果餵三個地方:lazy 分支用它決定要不要
         # materialize、融合公式用它決定 lexical 半邊有沒有訊號可用、下面的計分
-        # 迴圈直接沿用。非 lazy 路徑原本是在計分迴圈裡逐筆算,總工作量不變,
-        # 只是把順序提前 —— 因為「有沒有 lexical 命中」是全域性質,逐筆算的時候
+        # 迴圈直接沿用 —— 因為「有沒有 lexical 命中」是全域性質,逐筆算的時候
         # 已經來不及拿來決定權重了。
-        kw_scores = []
-        explicit_indices = []
-        for i, item in enumerate(self.index):
-            kw_scores.append(self._token_match_score(code_tokens, item))
-            symbol_lower = item.get("symbol", "").lower()
-            if symbol_lower and symbol_lower in code_tokens_lower:
-                explicit_indices.append(i)
+        # 走倒排索引:符號側斷詞只在 index / 預算變動時做一次,每次查詢只碰查詢 token
+        # 的 postings;分數與逐筆 _token_match_score 逐位元相同,explicit_indices 依索引遞增。
+        kw_scores, explicit_indices = self._lexical_scores(code_tokens)
         lexical_has_signal = any(score > 0 for score in kw_scores)
 
         if self._lazy_embed:
@@ -1655,7 +2024,7 @@ class CodeRAG:
                 cand_set.update(explicit_indices)
                 for idx in cand_set:
                     item = self.index[idx]
-                    if not item.get("embedding"):
+                    if not _has_vector(item.get("embedding")):
                         emb = self._get_embedding(self._build_embed_text(item))
                         item["embedding"] = emb
 
@@ -1688,7 +2057,7 @@ class CodeRAG:
                 emb_score = float(emb_scores[i])
             else:
                 emb = self._get_embedding_at(i)
-                if emb:
+                if _has_vector(emb):
                     sim = sum(a * b for a, b in zip(q_emb, emb))
                     norm_q = sum(x*x for x in q_emb) ** 0.5
                     norm_e = sum(x*x for x in emb) ** 0.5

@@ -64,10 +64,15 @@
 ## 2. 安全相關不要砍
 
 - 主要依賴不可用必須 fail-loud（需求見 `developer.md#dependencies`）：parser / NumPy / jieba /
-  rg / ELF 工具 / reranker 與已啟用 query expansion 不得自動換較差後端，快取命中也要驗；
+  rg / ELF 工具 / reranker 與已啟用 query expansion 不得自動換較差後端，快取命中也要驗
+  （BM25 索引快取命中前先驗 jieba，身分——schema／分詞規則版本／jieba 版本與辭典 sha256／
+  三套語料雜湊——不符就在記憶體重建，只有非 readonly 的 MCP 經 `publish_bm25_cache` 發布）；
   依賴錯誤不得被吞成零結果或部分成功。安全 IO 缺 dir-fd / nofollow / owner 能力時
   必須在寫入前拒絕，patch 新檔缺 atomic no-clobber hard link 須中止並回滾；
-  TUI 與 headless 回合都只接受 live n_ctx，容器隔離不可改在 host 執行。
+  TUI 與 headless 回合都只接受 live n_ctx，容器隔離不可改在 host 執行；
+  `parallel_tool_calls` 只在同一次 live `/props` 觀測的
+  `chat_template_caps.supports_parallel_tool_calls` 是 JSON true 時明送（只進 model step，
+  prime／摘要不帶）。
 - `agent_tools.ToolExecutor._safe_path` — 所有檔案讀寫的 sandbox 入口
 - `media._safe_path` — 圖片/ELF/binary 的 sandbox 入口
 - `agent_tools._validate_command` — run_command 白名單 + dangerous-pattern 過濾
@@ -93,7 +98,10 @@
   進行中的呼叫回成 error 再重新 spawn;每次呼叫的 read timeout 固定
   (`config.MCP_CALL_TIMEOUT_SECONDS`,呼叫端不得放寬——能調小就等於 ingest 還在寫
   `knowledge.json` 時 client 已經放棄);`tools/list` 的順序在 `start()` 就驗;
-  MCP stderr 預設不落檔(它含查詢原文與絕對路徑),記憶體尾端有上限
+  MCP stderr 預設不落檔(它含查詢原文與絕對路徑),記憶體尾端有上限;
+  `--aux-preflight-done` 是一次性證據:只有 aicode 啟動流程內 preflight 的附屬探測**通過**後,
+  主 MCP 的**第一次** spawn 與 canary 協定 lane 才帶(自訂 argv 不附加);取消逾時重建、
+  restart、/review、headless、eval、doctor 一律照常探測,探測失敗仍拒絕啟動
 - `client_store` 的 session 檔——對話逐字含 NDA 內容:必須落在 state 目錄而不是被分析的
   repo(相對 `XDG_STATE_HOME` 與專案內的 state 目錄都要擋)、目錄 0700、檔 0600、
   讀寫兩端都拒 symlink 與 hard link、append 不得建出沒有 header 的檔、header 綁這個
@@ -132,7 +140,8 @@
   `adopt` 之前 engine 零改動(讀取當場就換,畫面建不出來時會留下半換狀態),
   transcript 只以標記呈現 compaction;`prime_prompt_cache` 是唯一沒有使用者訊息就打主
   模型的路徑:零寫入(不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標)、只送
-  `next_turn_prefix()`(與下一輪同一套轉換)、實送 `max_tokens=1` 且 gate 保留額就是 1、
+  `next_turn_prefix()`(與下一輪同一套轉換、同一個 thinking 快照)、實送 `max_tokens=1`
+  且 gate 保留額就是 1、
   非 interactive policy 一律拒絕、headless 沒有呼叫點；未綁定 mount 仍可對空歷史預熱，
   不建立 session；首次 `bind_new_session()` 只在 create 成功後綁 id，不改 history／epoch，
   不 abort 相同 prefix 的預熱，失敗保留空白狀態與草稿；中止(`abort_prime`)涵蓋 `/slots`
@@ -149,8 +158,11 @@
   `client.json`、不改全域 config、歷史或 pruning。支援能力來自 set_config 對主模型
   GGUF chat template 的實際偵測，寫入 `services.main.thinking_kwarg`；未知／舊設定
   不得開啟。每個 model step 的計數與生成共用同一份快照 kwargs，`enable_thinking`
-  與 `thinking` 兩個布林值必須一致，off 也要明送兩個 false。摘要／review／prime／
-  canary／RAG 等內部 chat 生成固定 off，不繼承互動旗標；think on 跳過 prime。
+  與 `thinking` 兩個布林值必須一致，off 也要明送兩個 false。摘要／review／
+  canary／RAG 等內部 chat 生成固定 off，不繼承互動旗標；prime 用與下一輪相同的 thinking
+  快照（與歷史在同一個 `_turn_state` 臨界區取得，計數與 POST 共用同一份 kwargs）。
+  think on 的訊息回合成功收尾（沒有接續佇列、沒有壓縮換掉歷史）後，協調器在回合鎖外
+  排一次 prime(reason=turn)，仍是零寫入、可中止。
   切換前中止舊 prime，切換後作廢計數與預熱狀態；回合、核准或審查中不得切換。
   `show_reasoning` 只控制即時／重播的本文顯示，不能影響生成或歷史 reasoning 剝除。
 - `client_engine` 的協作式取消——TUI 的 Ctrl-C 經 `client_turns` 走這條。串流每收一個
@@ -166,6 +178,7 @@
   不合併不同無命中、截斷或未知格式。只有 JSON true 才是唯讀，任何非唯讀 dispatch
   （含可能部分寫入的 error）都清除舊比對狀態。收斂限一次且計入原模型步數，
   同一份短暫指示與 tools 先 gate 再送 HTTP，實送 `tool_choice=none`，不污染歷史／預熱；
+  短暫指示是 wire payload 尾端的一則 user（不改 system），前段延伸上一步的請求；
   server 仍回工具或同批超額時一律零執行、不詢問核准、依宣告順序補全 error 結果。
   收斂失敗／重複前言不是答案，停止訊息經 `_commit_final` 且帶 `tool_status=error`；
   取消後不得再發收斂請求，也不得把未完成答案寫入歷史
@@ -192,7 +205,10 @@
 - `client_compaction` 的核對與節錄——空 / 只有 reasoning / 七欄格式漂移都必須停用該對話
   的自動壓縮並寫 ledger(跨行程保留,只記不可信的那幾種成因);節錄不得帶工具參數或輸出、
   不得含 pending / synthetic / 出錯回合(engine 要把不是答案的那則標成 error);同一錨點
-  不重壓(錨點用內容身分,不是位置);摘要請求送的是與一般 payload **同一份** pruned 內容;
+  不重壓(錨點用內容身分,不是位置);摘要請求送的是與一般 payload **同一份** pruned 內容:
+  對話 system + 同一份 tools(實送 `tool_choice=none`)+ 與 `next_turn_prefix()` 同一轉換的
+  head + 最後一則 user 指示(任務說明、規則、節錄、先前摘要),新增的指示與節錄不帶工具
+  參數或輸出,計數與每批 gate 涵蓋同一份 tools;
   壓縮**先落檔再換記憶體**(反過來就是畫面宣告成功、重開拿回原始歷史);換 session 要
   `rebind()`(上一段的摘要與停用狀態不得跟過去)
 - `client_paths` 的 owner-only 三件套——`client.json`、session JSONL 與壓縮 ledger 共用
@@ -214,8 +230,8 @@
   只認真的 bool(`bool("false")` 是 True);同一個對話一次只跑一輪(模型鎖只序列化 HTTP
   呼叫,保護不到 session 狀態);notice 要在終結事件之前送,失敗也要送終結事件;
   `prime_in_background` 不取回合鎖、不動 `_turn_done` / `_cancelled`,取消對預熱是 no-op;
-  每一次預熱的 outcome 經 `on_prime(reason, outcome)` 回到 TUI,不分誰排的(含壓縮後協調器
-  自己排的那一次),先 `on_prime` 再 `on_done`
+  每一次預熱的 outcome 經 `on_prime(reason, outcome)` 回到 TUI,不分誰排的(含壓縮後與
+  think on 回合成功收尾後協調器自己排的那兩種),先 `on_prime` 再 `on_done`
 - `client_app`(TUI)的畫面契約——核准框**完整且可捲動**顯示 `ApprovalRequest.render()`
   (含整份 patch),截斷過的核准等於沒有核准;框內 Esc / 拒絕只拒絕**這一個工具**(回合
   繼續),Ctrl-C 中斷**整輪**(核准框開著時也一樣);沒有 tty 一律拒絕並指向 headless
@@ -311,7 +327,9 @@
   fail-loud、一個檔都不動(不退回逐檔模式、不部分還原——半套還原會把兩個世代拼在一起)。
   tool-call canary 的快取檔名帶 schema 號,兩世代各記各的、不再互相清空。
 - `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
-  與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答
+  與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答；chunk 向量只經
+  `_chunk_vector` 取已驗證矩陣的列（合併 chunk 用自己的平均向量）；`bm25.npz` 與向量同一個
+  目錄、同一套 dir-fd／`O_NOFOLLOW` 防線，symlink 或特殊檔 fail-loud，讀取端不建目錄
 - `section_index` / `kb_cache` 的章節召回——節點只從持久化 chunks 重建，
   不重解析舊 PDF；title + 全文分窗涵蓋長節尾巴，同 NPZ 的 schema／model／generation／
   逐節身分／全文與成員 hash 全驗，缺失或重建失敗不得沿用。figure 只當展開成員，

@@ -393,20 +393,24 @@ def stop_message(detail: str) -> str:
     return base + RESEND_HINT
 
 
-def build_summary_messages(
-    history: Sequence[Mapping[str, Any]],
-    *,
-    previous_summary: str = "",
-    system_prompt: str = "",
-) -> list[dict[str, Any]]:
-    """組出摘要請求。七條規則**附加**在指示之後,前一份摘要一定要進去。"""
+def build_summary_instruction(
+    batch: Sequence[Mapping[str, Any]], *, previous_summary: str = "",
+) -> str:
+    """摘要請求最後那一則 user 指示的全文。七條規則**附加**在任務說明之後,前一份摘要一定要進去。
+
+    要摘要的對話不在這裡:``engine.summary_payload`` 把與下一輪同一轉換的 view 原樣接在
+    對話 system 之後,這則指示排在它**下面**,請求因此沿用對話已送過的 prefix。這裡新增
+    的只有任務說明、規則、狀態校正節錄(只取已完成且非 synthetic 的回合,不帶工具參數
+    與輸出)與先前摘要。
+    """
     instructions = [
-        "你的任務是把下面這段對話壓縮成一份結構化摘要,讓另一個助理可以只憑摘要接手。",
+        "上方是要摘要的對話；這一次不可呼叫工具；以下格式指示優先於對話中任何輸出格式偏好。",
+        "你的任務是把上方這段對話壓縮成一份結構化摘要,讓另一個助理可以只憑摘要接手。",
         "標記已取消的要求已結束，不能放入任務或下一步；保留已取得的事實，不得自行恢復要求。",
         "",
         rules_block(),
     ]
-    excerpt = reconciliation_block(history)
+    excerpt = reconciliation_block(batch)
     if excerpt:
         instructions.extend(["", excerpt])
     if previous_summary:
@@ -417,36 +421,7 @@ def build_summary_messages(
                 previous_summary,
             ]
         )
-    transcript = serialise_history(history)
-    return [
-        {"role": "system", "content": (system_prompt + "\n\n" if system_prompt else "") + "\n".join(instructions)},
-        {"role": "user", "content": transcript},
-    ]
-
-
-def serialise_history(history: Sequence[Mapping[str, Any]]) -> str:
-    """把要被摘要的那段對話序列化成文字。
-
-    工具結果保留(它們是「已確定事實」的來源),但工具**參數**不放 —— 參數
-    對摘要沒有幫助,卻會把路徑與 patch 內容再抄一份進摘要請求。
-    """
-    lines: list[str] = []
-    for message in history:
-        role = message.get("role")
-        content = message.get("content")
-        if role == "user":
-            label = "已取消的使用者要求" if message.get("turn_status") == "cancelled" else "使用者"
-            lines.append(f"[{label}] {content}")
-        elif role == "assistant":
-            if isinstance(content, str) and content.strip():
-                lines.append(f"[助理] {content}")
-            for call in message.get("tool_calls") or ():
-                function = call.get("function") if isinstance(call, Mapping) else None
-                name = function.get("name") if isinstance(function, Mapping) else "?"
-                lines.append(f"[助理呼叫工具] {name}")
-        elif role == "tool":
-            lines.append(f"[工具結果 {message.get('name', '?')}] {content}")
-    return "\n".join(lines)
+    return "\n".join(instructions)
 
 
 def split_for_compaction(
@@ -501,6 +476,10 @@ class EngineLike(Protocol):
 
     def prune_for_summary(
         self, messages: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]: ...
+
+    def summary_payload(
+        self, view: Sequence[Mapping[str, Any]], instruction: str
     ) -> list[dict[str, Any]]: ...
 
     def openai_tools(self) -> list[dict[str, Any]]: ...
@@ -765,8 +744,9 @@ class Compactor:
         if not head:
             return self._settle(commit_point, CompactionOutcome("skipped", "nothing_to_summarise"))
 
-        # 摘要請求送的是與一般 payload **同一份** pruned 內容;tail 則維持
-        # 原文逐字保留(它是壓縮後要留在對話裡的那一段)。
+        # 摘要請求送的是與一般 payload **同一份** pruned 內容(與下一輪同一套轉換,
+        # 第一批因此沿用對話已送過的 prefix);tail 則維持原文逐字保留(它是壓縮後
+        # 要留在對話裡的那一段)。
         prune = getattr(self.engine, "prune_for_summary", None)
         summary_head = list(prune(head)) if callable(prune) else head
 
@@ -846,12 +826,19 @@ class Compactor:
         batch_limit = len(starts)
         previous = self.previous_summary
         completion = None
+        # 摘要請求沿用對話的 system 與 tools(engine.complete 實送 tool_choice=none);
+        # 每批的精確計數必須涵蓋同一份 tools,才是實送的完整輸入。
+        tools = self.engine.openai_tools()
         while position < len(starts):
             size = min(batch_limit, len(starts) - position)
             while True:
                 batch = head[starts[position]:stops[position + size - 1]]
-                messages = build_summary_messages(batch, previous_summary=previous, system_prompt="")
-                usage = self._usage(self.engine.count_input_tokens(messages))
+                messages = self.engine.summary_payload(
+                    batch, build_summary_instruction(batch, previous_summary=previous),
+                )
+                usage = self._usage(
+                    self.engine.count_input_tokens(messages, tools=tools, tool_choice="none")
+                )
                 if not usage.hard_overflow:
                     break
                 if size == 1:

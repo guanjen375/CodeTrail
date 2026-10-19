@@ -333,8 +333,12 @@ def test_exact_input_count_blocks_a_prompt_that_the_character_estimate_accepts(
     assert measured[0]["extra"]["max_tokens"] == engine.options.max_output_tokens
     assert measured[0]["stream"] is True
     if request_kind == "convergence":
+        # 指示是 payload 尾端的一則 user,system 保持原文(前段才能沿用上一步的 prefix)。
         assert measured[0]["tool_choice"] == "none"
-        assert client_engine.CONVERGENCE_INSTRUCTION in measured[0]["messages"][0]["content"]
+        assert measured[0]["messages"][0] == {"role": "system", "content": engine.system_prompt.text}
+        assert measured[0]["messages"][-1] == {
+            "role": "user", "content": client_engine.CONVERGENCE_INSTRUCTION,
+        }
 
 
 def test_fresh_exact_counts_cover_the_sent_payload_and_full_input_event(engine_factory, monkeypatch):
@@ -826,7 +830,14 @@ def test_repeated_grep_gets_one_evidence_based_final_pass(engine_factory, monkey
     saved = list(client_store.iter_messages(engine.store.read(engine.session_id)))
     assert any(m.get("structured") == {"private": "UI only"} for m in saved)
     assert any("第 2 次" in str(m.get("content")) for m in saved if m["role"] == "tool")
-    assert requests[-1]["messages"][0] != requests[0]["messages"][0]
+    # 收斂請求延伸上一步:同一個 system,前段 = 上一步請求 + 上一步 assistant(tool_calls)
+    # + 它的工具結果,指示只是尾端那一則 user。
+    convergence, previous = requests[-1]["messages"], requests[-2]["messages"]
+    assert convergence[0] == requests[0]["messages"][0]
+    assert convergence[:len(previous)] == previous
+    assert convergence[len(previous):-1] == client_engine.to_wire(engine.messages[3:5])
+    assert [m["role"] for m in convergence[len(previous):-1]] == ["assistant", "tool"]
+    assert convergence[-1] == {"role": "user", "content": client_engine.CONVERGENCE_INSTRUCTION}
     saved_users = [m for m in saved if m["role"] == "user"]
     assert len(saved_users) == 1 and saved_users[0]["content"] == engine.messages[0]["content"]
     assert not saved_users[0].get("synthetic")
@@ -839,6 +850,52 @@ def test_repeated_grep_gets_one_evidence_based_final_pass(engine_factory, monkey
     assert requests[before]["tool_choice"] == "auto"
     assert requests[before]["messages"][:-1] == expected_prefix
     assert requests[before]["messages"][0] == requests[0]["messages"][0]
+
+
+@pytest.mark.smoke
+def test_convergence_keeps_the_previous_step_prefix_and_appends_one_instruction(
+    engine_factory, monkeypatch, tmp_path,
+):
+    """收斂請求 = 同一刻不加指示的 payload + 尾端一則 user 指示,而且指示只活在這一次請求。
+
+    指示改寫 system 的話,收斂請求從第一個 token 就與上一步分岔,server 只能整段重算;
+    指示漏進歷史 / session / next_turn_prefix 的話,下一輪與預熱都多一則使用者沒說過的話。
+    兩種都不會報錯。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    engine = engine_factory(max_tool_steps=2)
+    counted, gated, sent, plain = [], [], [], []
+    check = context_budget.check_and_log
+
+    def count(**kwargs):
+        counted.append(kwargs)
+        if kwargs["tool_choice"] == "none":
+            plain.append(engine.payload_messages()[0])   # 同一刻、不加指示的那一份
+        return 100
+
+    def gate(**kwargs):
+        gated.append(kwargs)
+        return check(**kwargs)
+
+    def chat(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            return iter([_tool_chunk("read_file", '{"path":"a.c"}', call_id="a", finish="tool_calls")])
+        return iter([_text_chunk("a.c 已讀到;尚未確認 b.c。下一步讀 b.c。", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count)
+    monkeypatch.setattr(context_budget, "check_and_log", gate)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    result = engine.send("比對 a.c")
+    assert result.finish == "stop" and [r["tool_choice"] for r in sent] == ["auto", "none"]
+    final = sent[-1]["messages"]
+    assert final == plain[0] + [{"role": "user", "content": client_engine.CONVERGENCE_INSTRUCTION}]
+    assert counted[-1]["messages"] is final and gated[-1]["messages"] is final
+    assert final[0] == sent[0]["messages"][0]
+    assert sent[-1]["tools"] == engine.openai_tools()
+    stored = engine.store.read(engine.session_id)
+    for leftover in (engine.messages, stored, engine.next_turn_prefix()):
+        assert client_engine.CONVERGENCE_INSTRUCTION not in json.dumps(leftover, ensure_ascii=False)
 
 
 @pytest.mark.smoke
@@ -1338,6 +1395,120 @@ def test_the_summary_request_sees_the_pruned_history_not_the_raw_one(engine_fact
 
     pruned = engine.prune_for_summary(engine.messages)
     assert "SECRET-OLD-OUTPUT" not in json.dumps(pruned, ensure_ascii=False)
+    # 實送的是 summary_payload 組出的 wire 訊息:被剪掉的那筆在對話投影裡只剩佔位。
+    wire = engine.summary_payload(pruned, "instruction")
+    assert "SECRET-OLD-OUTPUT" not in json.dumps(wire, ensure_ascii=False)
+    assert [m["content"] for m in wire if m["role"] == "tool"] == [client_engine.PRUNE_PLACEHOLDER]
+
+
+def _seven_field_summary():
+    import client_compaction
+
+    return "\n".join(f"## {heading}\n- 已保留的事實" for heading in client_compaction.rule_headings())
+
+
+@pytest.mark.smoke
+def test_the_summary_request_extends_the_next_turn_prefix_with_one_instruction(
+    engine_factory, monkeypatch, tmp_path,
+):
+    """摘要請求 = 對話已送過的 prefix(同 system、同 tools、同一套轉換)+ 尾端一則指示。
+
+    舊做法(指示放 system、對話序列化成一則 user)從第一個 token 起就與對話不同;view 若以
+    head 自己的最後一則 user 剝 reasoning,head 尾端那則答案帶著 reasoning,前綴在那裡分岔。
+    兩種都只是讓 server 整段重算,不會報錯。
+    """
+    import client_compaction
+
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(client_engine, "PRUNE_PROTECT_TOKENS", 40)
+    monkeypatch.setattr(client_engine, "PRUNE_MINIMUM_TOKENS", 20)
+    engine = engine_factory()
+    history = (_projection_turn(1, tool_content="old evidence " * 30)
+               + _projection_turn(2) + _projection_turn(3))
+    history[5]["reasoning_content"] = "head 最後一則答案的 thinking"
+    engine.messages = history
+    expected = engine.next_turn_prefix()
+    assert expected[3]["content"] == client_engine.PRUNE_PLACEHOLDER
+    counted, gated, sent = [], [], []
+    check = context_budget.check_and_log
+    monkeypatch.setattr(llama_client, "count_chat_tokens", lambda **kw: counted.append(kw) or 100)
+    monkeypatch.setattr(context_budget, "check_and_log", lambda **kw: gated.append(kw) or check(**kw))
+    monkeypatch.setattr(llama_client, "chat_completions",
+                        lambda **kw: sent.append(kw) or iter([_text_chunk(_seven_field_summary(), finish="stop")]))
+    compactor = client_compaction.Compactor(
+        engine, client_compaction.MODE_MANUAL, n_ctx=131072, env=engine.env,
+    )
+    assert compactor.compact(manual=True).status == "compacted"
+    assert len(sent) == 1
+    request = sent[0]
+    messages = request["messages"]
+    assert len(messages) == 1 + 6 + 1                     # system + head(turn 1、2)+ 指示
+    assert messages[:-1] == expected[:len(messages) - 1]
+    assert "reasoning_content" not in messages[6]
+    assert messages[-1]["role"] == "user"
+    assert client_compaction.rules_block() in messages[-1]["content"]
+    assert all(client_compaction.rules_block() not in str(m.get("content")) for m in messages[:-1])
+    assert request["tools"] == engine.openai_tools() and request["tool_choice"] == "none"
+    assert request["extra"]["chat_template_kwargs"] == {"enable_thinking": False, "thinking": False}
+    summary_gates = [kw for kw in gated if kw["source"] == "compaction"]
+    assert len(summary_gates) == 1
+    assert summary_gates[0]["messages"] is messages and summary_gates[0]["tools"] is request["tools"]
+    assert any(kw["messages"] is messages and kw["tools"] is request["tools"]
+               and kw["tool_choice"] == "none" and kw["extra"] is request["extra"] for kw in counted)
+
+
+@pytest.mark.smoke
+def test_every_summary_batch_is_counted_gated_and_sent_with_the_conversation_tools(
+    engine_factory, monkeypatch, tmp_path,
+):
+    """head 太大要分批時,每一批都以實送的同一份 messages / tools / tool_choice 精確計數並過閘。
+
+    計數少算 tools 的話,閘量到的不是實送的請求:超長的摘要請求由 llama-server 從前面
+    靜默截掉,或在生成到一半時撐爆 context。
+    """
+    import client_compaction
+
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    engine = engine_factory()
+    engine.messages = sum((_projection_turn(number) for number in range(1, 5)), [])
+    counted, gated, sent = [], [], []
+    check = context_budget.check_and_log
+
+    def count(**kwargs):
+        counted.append(kwargs)
+        turns = sum(1 for message in kwargs["messages"] if message["role"] == "user"
+                    and str(message["content"]).startswith("question "))
+        return 1000 + 50_000 * turns          # 三個回合放不下一批,兩個放得下
+
+    def gate(**kwargs):
+        gated.append(kwargs)
+        return check(**kwargs)
+
+    def chat(**kwargs):
+        sent.append(kwargs)
+        return iter([_text_chunk(_seven_field_summary(), finish="stop")])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count)
+    monkeypatch.setattr(context_budget, "check_and_log", gate)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    compactor = client_compaction.Compactor(
+        engine, client_compaction.MODE_MANUAL, n_ctx=131072, env=engine.env,
+    )
+    assert compactor.compact(manual=True).status == "compacted"
+    assert len(sent) == 2
+    summary_gates = [kw for kw in gated if kw["source"] == "compaction"]
+    assert len(summary_gates) == len(sent)
+    tools = engine.openai_tools()
+    for gate_kwargs, request in zip(summary_gates, sent):
+        assert gate_kwargs["messages"] is request["messages"]
+        assert gate_kwargs["tools"] is request["tools"] and request["tools"] == tools
+        assert request["tool_choice"] == "none"
+        assert gate_kwargs["reserved_output_tokens"] == request["extra"]["max_tokens"]
+        assert any(kw["messages"] is request["messages"] and kw["extra"] is request["extra"]
+                   and kw["tools"] is request["tools"] and kw["tool_choice"] == "none"
+                   for kw in counted)
+        assert client_compaction.rules_block() in request["messages"][-1]["content"]
+    assert all(kw["tools"] == tools for kw in counted if kw["tool_choice"] == "none")
 
 
 # ============================================================
@@ -1426,9 +1597,12 @@ def test_cancelled_turn_survives_resume_summary_and_export(engine_factory, monke
     monkeypatch.setattr(llama_client, "chat_completions", answer)
     engine.send("Only answer done.")
     assert captured[0] == prefix + [{"role": "user", "content": "Only answer done."}]
-    summary = cc.build_summary_messages(engine.prune_for_summary(engine.messages))
-    assert "已取消" in summary[-1]["content"]
-    assert original in summary[-1]["content"]
+    # 摘要請求沿用對話投影:取消標記與原文就在那則 user 訊息裡(內部欄位不送出)。
+    view = engine.prune_for_summary(engine.messages)
+    summary = engine.summary_payload(view, cc.build_summary_instruction(view))
+    assert summary[1]["role"] == "user" and "已取消" in summary[1]["content"]
+    assert original in summary[1]["content"]
+    assert "turn_status" not in summary[1] and "message_id" not in summary[1]
     assert [turn.question for turn in cc.completed_turns(engine.messages)] == ["Only answer done."]
     entries = client_app.history_entries(snapshot.transcript)
     assert any(entry.kind == "cancelled" for entry in entries)
@@ -3958,6 +4132,29 @@ def test_chat_thinking_count_and_generation_share_one_snapshot(engine_factory, m
     assert engine.messages[:2] == original
 
 
+@pytest.mark.smoke
+@pytest.mark.parametrize("option", [False, True, "true", 1])
+def test_parallel_tool_calls_is_counted_and_sent_only_when_the_option_is_true(
+    engine_factory, monkeypatch, option,
+):
+    """模板能力是 JSON true 才明送 parallel_tool_calls,而且計數與生成是同一份 extra。
+
+    只有真的 ``True`` 才算(``"true"``、``1`` 不算);只送一邊的話,閘量的就不是實送的請求。
+    """
+    engine = engine_factory(parallel_tool_calls=option, metrics_enabled=False)
+    counted, generated = [], []
+    monkeypatch.setattr(llama_client, "count_chat_tokens", lambda **kw: counted.append(kw) or 100)
+    monkeypatch.setattr(llama_client, "chat_completions",
+                        lambda **kw: generated.append(kw) or iter([_text_chunk("answer", finish="stop")]))
+    assert engine.send("question").text == "answer"
+    assert len(counted) == len(generated) == 1
+    assert counted[0]["extra"] is generated[0]["extra"]
+    if option is True:
+        assert generated[0]["extra"]["parallel_tool_calls"] is True
+    else:
+        assert "parallel_tool_calls" not in generated[0]["extra"]
+
+
 def test_compaction_is_explicitly_off_while_chat_context_count_tracks_thinking(engine_factory, monkeypatch):
     engine = engine_factory(thinking_kwarg="thinking", thinking=True, metrics_enabled=False)
     counted, generated = [], []
@@ -3968,17 +4165,22 @@ def test_compaction_is_explicitly_off_while_chat_context_count_tracks_thinking(e
 
     def chat(**kwargs):
         generated.append(kwargs)
+        if len(generated) == 1:
+            return iter([_prime_final_chunk()])
         return iter([_text_chunk("summary", finish="stop")])
 
     monkeypatch.setattr(llama_client, "count_chat_tokens", count)
     monkeypatch.setattr(llama_client, "chat_completions", chat)
-    monkeypatch.setattr(llama_client, "get_slots", _no_probe)
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
     monkeypatch.setattr(config, "CLIENT_PRIME_PROMPT_CACHE", True)
-    assert engine.prime_prompt_cache() == client_engine.PrimeOutcome(False, "thinking", None)
-    assert counted == generated == []
-    assert engine.complete([{"role": "user", "content": "summarize"}], source="compaction").text == "summary"
+    # think on 也預熱,用的就是下一輪那個 thinking 快照(互動旗標)。
+    assert engine.prime_prompt_cache().sent is True
     assert counted[0]["extra"] is generated[0]["extra"]
-    assert generated[0]["extra"]["chat_template_kwargs"] == {
+    assert generated[0]["extra"]["chat_template_kwargs"] == {"enable_thinking": True, "thinking": True}
+    # 摘要仍固定 off,不繼承互動旗標。
+    assert engine.complete([{"role": "user", "content": "summarize"}], source="compaction").text == "summary"
+    assert counted[1]["extra"] is generated[1]["extra"]
+    assert generated[1]["extra"]["chat_template_kwargs"] == {
         "enable_thinking": False, "thinking": False,
     }
     engine.count_input_tokens([{"role": "user", "content": "summary budget"}])
@@ -4002,6 +4204,8 @@ def test_thinking_changes_require_support_idle_state_and_completed_prime_shutdow
 
     def chat(**kwargs):
         sent.append(kwargs)
+        if len(sent) > 1:
+            return iter([_prime_final_chunk()])
         ready.set()
         return stream
 
@@ -4020,7 +4224,9 @@ def test_thinking_changes_require_support_idle_state_and_completed_prime_shutdow
         engine.model_lock.release()
         assert engine.options.thinking is True
         assert sent[0]["extra"]["chat_template_kwargs"] == {"enable_thinking": False, "thinking": False}
-        assert engine.prime_prompt_cache().reason == "thinking" and len(sent) == 1
+        # 切到 on 之後的預熱用新的快照送出(think on 不再跳過預熱)。
+        assert engine.prime_prompt_cache().sent is True and len(sent) == 2
+        assert sent[1]["extra"]["chat_template_kwargs"] == {"enable_thinking": True, "thinking": True}
         assert engine.messages == history and engine._history is binding
         assert engine.set_thinking(True) is False
         with engine.turn_scope():
@@ -4044,6 +4250,49 @@ def test_thinking_changes_require_support_idle_state_and_completed_prime_shutdow
         release.set()
         engine.abort_prime(wait=0)
         primer.join(2)
+
+
+@pytest.mark.smoke
+def test_prime_snapshots_thinking_with_its_history_and_matches_the_next_turn(engine_factory, monkeypatch):
+    """預熱的 thinking 與歷史在同一個臨界區快照;計數、POST 與下一輪都是同一個值。
+
+    thinking 會改變每一則歷史 assistant 的渲染。一進來就讀旗標的話,在那之後、取歷史
+    之前完成的 ``/think`` 會讓預熱拿舊值送出:prefill 一份下一輪用不到的 prefix,
+    ``/status`` 照樣顯示 sent。
+    """
+    monkeypatch.setattr(config, "CLIENT_PRIME_PROMPT_CACHE", True)
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    engine = engine_factory(thinking_kwarg="enable_thinking", metrics_enabled=False)
+    engine.messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "上一輪的 thinking"},
+    ]
+    counted, sent, switched = [], [], []
+
+    def chat(**kwargs):
+        sent.append(kwargs)
+        return iter([_prime_final_chunk()] if len(sent) == 1 else [_text_chunk("a2", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", lambda **kw: counted.append(kw) or 100)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    lease = client_engine._ModelSlot.try_lease
+
+    def switch_then_lease(lock):
+        # /think on 落在「預熱已進入、還沒進臨界區取快照」之間。
+        switched.append(engine.set_thinking(True))
+        return lease(lock)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(client_engine._ModelSlot, "try_lease", staticmethod(switch_then_lease))
+        outcome = engine.prime_prompt_cache(reason="think")
+    assert switched == [True] and outcome.sent is True
+    thinking_on = {"enable_thinking": True, "thinking": True}
+    assert counted[0]["extra"] is sent[0]["extra"]
+    assert sent[0]["extra"]["chat_template_kwargs"] == thinking_on
+    assert engine.send("q2").text == "a2"
+    assert sent[1]["extra"]["chat_template_kwargs"] == thinking_on
+    assert sent[1]["messages"][:-1] == sent[0]["messages"]
+    assert sent[1]["messages"][-1] == {"role": "user", "content": "q2"}
 
 
 class _AdmissionStore(_CountingStore):

@@ -47,6 +47,10 @@ def _parse_server_argv(argv: list[str]) -> dict:
         # 測試 / eval 的接縫。正常 runtime 不帶它 —— 缺 reranker 的 session 會在
         # 使用者問第一個 RAG 問題時才炸,而那時他已經在對話裡了。
         "skip_aux_preflight": False,
+        # 啟動它的 aicode 在**這次**啟動流程內剛探測過附屬 server(同一份 run_checks、
+        # 同一份 profile)。客戶端只在第一次 spawn 帶它;取消逾時重建、/review、
+        # headless、eval、doctor 都不帶 → 照常探測。與 --skip-aux-preflight 同給時以 skip 為準。
+        "aux_preflight_done": False,
         # 外部匯入的來源根:客戶端**啟動時**讀 client.json 後逐一交過來(可重複)。
         # 沒有這個旗標 = 外部匯入關閉(見下方 apply_to_config 之後的覆寫)。
         "external_import_roots": [],
@@ -102,6 +106,8 @@ def _parse_server_argv(argv: list[str]) -> dict:
             parsed["build_commands"] = True
         elif item == "--skip-aux-preflight":
             parsed["skip_aux_preflight"] = True
+        elif item == "--aux-preflight-done":
+            parsed["aux_preflight_done"] = True
         elif item in ("--root", "--n-ctx", "--client-config"):
             once(item)
             nxt = argv[index + 1] if index + 1 < len(argv) else None
@@ -375,6 +381,10 @@ if _ARGS["skip_aux_preflight"]:
         "[MCP] WARN: required model server preflight skipped via --skip-aux-preflight "
         "(test / eval only; normal runtime keeps this hard gate enabled)"
     )
+elif _ARGS["aux_preflight_done"]:
+    # 同一道硬閘剛由啟動這個 server 的 aicode 在本次啟動流程內跑過(客戶端只讓
+    # 第一次 spawn 帶這個旗標);之後的重建不帶,照常走下面的 else。
+    _log("[MCP] model-preflight 已由啟動它的 aicode 在本次啟動完成，不重複探測")
 else:
     _required_model_checks = _run_required_model_checks()
     for _line in _render_required_model_report(_required_model_checks, prefix="[MCP][model-preflight]"):
@@ -408,7 +418,10 @@ def _kb_snapshot_hook(raw: bytes, metadata: dict) -> None:
     data_flywheel.get_collector().snapshot_kb(raw, metadata)
 
 
-KB = KnowledgeBase(_kb_path, on_loaded=_kb_snapshot_hook)
+# BM25 快取只有可寫的 server 才發布(三個建 KB 處同一個判準):readonly 的契約是
+# 「前後 project state 不變」,載入 KB 不得在專案內多出快取檔;每次在呼叫當下讀 _ARGS。
+KB = KnowledgeBase(_kb_path, on_loaded=_kb_snapshot_hook,
+                   publish_bm25_cache=not _ARGS["readonly"])
 _log(f"[MCP] {KB.get_status()}")
 
 
@@ -427,7 +440,8 @@ def _ensure_kb_fresh() -> None:
         return
     _log(f"[MCP] knowledge.json 已變更,自動重新載入 ({_kb_path}) ...")
     try:
-        KB = load_knowledge_base_strict(_kb_path, on_loaded=_kb_snapshot_hook)
+        KB = load_knowledge_base_strict(_kb_path, on_loaded=_kb_snapshot_hook,
+                                        publish_bm25_cache=not _ARGS["readonly"])
     except KnowledgeStoreError as e:
         _log(f"[MCP] KB 自動重載失敗,保留原記憶體 KB: {e}")
         raise
@@ -3469,7 +3483,8 @@ def reload_knowledge_base() -> str:
     """
     global KB
     try:
-        KB = load_knowledge_base_strict(_kb_path, on_loaded=_kb_snapshot_hook)
+        KB = load_knowledge_base_strict(_kb_path, on_loaded=_kb_snapshot_hook,
+                                        publish_bm25_cache=not _ARGS["readonly"])
     except KnowledgeStoreError as e:
         return (
             f"[KB reload 失敗] {e}\n"

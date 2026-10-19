@@ -16,9 +16,9 @@
    是另一份完整資料,重複餵給模型等於把同一份證據算兩次 context;它只給
    UI 與 eval。
 4. **預熱是零寫入的。** ``prime_prompt_cache()`` 是唯一沒有使用者訊息就打主模型
-   的路徑:它只送 ``next_turn_prefix()``(與下一輪同一套轉換)、實送 ``max_tokens=1``
-   且 gate 的保留額就是 1,不進 turn 狀態、不寫 session 檔、不發事件、不碰取消旗標,
-   非互動 policy 一律在任何 I/O 之前拒絕。
+   的路徑:它只送 ``next_turn_prefix()``(與下一輪同一套轉換、同一個 thinking 快照)、
+   實送 ``max_tokens=1`` 且 gate 的保留額就是 1,不進 turn 狀態、不寫 session 檔、
+   不發事件、不碰取消旗標,非互動 policy 一律在任何 I/O 之前拒絕。
 """
 from __future__ import annotations
 
@@ -686,6 +686,9 @@ class EngineOptions:
     thinking_kwarg: str | None = None
     #: 專案外 @ 附件的範圍(啟動時由 apply_to_config 之後的設定產生;None = 只收專案內)。
     attachment_scope: client_attachments.ExternalScope | None = None
+    #: 主 server /props 的 chat_template_caps.supports_parallel_tool_calls 是 JSON true 才為 True。
+    #: True 時帶工具的聊天請求明送 parallel_tool_calls(舊版 llama-server 預設每則只准一個 call)。
+    parallel_tool_calls: bool = False
 
 
 @dataclass
@@ -1012,26 +1015,50 @@ class Engine:
     def prune_for_summary(
         self, messages: Sequence[Mapping[str, Any]]
     ) -> list[dict[str, Any]]:
-        """摘要請求要送的那一份:和一般 payload 走**同一套**轉換。
+        """摘要請求的 view:和 :meth:`next_turn_prefix` 走**同一套**轉換(內部形狀)。
 
         摘要器直接吃原始歷史的話,已經被 prune 掉的舊工具輸出會整份回到模型
         面前 —— 摘要請求自己撞 context gate、壓縮從此停用,而且違反
         `docs/compaction-rules.md` 的「被清掉的工具結果進不了下一次摘要」。
+
+        reasoning 的剝除邊界也與下一輪相同:head 之後還有下一則真實 user。以 head
+        自己的最後一則 user 當邊界的話,head 尾端那幾則 assistant 會帶著 reasoning,
+        摘要請求就在那裡與對話已送過的 prefix 分岔(server 的 prompt cache 接不上)。
+        實送的訊息由 :meth:`summary_payload` 組成。
         """
         binding = self._history
         if len(messages) > len(binding.messages) or list(messages) != binding.messages[:len(messages)]:
             raise EngineError("摘要 head 必須是目前原始歷史的前段;不能猜測工具剪枝位置")
-        working = list(messages)
-        if self.options.prune:
-            working, _pruned = _apply_pruning(working, binding.pruning)
-        working = heal_in_place(working)
-        if not self.options.keep_reasoning:
-            working = strip_historical_reasoning(working)
-        return working
+        return self._next_turn_view(list(messages), binding.pruning)
+
+    def summary_payload(
+        self, view: Sequence[Mapping[str, Any]], instruction: str
+    ) -> list[dict[str, Any]]:
+        """壓縮摘要實送的訊息:對話 system + ``to_wire(view)`` + 最後一則 user 指示。
+
+        ``view`` 是 :meth:`prune_for_summary` 的結果(或其中完整回合的切片)。第一批的
+        前段因此逐 token 等於 :meth:`next_turn_prefix` 的前段,只在 head 結尾之後分岔;
+        規則、狀態校正節錄與先前摘要全在最後那一則指示裡,指示不落檔、不進歷史。
+        """
+        payload = [{"role": "system", "content": self.system_prompt.text}]
+        payload.extend(to_wire(view))
+        payload.append({"role": "user", "content": instruction})
+        return payload
 
     def complete(self, messages: Sequence[Mapping[str, Any]], *, source: str):
-        """一次非工具的模型呼叫(壓縮摘要用)。走同一個 gate 與同一把鎖。"""
+        """一次不執行工具的模型呼叫(壓縮摘要用)。走同一個 gate 與同一把鎖。
+
+        壓縮摘要(``source="compaction"``)的 messages 前段就是對話已送過的 prefix
+        (見 :meth:`summary_payload`),所以計數、gate 與生成都帶對話**同一份** tools,
+        並實送 ``tool_choice="none"``:少了 tools,模板渲染出來的 prefix 從 system 之後
+        就與對話不同。其他 source 不帶 tools。thinking 一律固定 off。
+        """
         operation = "compact" if source == "compaction" else "response"
+        if source == "compaction":
+            tools: list[dict[str, Any]] | None = self._openai_tools
+            tool_choice = "none"
+        else:
+            tools, tool_choice = None, "auto"
         content: list[str] = []
         reasoning: list[str] = []
         finish = ""
@@ -1040,11 +1067,14 @@ class Engine:
             self._report_activity(operation, "preparing")
             payload = [dict(message) for message in messages]
             extra = self._chat_extra()
-            measured = self.count_input_tokens(payload, extra=extra)
+            measured = self.count_input_tokens(
+                payload, tools=tools, tool_choice=tool_choice, extra=extra,
+            )
             usage = self._check_context(
                 source=source,
                 requested_num_ctx=self.options.n_ctx,
                 messages=payload,
+                tools=tools,
                 model=self.options.model,
                 reserved_output_tokens=self.options.max_output_tokens,
                 measured_input_tokens=measured,
@@ -1067,6 +1097,8 @@ class Engine:
                         top_p=config.CHAT_TOP_P,
                         top_k=config.CHAT_TOP_K,
                         min_p=config.CHAT_MIN_P,
+                        tools=tools,
+                        tool_choice=tool_choice,
                         stream=True,
                         extra=extra,
                         timeout=self.options.request_timeout,
@@ -1371,6 +1403,19 @@ class Engine:
         self, history: Sequence[Mapping[str, Any]], pruning: tuple[_PrunedTool, ...]
     ) -> list[dict[str, Any]]:
         """:meth:`next_turn_prefix` 的實作,吃一份 snapshot(預熱在鎖內取的那一份)。"""
+        payload = [{"role": "system", "content": self.system_prompt.text}]
+        payload.extend(to_wire(self._next_turn_view(history, pruning)))
+        return payload
+
+    def _next_turn_view(
+        self, history: Sequence[Mapping[str, Any]], pruning: tuple[_PrunedTool, ...]
+    ) -> list[dict[str, Any]]:
+        """下一輪會送的轉換結果(內部形狀:還沒 to_wire、沒有 system)。
+
+        預熱 prefix 與壓縮摘要的 view 共用這一份:固定工具剪枝計畫 → heal → 以「下一則
+        真實 user」為邊界剝 reasoning。尾端的佔位 user 訊息只讓剝除按這個邊界計算,算完
+        就拿掉(見 ``_PRIME_PLACEHOLDER_KEY``),不會重新挑剪枝候選。
+        """
         working = list(history)
         if self.options.prune:
             working, _pruned = _apply_pruning(working, pruning)
@@ -1380,13 +1425,11 @@ class Engine:
             working = strip_historical_reasoning(working)
         if not working or not working[-1].get(_PRIME_PLACEHOLDER_KEY):
             # 兩個轉換都不會重排也不會追加,所以這是不可能的。真的發生就是有人改了
-            # 轉換的形狀:寧可 fail-loud(呼叫端把它記成 error:EngineError 並跳過這次
-            # 預熱),也不要把一則內容為空的佔位 user 訊息送進模型。
-            raise EngineError("預熱 prefix 的佔位訊息不在尾端;不送出可能含佔位內容的 payload")
+            # 轉換的形狀:寧可 fail-loud(預熱把它記成 error:EngineError 並跳過,壓縮
+            # 整次失敗、原始歷史不動),也不要把一則內容為空的佔位 user 訊息送進模型。
+            raise EngineError("下一輪投影的佔位訊息不在尾端;不送出可能含佔位內容的 payload")
         working.pop()
-        payload = [{"role": "system", "content": self.system_prompt.text}]
-        payload.extend(to_wire(working))
-        return payload
+        return working
 
     def count_input_tokens(
         self,
@@ -1484,16 +1527,18 @@ class Engine:
           另外先用下一輪的保留額 ``options.max_output_tokens`` 試算一次:下一輪反正
           會撞閘的話,預熱它沒有意義(這一次試算**不寫 log**,免得 telemetry 多出一
           列從沒發生過的請求)。
+        - **與下一輪同一個 thinking 快照**:thinking 旗標會改變每一則歷史 assistant 的
+          渲染,用別的值預熱等於預熱一份下一輪用不到的 prefix。快照與歷史在同一個
+          ``_turn_state`` 臨界區取得(``set_thinking()`` 也在這把鎖裡先 abort 再翻旗標),
+          計數與 POST 共用同一份 ``chat_template_kwargs``。
 
-        ``reason``(``mount`` / ``new`` / ``session`` / ``compaction``)只是呼叫端的標記,
-        engine 刻意**不記它**——零寫入包含 telemetry 之外的一切。
+        ``reason``(``mount`` / ``new`` / ``session`` / ``think`` / ``compaction`` /
+        ``turn``)只是呼叫端的標記,engine 刻意**不記它**——零寫入包含 telemetry 之外的一切。
         """
         # 以下判定在任何 I/O、任何鎖之前:readonly session 的「不得打模型」是
         # 評測邊界,不能在 probe 之後才發現。
         if not config.CLIENT_PRIME_PROMPT_CACHE:
             return PrimeOutcome(False, "disabled", None)
-        if self.options.thinking:
-            return PrimeOutcome(False, "thinking", None)
         if not self._loaded_tools:
             return PrimeOutcome(False, "tools_not_loaded", None)
         if self.options.policy.name != client_policy.InteractivePolicy.name:
@@ -1511,8 +1556,9 @@ class Engine:
             with self._turn_state:
                 if self._in_turn > 0:
                     return PrimeOutcome(False, "turn_in_progress", None)
-                if self.options.thinking:
-                    return PrimeOutcome(False, "thinking", None)
+                # 與歷史同一個臨界區:set_thinking() 在這把鎖裡先 abort 再翻旗標,所以這次
+                # 預熱要嘛拿到新值,要嘛先登記、被那次 abort 收掉——不會拿舊值送出。
+                thinking = self.options.thinking
                 with self._prime_guard:
                     if self._session_switching:
                         return PrimeOutcome(False, "aborted", None)
@@ -1527,7 +1573,9 @@ class Engine:
                     self._prime_request = request
                     self._priming = True
             try:
-                return self._prime_locked(abort, epoch, history, pruning, request)
+                return self._prime_locked(
+                    abort, epoch, history, pruning, request, thinking=thinking,
+                )
             except context_budget.ContextOverflowError:
                 return PrimeOutcome(False, "gate", None)
             except Exception as exc:  # noqa: BLE001 - 背景工作的失敗不得冒到呼叫端
@@ -1562,12 +1610,13 @@ class Engine:
     def _prime_locked(
         self, abort: threading.Event, epoch: int,
         history: list[dict[str, Any]], pruning: tuple[_PrunedTool, ...],
-        request: llama_client.RequestCancellation,
+        request: llama_client.RequestCancellation, *, thinking: bool,
     ) -> "PrimeOutcome":
         """:meth:`prime_prompt_cache` 持著模型鎖的那一段(例外由呼叫端翻成 reason)。
 
         每個會阻塞的 I/O 都可以被 ``abort`` 打斷、每個邊界都比一次世代號:中止落在哪一段,
         預熱就在那一段之後的第一個邊界回 ``aborted``,而且**不再發 POST**。
+        ``thinking`` 是與 ``history`` 同一個臨界區取的快照;這裡不再讀 ``options``。
         """
         if abort.is_set() or self._prime_superseded(epoch):
             return PrimeOutcome(False, "aborted", None)
@@ -1592,9 +1641,10 @@ class Engine:
             return PrimeOutcome(False, "aborted", None)
 
         payload = self._prefix_from(history, pruning)
+        # 計數與 POST 共用這一份 dict:同一個 thinking 快照,也就是下一輪會送的那一個。
         extra = {
             "max_tokens": PRIME_MAX_TOKENS,
-            "chat_template_kwargs": llama_client.thinking_template_kwargs(),
+            "chat_template_kwargs": llama_client.thinking_template_kwargs(thinking),
         }
         measured = self.count_input_tokens(
             payload, tools=self._openai_tools,
@@ -2232,10 +2282,15 @@ class Engine:
         self._report_activity("response", "preparing")
         payload, transform = self.payload_messages()
         if tool_choice == "none":
-            # 只改局部 wire payload,先加指示再 gate;session、預熱 prefix 與下一輪
-            # 的 system prompt 都保持原文。tools 保留,HTTP adapter 才會實送 none。
-            payload[0] = {**payload[0], "content": payload[0]["content"] + "\n\n" + CONVERGENCE_INSTRUCTION}
+            # 指示只接在局部 wire payload 尾端(一則 user),先加再 gate;session、預熱
+            # prefix 與下一輪都看不到它。前段因此逐字是上一步的 prompt + 上一步回應 +
+            # 新工具結果,server 從上一步 prompt 尾端的 checkpoint 接續;改 system 的話
+            # 第一個 token 就分岔,整段重算。tools 保留,HTTP adapter 才會實送 none。
+            payload.append({"role": "user", "content": CONVERGENCE_INSTRUCTION})
         extra = self._chat_extra(thinking=self.options.thinking)
+        if self.options.parallel_tool_calls is True:
+            # 只有 /props 的模板能力是 JSON true 才開;計數與生成共用這一份 extra。
+            extra["parallel_tool_calls"] = True
         measured = self.count_input_tokens(
             payload, tools=self._openai_tools, tool_choice=tool_choice, extra=extra,
         )
